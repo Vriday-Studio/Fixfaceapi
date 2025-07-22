@@ -7,7 +7,11 @@ function App(){
   const canvasRef = useRef()
   const faceWidthInMeters = 0.15; // Average face width in meters
   const focalLength = 500; // Example focal length in pixels
+  const [nama, setNama] = useState("unknown");
   // LOAD FROM USEEFFECT
+  useEffect(() => {
+    console.log("App component mounted");
+  }, []);
   useEffect(()=>{
     startVideo()
     videoRef && loadModels()
@@ -30,7 +34,7 @@ function App(){
   const loadModels = ()=>{
     Promise.all([
       faceapi.nets.tinyFaceDetector.loadFromUri("/models"),
-     // faceapi.nets.ssdMobilenetv1.loadFromUri("/models"),
+     faceapi.nets.ssdMobilenetv1.loadFromUri("/models"),
       faceapi.nets.faceLandmark68Net.loadFromUri("/models"),
       faceapi.nets.faceRecognitionNet.loadFromUri("/models"),
       faceapi.nets.faceExpressionNet.loadFromUri("/models"),
@@ -40,18 +44,21 @@ function App(){
     })
   }
   const getLabeledFaceDescription = () => {
-    const labels =["Jokowi","Data"];
+    const labels =["Raisa","Jokowi","JefriNichol"];
     return Promise.all(
       labels.map(async (label) => {
         const descriptions = [];
         for (let i = 1; i <= 2; i++) {
           const img = await faceapi.fetchImage(`./labels/${label}/${i}.jpg`);
+         // console.log("Image loaded:"+ `${label}/${i}.jpg`);
           const detections = await faceapi
             .detectSingleFace(img)
             .withFaceLandmarks()
             .withFaceDescriptor();
+       // console.log("Detections image :"+i);
           descriptions.push(detections.descriptor);
         }
+      //  setNama(label);
         return new faceapi.LabeledFaceDescriptors(label, descriptions);
       })
     );
@@ -60,7 +67,7 @@ function App(){
   const faceMyDetect = ()=>{
     setInterval(async()=>{
       const detections = await faceapi.detectAllFaces(videoRef.current,
-        new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks().withFaceExpressions().withAgeAndGender();
+        new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks().withFaceExpressions().withAgeAndGender().withFaceDescriptors();
 
       // DRAW YOU FACE IN WEBCAM
       canvasRef.current.innerHtml = faceapi.createCanvasFromMedia(videoRef.current);
@@ -79,34 +86,49 @@ function App(){
       faceapi.draw.drawFaceLandmarks(canvasRef.current,resized);
       faceapi.draw.drawFaceExpressions(canvasRef.current,resized);
 
-   //   const labeledFaceDescriptors = await getLabeledFaceDescription();
-     // const faceMatcher = new faceapi.FaceMatcher(labeledFaceDescriptors);
       //const resizedDetections = faceapi.resizeResults(detections, displaySize);
       
+    const labeledFaceDescriptors = await getLabeledFaceDescription();
+   // console.log("Labeled Face Descriptors:", labeledFaceDescriptors);
+
+     const faceMatcher = new faceapi.FaceMatcher(labeledFaceDescriptors);
+    // console.log("Face Matcher created:", faceMatcher);
+    var nametemp="none";
+     if (detections.length > 0) {
+      detections.forEach((detection) => {
+        const bestMatch = faceMatcher.findBestMatch(detection.descriptor);
+        console.log(`Detected: ${bestMatch.toString()}`); 
+        setNama(bestMatch.toString());// Log the best match
+        nametemp=bestMatch.toString();
+      });
+    }
       // Draw age and gender
       detections.forEach((detection, index) => {
         const { age, gender } = detection;
         const box = detection.detection.box;
         const distance = (focalLength * faceWidthInMeters) / box.width;
-
+        
         // Create a new row
         const newRow = document.createElement("tr");
         newRow.innerHTML = `
             <td style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>${gender}</td>
             <td style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>${Math.round(age)}</td>
             <td style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>${distance.toFixed(2)}</td>
-            <td style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}></td>
+            <td style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>${nametemp}</td>
         `;
 
         // Append the new row to the table body
         const dataBody = document.getElementById("dataBody");
-        dataBody.appendChild(newRow);
+        if(newRow !== undefined){
+          dataBody.appendChild(newRow);
+        }
+     
 
         // Check if there are more than 5 rows
     
 
         // Check every 5 detected rows
-        if ((index + 1) % 5 === 0) {
+      /*  if ((index + 1) % 5 === 0) {
             const rows = Array.from(dataBody.rows);
             const selectedRows = rows.slice(-5); // Get the last 5 rows
 
@@ -124,27 +146,29 @@ function App(){
             }
 
            
-        }
+        }*/
         if (dataBody.rows.length > 5) {
-          // Remove the oldest row
-          dataBody.deleteRow(0);
-      }
-      const rows = Array.from(dataBody.rows);
-      console.log("data1"+row.cells[0].innerText);
+           //Remove the oldest row
+         dataBody.deleteRow(0);
+     }
+   //   const rows = Array.from(dataBody.rows);
+     // console.log("data1"+row.cells[0].innerText);
       });
 
-    },5000);
+    },1000);
   }
 
 
   const registerFace = () => {
-    const name = document.getElementById("faceName").value;
-    if (name) {
-      // Logic to register the face with the entered name
-      console.log(`Registering face for: ${name}`);
+    console.log("Register Face clicked"); // Debugging line
+    console.log("Is face detected:", isFaceDetected); // Check if a face is detected
+    console.log("Models loaded:", modelsLoaded); // Check if models are loaded
+
+    if (isFaceDetected) {
+      console.log("Face registered!"); // Logic to register the face
       // Here you would typically call your face recognition API or logic
     } else {
-      alert("Please enter a name.");
+      alert("No face detected. Please ensure your face is visible.");
     }
   };
 

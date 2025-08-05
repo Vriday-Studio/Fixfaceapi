@@ -44,11 +44,11 @@ function App(){
     })
   }
   const getLabeledFaceDescription = () => {
-    const labels =["Raisa","Jokowi","JefriNichol"];
+    const labels =["Raisa","Jokowi","JefriNichol","Vior"];
     return Promise.all(
       labels.map(async (label) => {
         const descriptions = [];
-        for (let i = 1; i <= 2; i++) {
+        for (let i = 1; i <= 4; i++) {
           const img = await faceapi.fetchImage(`./labels/${label}/${i}.jpg`);
          // console.log("Image loaded:"+ `${label}/${i}.jpg`);
           const detections = await faceapi
@@ -63,7 +63,7 @@ function App(){
       })
     );
     }
-
+    var nametemp="Membaca Wajah...";
   const faceMyDetect = ()=>{
     setInterval(async()=>{
       const detections = await faceapi.detectAllFaces(videoRef.current,
@@ -86,22 +86,28 @@ function App(){
       faceapi.draw.drawFaceLandmarks(canvasRef.current,resized);
       faceapi.draw.drawFaceExpressions(canvasRef.current,resized);
 
-      //const resizedDetections = faceapi.resizeResults(detections, displaySize);
-      
+
+    
+   /*   
     const labeledFaceDescriptors = await getLabeledFaceDescription();
    // console.log("Labeled Face Descriptors:", labeledFaceDescriptors);
 
      const faceMatcher = new faceapi.FaceMatcher(labeledFaceDescriptors);
     // console.log("Face Matcher created:", faceMatcher);
-    var nametemp="none";
+   
      if (detections.length > 0) {
       detections.forEach((detection) => {
         const bestMatch = faceMatcher.findBestMatch(detection.descriptor);
         console.log(`Detected: ${bestMatch.toString()}`); 
-        setNama(bestMatch.toString());// Log the best match
-        nametemp=bestMatch.toString();
+        nametemp= "Wajah : "+ bestMatch.toString();
+        if (!nametemp.includes("unknown")) {
+          document.getElementById("prediksiwajah").innerHTML = nametemp;
+        }
+      //  setNama(bestMatch.toString());// Log the best match
+      
       });
     }
+      */
       // Draw age and gender
       detections.forEach((detection, index) => {
         const { age, gender } = detection;
@@ -147,15 +153,75 @@ function App(){
 
            
         }*/
-        if (dataBody.rows.length > 5) {
+        if (dataBody.rows.length > 15) {
            //Remove the oldest row
          dataBody.deleteRow(0);
      }
+      // Calculate averages every 10 rows
+      if (dataBody.rows.length % 10 === 0) {
+        let totalAge = 0;
+        let totalDistance = 0;
+        let maleCount = 0;
+        let femaleCount = 0;
+
+        for (let i = 0; i < dataBody.rows.length; i++) {
+          const row = dataBody.rows[i];
+          const rowGender = row.cells[0].innerText;
+          const rowAge = parseInt(row.cells[1].innerText);
+          const rowDistance = parseFloat(row.cells[2].innerText);
+
+          totalAge += rowAge;
+          totalDistance += rowDistance;
+
+          if (rowGender === "male") {
+            maleCount++;
+          } else if (rowGender === "female") {
+            femaleCount++;
+          }
+        }
+
+        const averageAge = totalAge / dataBody.rows.length;
+        const averageDistance = totalDistance / dataBody.rows.length;
+        const summarizedGender = maleCount > femaleCount ? "male" : "female";
+
+        // Update the summarize label
+        const summarizeLabel = document.getElementById("summarize");
+        summarizeLabel.innerText = `Rata-rata: Gender: ${summarizedGender}, Umur: ${Math.round(averageAge)}, Jarak: ${averageDistance.toFixed(2)}`;
+        const promptLabel = document.getElementById("prompt");
+        if (detections.length > 0) {
+      
+          if (summarizedGender === "female") {
+            if (averageAge < 12) {
+              promptLabel.innerText = "Halo Adik kecil, ada yang bisa saya bantu?"; // Below 12 years
+            } else if (averageAge < 30) {
+              promptLabel.innerText = "Hai Girls! ada yang bisa kubantu?"; // Female under 30
+            }else if (averageAge < 60) {
+              promptLabel.innerText = "Selamat Pagi Ibu! ada yang bisa saya bantu?"; // Male 30 to 60
+        }  else {
+              promptLabel.innerText = "Selamat Pagi Nenek! ,ada yang bisa saya bantu?"; // Female 30 and above
+            }
+          } else { // Male
+            if (averageAge < 12) {
+              promptLabel.innerText = "Halo Adik kecil, ada yang bisa kakak bantu?"; // Below 12 years
+            } else if (averageAge < 30) {
+              promptLabel.innerText = "Hai Masbro!, ada yang bisa kubantu?"; // Male under 30
+            } else if (averageAge < 60) {
+                  promptLabel.innerText = "Selamat Pagi Bapak! ada yang bisa saya bantu?"; // Male 30 to 60
+            } else {
+              promptLabel.innerText = "Selamat Pagi Kakek! ada yang bisa saya bantu?"; // Male 60 and above
+            }
+          }// Face detected
+        } else {
+          
+          promptLabel.innerText = "Mari kesini, aku AI yang bisa memandu di tempat ini"; // No face detected
+        }
+      }
    //   const rows = Array.from(dataBody.rows);
      // console.log("data1"+row.cells[0].innerText);
       });
+// Update the prompt label based on face detection
 
-    },1000);
+    },1500);
   }
 
 
@@ -184,8 +250,13 @@ function App(){
       <canvas ref={canvasRef} width="940" height="650"
       className="appcanvas"/>
            <div>
-           <label id="iskeluarga">Tabel</label>
-      <table id="dataplayer" style={{ borderCollapse: 'collapse', width: '100%', textAlign: 'center' }}>
+           <label id="prediksiwajah"></label>
+           <label id="prompt">...</label>
+           <br></br>
+           <label >Summarize:</label>
+           <label id="summarize">...</label>
+           <label id="iskeluarga"></label>
+      <table id="dataplayer" style={{ borderCollapse: 'collapse', width: '100%', textAlign: 'center', display: 'block' }}>
         <thead style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>
           <tr  style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>
             <th style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>Gender</th>
@@ -199,15 +270,7 @@ function App(){
         </tbody>
       </table>
       <div style={{ marginTop: '20px', textAlign: 'center' }}>
-        <input
-          type="text"
-          id="faceName"
-          placeholder="Enter name for face recognition"
-          style={{ padding: '10px', width: '200px' }}
-        />
-        <button onClick={registerFace} style={{ padding: '10px', marginLeft: '10px' }}>
-          Register Face
-        </button>
+      
       </div>
       </div>
           </div>

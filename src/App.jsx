@@ -8,6 +8,10 @@ function App(){
   const faceWidthInMeters = 0.15; // Average face width in meters
   const focalLength = 500; // Example focal length in pixels
   const [nama, setNama] = useState("unknown");
+  let totalDetectedFaces = 0;
+  let historySumarry="";  
+  let historyGender="";  
+  let historyAge=0;  
   // LOAD FROM USEEFFECT
   useEffect(() => {
     console.log("App component mounted");
@@ -64,6 +68,7 @@ function App(){
     );
     }
     var nametemp="Membaca Wajah...";
+   
   const faceMyDetect = ()=>{
     setInterval(async()=>{
       const detections = await faceapi.detectAllFaces(videoRef.current,
@@ -110,6 +115,7 @@ function App(){
       */
       // Draw age and gender
       detections.forEach((detection, index) => {
+      
         const { age, gender } = detection;
         const box = detection.detection.box;
         const distance = (focalLength * faceWidthInMeters) / box.width;
@@ -153,7 +159,7 @@ function App(){
 
            
         }*/
-        if (dataBody.rows.length > 15) {
+        if (dataBody.rows.length > 10) {
            //Remove the oldest row
          dataBody.deleteRow(0);
      }
@@ -183,11 +189,29 @@ function App(){
         const averageAge = totalAge / dataBody.rows.length;
         const averageDistance = totalDistance / dataBody.rows.length;
         const summarizedGender = maleCount > femaleCount ? "male" : "female";
-
+        const promptLabel = document.getElementById("prompt");
+        historyGender=summarizedGender;
+        historyAge=averageAge;
+        //console.log("historyGender: "+historyGender);
+      //  console.log("summarizedGender: "+summarizedGender);
+      //  if(historyGender !== summarizedGender){
+          //console.log("historyGender: "+historyGender);
+          //console.log("summarizedGender: "+summarizedGender);
+         // console.log("historyAge: "+historyAge);
+         // console.log("averageAge: "+averageAge);
+          if(Math.abs(averageAge - historyAge) > 3){
+            totalDetectedFaces++;
+          }
+         
+        //}
         // Update the summarize label
         const summarizeLabel = document.getElementById("summarize");
-        summarizeLabel.innerText = `Rata-rata: Gender: ${summarizedGender}, Umur: ${Math.round(averageAge)}, Jarak: ${averageDistance.toFixed(2)}`;
-        const promptLabel = document.getElementById("prompt");
+        summarizeLabel.innerText = `Rata-rata: Gender: ${summarizedGender}, 
+        Umur: ${Math.round(averageAge)}, Jarak: ${averageDistance.toFixed(2)}, 
+        Total Wajah: ${totalDetectedFaces}`; // Tambahkan total wajah const promptLabel = document.getElementById("prompt");
+    
+
+        historySumarry=summarizeLabel.innerText;
         if (detections.length > 0) {
       
           if (summarizedGender === "female") {
@@ -212,7 +236,8 @@ function App(){
             }
           }// Face detected
         } else {
-          
+          totalDetectedFaces=0;
+          summarizeLabel.innerText = "..."
           promptLabel.innerText = "Mari kesini, aku AI yang bisa memandu di tempat ini"; // No face detected
         }
       }
@@ -221,7 +246,7 @@ function App(){
       });
 // Update the prompt label based on face detection
 
-    },1500);
+    },800);
   }
 
 

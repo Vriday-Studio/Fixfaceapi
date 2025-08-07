@@ -1,14 +1,16 @@
 import {useRef,useEffect,useState} from 'react'
 import './App.css'
 import * as faceapi from 'face-api.js'
-
 function App(){
   const videoRef = useRef()
   const canvasRef = useRef()
   const faceWidthInMeters = 0.15; // Average face width in meters
   const focalLength = 500; // Example focal length in pixels
   const [nama, setNama] = useState("unknown");
+ 
+let iternoFaces=0;
   let totalDetectedFaces = 0;
+  let numberOfFaces=0;
   let historySumarry="";  
   let historyGender="";  
   let historyAge=0;  
@@ -69,11 +71,25 @@ function App(){
     }
     var nametemp="Membaca Wajah...";
     let iterDetect=0;
+   
   const faceMyDetect = ()=>{
     setInterval(async()=>{
       const detections = await faceapi.detectAllFaces(videoRef.current,
         new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks().withFaceExpressions().withAgeAndGender().withFaceDescriptors();
-        const numberOfFaces = detections.length;
+       if(detections.length == 0){  
+       
+        iternoFaces++;
+        if(iternoFaces>20){
+          console.log("No face detected Longtime");
+          iternoFaces=0;
+          numberOfFaces=0;
+        }
+        console.log("No face detected");
+       }else{
+        iternoFaces=0;
+        numberOfFaces=detections.length;
+       }
+        
        // console.log("Number of Faces: "+numberOfFaces);
       // DRAW YOU FACE IN WEBCAM
       canvasRef.current.innerHtml = faceapi.createCanvasFromMedia(videoRef.current);
@@ -199,7 +215,9 @@ function App(){
         //}
         // Update the summarize label
         const summarizeLabel = document.getElementById("summarize");
-        console.log("iterDetect: "+iterDetect);
+        const rtTotalWajahLabel = document.getElementById("rtTotalWajah");
+        //console.log("iterDetect: "+iterDetect);
+        rtTotalWajahLabel.innerText="Realtime number of faces: " +numberOfFaces;
         if(iterDetect==5){
         summarizeLabel.innerText = `Rata-rata: Gender: ${summarizedGender}, 
         Umur: ${Math.round(averageAge)}, Jarak: ${averageDistance.toFixed(2)}, 
@@ -209,7 +227,7 @@ function App(){
         historySumarry=summarizeLabel.innerText;
 
         if (detections.length > 0) {
-      
+      //    setNumberOfFaces(detections.length);
           if (summarizedGender === "female") {
             if (averageAge < 12) {
               promptLabel.innerText = "Halo Adik kecil, ada yang bisa saya bantu?"; // Below 12 years
@@ -232,6 +250,13 @@ function App(){
             }
           }// Face detected
         } else {
+          if(detections.length == 0){
+          
+   
+             console.log("No face detected");
+           }
+            
+           
           totalDetectedFaces=0;
           summarizeLabel.innerText = "..."
           promptLabel.innerText = "Mari kesini, aku AI yang bisa memandu di tempat ini"; // No face detected
@@ -276,6 +301,8 @@ function App(){
            <label id="promptFinal" style={{color: 'red'}}></label>
            <br></br>
            <label id="prompt">...</label>
+           <br></br>
+           <label id="rtTotalWajah">Realtime number of faces: 0</label>
            <br></br>
            <label >Summarize:</label>
            <label id="summarize">...</label>

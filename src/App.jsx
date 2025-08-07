@@ -68,12 +68,13 @@ function App(){
     );
     }
     var nametemp="Membaca Wajah...";
-   
+    let iterDetect=0;
   const faceMyDetect = ()=>{
     setInterval(async()=>{
       const detections = await faceapi.detectAllFaces(videoRef.current,
         new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks().withFaceExpressions().withAgeAndGender().withFaceDescriptors();
-
+        const numberOfFaces = detections.length;
+       // console.log("Number of Faces: "+numberOfFaces);
       // DRAW YOU FACE IN WEBCAM
       canvasRef.current.innerHtml = faceapi.createCanvasFromMedia(videoRef.current);
       faceapi.matchDimensions(canvasRef.current,{ 
@@ -114,12 +115,17 @@ function App(){
     }
       */
       // Draw age and gender
-      detections.forEach((detection, index) => {
-      
+    
+      detections.forEach((detection, index) => { iterDetect++;
+        if(iterDetect>6){
+          iterDetect=0;
+        }
+       
         const { age, gender } = detection;
         const box = detection.detection.box;
         const distance = (focalLength * faceWidthInMeters) / box.width;
-        
+        const indekDetect=index;
+        //console.log("index: "+indekDetect);
         // Create a new row
         const newRow = document.createElement("tr");
         newRow.innerHTML = `
@@ -135,30 +141,6 @@ function App(){
           dataBody.appendChild(newRow);
         }
      
-
-        // Check if there are more than 5 rows
-    
-
-        // Check every 5 detected rows
-      /*  if ((index + 1) % 5 === 0) {
-            const rows = Array.from(dataBody.rows);
-            const selectedRows = rows.slice(-5); // Get the last 5 rows
-
-            // Check if the selected rows have the same gender and age difference
-            const sameGender = selectedRows.every(row => row.cells[0].innerText === gender);
-            const ageDifferences = selectedRows.map(row => Math.abs(parseInt(row.cells[1].innerText) - Math.round(age)));
-
-            if (sameGender && ageDifferences.every(diff => diff <= 5)) {
-                // Remove the two oldest rows
-                for (let i = 0; i < 2; i++) {
-                    if (dataBody.rows.length > 0) {
-                        dataBody.deleteRow(dataBody.rows.length - 1);
-                    }
-                }
-            }
-
-           
-        }*/
         if (dataBody.rows.length > 10) {
            //Remove the oldest row
          dataBody.deleteRow(0);
@@ -190,28 +172,42 @@ function App(){
         const averageDistance = totalDistance / dataBody.rows.length;
         const summarizedGender = maleCount > femaleCount ? "male" : "female";
         const promptLabel = document.getElementById("prompt");
+
         historyGender=summarizedGender;
         historyAge=averageAge;
-        //console.log("historyGender: "+historyGender);
-      //  console.log("summarizedGender: "+summarizedGender);
-      //  if(historyGender !== summarizedGender){
-          //console.log("historyGender: "+historyGender);
-          //console.log("summarizedGender: "+summarizedGender);
-         // console.log("historyAge: "+historyAge);
-         // console.log("averageAge: "+averageAge);
-          if(Math.abs(averageAge - historyAge) > 3){
-            totalDetectedFaces++;
-          }
-         
+     // Buat baris baru untuk dataBodyindex
+     const newRowIndex = document.createElement("tr");
+     newRowIndex.innerHTML = `
+         <td style="border: 4px solid white; padding: 8px; text-align: center;">${indekDetect}</td>
+         <td style="border: 4px solid white; padding: 8px; text-align: center;">${summarizedGender}</td>
+         <td style="border: 4px solid white; padding: 8px; text-align: center;">${Math.round(averageAge)}</td>
+         <td style="border: 4px solid white; padding: 8px; text-align: center;">${averageDistance.toFixed(2)}</td>
+         <td style="border: 4px solid white; padding: 8px; text-align: center;">${promptLabel.innerText}</td>
+     `;
+
+     // Tambahkan baris baru ke dataBodyindex
+     const dataBodyIndex = document.getElementById("dataBodyindex");
+     if (newRowIndex !== undefined) {
+  
+         dataBodyIndex.appendChild(newRowIndex);
+      
+     }
+     if (dataBodyIndex.rows.length > 5) {
+      //Remove the oldest row
+    dataBodyIndex.deleteRow(0);
+}  
         //}
         // Update the summarize label
         const summarizeLabel = document.getElementById("summarize");
+        console.log("iterDetect: "+iterDetect);
+        if(iterDetect==5){
         summarizeLabel.innerText = `Rata-rata: Gender: ${summarizedGender}, 
         Umur: ${Math.round(averageAge)}, Jarak: ${averageDistance.toFixed(2)}, 
-        Total Wajah: ${totalDetectedFaces}`; // Tambahkan total wajah const promptLabel = document.getElementById("prompt");
-    
+        Total Wajah: ${numberOfFaces}`; // Tambahkan total wajah const promptLabel = document.getElementById("prompt");
+        }
 
         historySumarry=summarizeLabel.innerText;
+
         if (detections.length > 0) {
       
           if (summarizedGender === "female") {
@@ -241,6 +237,7 @@ function App(){
           promptLabel.innerText = "Mari kesini, aku AI yang bisa memandu di tempat ini"; // No face detected
         }
       }
+       
    //   const rows = Array.from(dataBody.rows);
      // console.log("data1"+row.cells[0].innerText);
       });
@@ -276,11 +273,29 @@ function App(){
       className="appcanvas"/>
            <div>
            <label id="prediksiwajah"></label>
+           <label id="promptFinal" style={{color: 'red'}}></label>
+           <br></br>
            <label id="prompt">...</label>
            <br></br>
            <label >Summarize:</label>
            <label id="summarize">...</label>
            <label id="iskeluarga"></label>
+                
+           <table id="dataplayerindex" style={{ borderCollapse: 'collapse', width: '100%', textAlign: 'center', display: 'block' }}>
+        <thead style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>
+          <tr  style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>
+          <th style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>Index</th>
+            <th style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>Gender</th>
+            <th style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>Umur</th>
+            <th style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>Jarak (m)</th>
+            <th style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>Prompt</th>
+          </tr>
+        </thead>
+        <tbody id="dataBodyindex" style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>
+          {/* Rows will be added here dynamically */}
+        </tbody>
+        
+      </table>     
       <table id="dataplayer" style={{ borderCollapse: 'collapse', width: '100%', textAlign: 'center', display: 'block' }}>
         <thead style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>
           <tr  style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>

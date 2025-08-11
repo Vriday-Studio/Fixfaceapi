@@ -223,32 +223,33 @@ let iternoFaces=0;
         Umur: ${Math.round(averageAge)}, Jarak: ${averageDistance.toFixed(2)}, 
         Total Wajah: ${numberOfFaces}`; // Tambahkan total wajah const promptLabel = document.getElementById("prompt");
         }
-
         historySumarry=summarizeLabel.innerText;
-
+        promptLabel.innerText="";
         if (detections.length > 0) {
       //    setNumberOfFaces(detections.length);
+
           if (summarizedGender === "female") {
             if (averageAge < 12) {
-              promptLabel.innerText = "Halo Adik kecil, ada yang bisa saya bantu?"; // Below 12 years
+              promptLabel.innerText = "Pengunjung masih wanita kecil muda berumur dibawah 12 tahun"; // Below 12 years
             } else if (averageAge < 30) {
-              promptLabel.innerText = "Hai Girls! ada yang bisa kubantu?"; // Female under 30
+              promptLabel.innerText = "Pengunjung wanita muda antara 13-30 tahun"; // Female under 30
             }else if (averageAge < 60) {
-              promptLabel.innerText = "Selamat Pagi Ibu! ada yang bisa saya bantu?"; // Male 30 to 60
+              promptLabel.innerText = "Pengunjung wanita dewasa antara 31-60 tahun"; // Male 30 to 60
         }  else {
-              promptLabel.innerText = "Selamat Pagi Nenek! ,ada yang bisa saya bantu?"; // Female 30 and above
+              promptLabel.innerText = "Pengunjung wanita tua berumur diatas 60 tahun"; // Female 30 and above
             }
           } else { // Male
             if (averageAge < 12) {
-              promptLabel.innerText = "Halo Adik kecil, ada yang bisa kakak bantu?"; // Below 12 years
+              promptLabel.innerText = "Pengunjung masih pria kecil muda berumur dibawah 12 tahun"; // Below 12 years
             } else if (averageAge < 30) {
-              promptLabel.innerText = "Hai Masbro!, ada yang bisa kubantu?"; // Male under 30
+              promptLabel.innerText = "Pengunjung pria muda antara 13-30 tahun"; // Male under 30
             } else if (averageAge < 60) {
-                  promptLabel.innerText = "Selamat Pagi Bapak! ada yang bisa saya bantu?"; // Male 30 to 60
+                  promptLabel.innerText = "Pengunjung pria dewasa antara 31-60 tahun"; // Male 30 to 60
             } else {
-              promptLabel.innerText = "Selamat Pagi Kakek! ada yang bisa saya bantu?"; // Male 60 and above
+              promptLabel.innerText = "Pengunjung pria tua berumur diatas 60 tahun"; // Male 60 and above
             }
           }// Face detected
+         
         } else {
           if(detections.length == 0){
           
@@ -261,6 +262,7 @@ let iternoFaces=0;
           summarizeLabel.innerText = "..."
           promptLabel.innerText = "Mari kesini, aku AI yang bisa memandu di tempat ini"; // No face detected
         }
+        promptLabel.innerText += " ,Orang didepan berjumlah:"+numberOfFaces;
       }
        
    //   const rows = Array.from(dataBody.rows);
@@ -300,7 +302,11 @@ let iternoFaces=0;
            <label id="prediksiwajah"></label>
            <label id="promptFinal" style={{color: 'red'}}></label>
            <br></br>
+           <br></br>
+           Prompt Send:
+           <br></br>
            <label id="prompt">...</label>
+           <br></br>
            <br></br>
            <label id="rtTotalWajah">Realtime number of faces: 0</label>
            <br></br>

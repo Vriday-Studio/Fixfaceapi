@@ -1,6 +1,8 @@
 import {useRef,useEffect,useState} from 'react'
 import './App.css'
 import * as faceapi from 'face-api.js'
+import OpenAI from "openai";
+import { getResponse } from './example.mjs';
 function App(){
   const videoRef = useRef()
   const canvasRef = useRef()
@@ -23,7 +25,28 @@ let iternoFaces=0;
     videoRef && loadModels()
 
   },[])
+let promptKirim = "Anda berperan sebagai Pemandu Pengunjung di Galeri Indonesia Kaya, Nama kamu adalah IKA, Sambutlah pengunjung sesuai informasi yang nanti akan saya kirimkan dengan ramah,  ,  jika mengerti  jawab dengan sapaan: Hai, namaku IKA, saya bisa membantu anda disini!";
+let panggilAI=true;
+  // Fungsi untuk mendapatkan respons
+  const fetchResponse = async () => {
+    if(panggilAI){
+   // Ganti dengan prompt yang Anda inginkan
+    const promptFinale = document.getElementById("promptFinal");
+    const response = await getResponse(promptKirim);
+   // console.log(response);
+    promptFinale.innerText=response;
+  }else{
+    console.log("AI tak dipanggil");
+  } // Tampilkan respons di konsol
+};
 
+// Panggil fetchResponse setiap 10 detik
+useEffect(() => {
+   fetchResponse(); // Panggil sekali saat komponen dimuat
+    const intervalId = setInterval(fetchResponse, 10000); // 10000 ms = 10 detik
+
+    return () => clearInterval(intervalId); // Bersihkan interval saat komponen di-unmount
+}, []);
 
 
   // OPEN YOU FACE WEBCAM
@@ -80,11 +103,14 @@ let iternoFaces=0;
        
         iternoFaces++;
         if(iternoFaces>20){
-          console.log("No face detected Longtime");
+          const promptLabelx = document.getElementById("prompt");
+          //console.log("No face detected Longtime");
+          promptKirim="Tak ada orang disini, buat kalimat menarik dan trivia tentang kebudayaaan indonesia yang bertujuan orang yang agak jauh agar mendekat";
+          promptLabelx.innerText = "Tak ada orang disini";
           iternoFaces=0;
           numberOfFaces=0;
         }
-        console.log("No face detected");
+      //  console.log("No face detected");
        }else{
         iternoFaces=0;
         numberOfFaces=detections.length;
@@ -263,6 +289,8 @@ let iternoFaces=0;
           promptLabel.innerText = "Mari kesini, aku AI yang bisa memandu di tempat ini"; // No face detected
         }
         promptLabel.innerText += " ,Orang didepan berjumlah:"+numberOfFaces;
+        promptKirim= "Sapalah pengunjung berikut ini, sertakan panggilan orang berdasarkan gender dan usia, dan Tambahkan basa basi seperti: trivia pengetahuan unik budaya indonesia atau topik cuaca atau kemacetan  atau keadaan di Galeri Indonesia Kaya atau lain sebagainya, dan bedakan berdasar jumlah orang, misal sendiri kamu bisa tambahkan kalimat: sendirian aja nih?, kalau berdua: wah, kalian temenan atau saudara nih?  kalo banyak: wah rombongan nih, silahkan kamu boleh improve kalimat basa basi yang lain, usahakan agar tiap saya kirim informasi kalimatnya berbeda,  berikut info yang tersedia: "+promptLabel.innerText;
+        console.log("prompt kirim="+promptKirim);
       }
        
    //   const rows = Array.from(dataBody.rows);
@@ -300,7 +328,9 @@ let iternoFaces=0;
       className="appcanvas"/>
            <div>
            <label id="prediksiwajah"></label>
-           <label id="promptFinal" style={{color: 'red'}}></label>
+           Prompt Chat AI Read:
+           <br></br>
+           <label id="promptFinal" style={{color: 'yellow'}}></label>
            <br></br>
            <br></br>
            Prompt Send:
@@ -308,6 +338,7 @@ let iternoFaces=0;
            <label id="prompt">...</label>
            <br></br>
            <br></br>
+          
            <label id="rtTotalWajah">Realtime number of faces: 0</label>
            <br></br>
            <label >Summarize:</label>

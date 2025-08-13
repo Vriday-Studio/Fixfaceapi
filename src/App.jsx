@@ -3,12 +3,98 @@ import './App.css'
 import * as faceapi from 'face-api.js'
 import OpenAI from "openai";
 import { getResponse } from './example.mjs';
+
 function App(){
   const videoRef = useRef()
   const canvasRef = useRef()
   const faceWidthInMeters = 0.15; // Average face width in meters
   const focalLength = 500; // Example focal length in pixels
   const [nama, setNama] = useState("unknown");
+  
+  // State untuk API Key dan visibilitas pop-up
+  const [apiKey, setApiKey] = useState('');
+  const [showPopup, setShowPopup] = useState(true);
+const defaultProminit="Anda berperan sebagai Pemandu Pengunjung di Galeri Indonesia Kaya, Nama kamu adalah IKA, Sambutlah pengunjung sesuai informasi yang nanti akan saya kirimkan dengan ramah,  ,  jika mengerti  jawab dengan sapaan: Hai, namaku IKA, saya bisa membantu anda disini!";
+  
+  const defPromptNoPeople="Tak ada orang disini, buat kalimat menarik dan trivia tentang kebudayaaan indonesia yang bertujuan orang yang agak jauh agar mendekat";
+  const defPromptIdentify="Sapalah pengunjung berikut ini, sertakan panggilan orang berdasarkan gender dan usia, dan Tambahkan basa basi seperti: trivia pengetahuan unik budaya indonesia atau topik cuaca atau kemacetan  atau keadaan di Galeri Indonesia Kaya atau lain sebagainya, dan bedakan berdasar jumlah orang, misal sendiri kamu bisa tambahkan kalimat: sendirian aja nih?, kalau berdua: wah, kalian temenan atau saudara nih?  kalo banyak: wah rombongan nih, silahkan kamu boleh improve kalimat basa basi yang lain, usahakan agar tiap saya kirim informasi kalimatnya berbeda,  berikut info yang tersedia: ";
+  const cekppd = ()=>{
+    if(localStorage.getItem('panggilanPerdetik') == null){
+      return 11000;
+    }else{
+      return localStorage.getItem('panggilanPerdetik');
+    }
+  }
+  const cekinit = ()=>{
+    if(localStorage.getItem('promptinit') == null){
+      return defaultProminit;
+    }else{
+      return localStorage.getItem('promptinit');
+    }
+  }
+  const cekNopeople = ()=>{
+    if(localStorage.getItem('promptNoPeople') == null){
+      return defPromptNoPeople;
+    }else{
+      return localStorage.getItem('promptNoPeople');
+    }
+  }
+  const cekIdentify = ()=>{
+    if(localStorage.getItem('promptIdentify') == null){
+      return defPromptIdentify;
+    }else{
+      return localStorage.getItem('promptIdentify');
+    }
+  }
+  // State untuk variabel input
+  const [panggilanPerdetik, setPanggilanPerdetik] = useState(cekppd);
+  const [promptinit, setPromptInit] = useState(cekinit);
+  const [promptNoPeople, setPromptNoPeople] = useState(cekNopeople);
+  const [promptIdentify,setPromptIdentify] = useState(cekIdentify);
+  // Mengambil nilai dari localStorage saat komponen dimuat
+  useEffect(() => {
+    const storedPanggilanPerdetik = localStorage.getItem('panggilanPerdetik');
+    const storedPromptInit = localStorage.getItem('promptinit');
+    const storedPromptNoPeople = localStorage.getItem('promptNoPeople');
+    const storedPromptIdentify = localStorage.getItem('promptIdentify');
+
+    if (storedPanggilanPerdetik) {
+      setPanggilanPerdetik(Number(storedPanggilanPerdetik));
+    }
+    if (storedPromptInit) {
+      setPromptInit(storedPromptInit);
+    }
+    if (storedPromptNoPeople) {
+      setPromptNoPeople(storedPromptNoPeople);
+    }
+    if (storedPromptIdentify) {
+      setPromptIdentify(storedPromptIdentify);
+    }
+    console.log("get item storedPanggilanPerdetik ="+storedPanggilanPerdetik );
+  }, []);
+
+  // Menyimpan nilai ke localStorage setiap kali ada perubahan
+  useEffect(() => {
+    console.log("Set item storedPanggilanPerdetik ="+ panggilanPerdetik );
+    localStorage.setItem('panggilanPerdetik', panggilanPerdetik);
+    localStorage.setItem('promptinit', promptinit);
+    localStorage.setItem('promptNoPeople', promptNoPeople);
+    localStorage.setItem('promptIdentify', promptIdentify);
+  }, [panggilanPerdetik, promptinit, promptNoPeople, promptIdentify]);
+
+  // Mengambil API Key dari localStorage saat komponen dimuat
+  useEffect(() => {
+    const storedApiKey = localStorage.getItem('apiKey');
+    if (storedApiKey) {
+      setApiKey(storedApiKey);
+    }
+  }, []);
+
+  // Fungsi untuk menyimpan API Key dan menutup pop-up
+  const handleSaveApiKey = () => {
+    localStorage.setItem('apiKey', apiKey);
+    setShowPopup(false);
+  };
  
 let iternoFaces=0;
   let totalDetectedFaces = 0;
@@ -25,25 +111,32 @@ let iternoFaces=0;
     videoRef && loadModels()
 
   },[])
-let promptKirim = "Anda berperan sebagai Pemandu Pengunjung di Galeri Indonesia Kaya, Nama kamu adalah IKA, Sambutlah pengunjung sesuai informasi yang nanti akan saya kirimkan dengan ramah,  ,  jika mengerti  jawab dengan sapaan: Hai, namaku IKA, saya bisa membantu anda disini!";
-let panggilAI=true;
-  // Fungsi untuk mendapatkan respons
+//let promptinit=  "Anda berperan sebagai Pemandu Pengunjung di Galeri Indonesia Kaya, Nama kamu adalah IKA, Sambutlah pengunjung sesuai informasi yang nanti akan saya kirimkan dengan ramah,  ,  jika mengerti  jawab dengan sapaan: Hai, namaku IKA, saya bisa membantu anda disini!";
+
+let panggilAI=false;
+  let promptKirim = promptinit;
+  let jumlahpanggilan=0;
+// Fungsi untuk mendapatkan respons
   const fetchResponse = async () => {
     if(panggilAI){
    // Ganti dengan prompt yang Anda inginkan
+jumlahpanggilan++;
+console.log("Jumlah Call:"+jumlahpanggilan );
     const promptFinale = document.getElementById("promptFinal");
     const response = await getResponse(promptKirim);
-   // console.log(response);
+ 
     promptFinale.innerText=response;
   }else{
     console.log("AI tak dipanggil");
+    const promptFinale = document.getElementById("promptFinal");
+    promptFinale.innerText="Hai Namaku IKA, aku pemandu disini"
   } // Tampilkan respons di konsol
 };
-
+//let panggilanPerdetik=10000;
 // Panggil fetchResponse setiap 10 detik
 useEffect(() => {
    fetchResponse(); // Panggil sekali saat komponen dimuat
-    const intervalId = setInterval(fetchResponse, 10000); // 10000 ms = 10 detik
+    const intervalId = setInterval(fetchResponse, panggilanPerdetik); // 10000 ms = 10 detik
 
     return () => clearInterval(intervalId); // Bersihkan interval saat komponen di-unmount
 }, []);
@@ -69,6 +162,8 @@ useEffect(() => {
       faceapi.nets.faceExpressionNet.loadFromUri("/models"),
       faceapi.nets.ageGenderNet.loadFromUri("/models")
     ]).then(()=>{
+      //disable panggil AI OpenAI here
+    panggilAI=true;
       faceMyDetect();
     })
   }
@@ -94,8 +189,9 @@ useEffect(() => {
     }
     var nametemp="Membaca Wajah...";
     let iterDetect=0;
-   
-  const faceMyDetect = ()=>{
+  // let promptNoPeople="Tak ada orang disini, buat kalimat menarik dan trivia tentang kebudayaaan indonesia yang bertujuan orang yang agak jauh agar mendekat";
+ //let promptIdentify="Sapalah pengunjung berikut ini, sertakan panggilan orang berdasarkan gender dan usia, dan Tambahkan basa basi seperti: trivia pengetahuan unik budaya indonesia atau topik cuaca atau kemacetan  atau keadaan di Galeri Indonesia Kaya atau lain sebagainya, dan bedakan berdasar jumlah orang, misal sendiri kamu bisa tambahkan kalimat: sendirian aja nih?, kalau berdua: wah, kalian temenan atau saudara nih?  kalo banyak: wah rombongan nih, silahkan kamu boleh improve kalimat basa basi yang lain, usahakan agar tiap saya kirim informasi kalimatnya berbeda,  berikut info yang tersedia: ";
+   const faceMyDetect = ()=>{
     setInterval(async()=>{
       const detections = await faceapi.detectAllFaces(videoRef.current,
         new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks().withFaceExpressions().withAgeAndGender().withFaceDescriptors();
@@ -105,8 +201,9 @@ useEffect(() => {
         if(iternoFaces>20){
           const promptLabelx = document.getElementById("prompt");
           //console.log("No face detected Longtime");
-          promptKirim="Tak ada orang disini, buat kalimat menarik dan trivia tentang kebudayaaan indonesia yang bertujuan orang yang agak jauh agar mendekat";
-          promptLabelx.innerText = "Tak ada orang disini";
+          promptKirim=promptNoPeople;
+          promptLabelx.innerText = "Tak ada orang disini, kirim trivia";
+        //  panggilAI=false;
           iternoFaces=0;
           numberOfFaces=0;
         }
@@ -114,6 +211,7 @@ useEffect(() => {
        }else{
         iternoFaces=0;
         numberOfFaces=detections.length;
+       // panggilAI=true;
        }
         
        // console.log("Number of Faces: "+numberOfFaces);
@@ -251,9 +349,12 @@ useEffect(() => {
         }
         historySumarry=summarizeLabel.innerText;
         promptLabel.innerText="";
-        if (detections.length > 0) {
+        let indexTempDet= 99;
+        if (detections.length >=1) {
+          promptLabel.innerText="";
       //    setNumberOfFaces(detections.length);
-
+      indexTempDet=indekDetect;
+          console.log("indekdetek ="+indekDetect);
           if (summarizedGender === "female") {
             if (averageAge < 12) {
               promptLabel.innerText = "Pengunjung masih wanita kecil muda berumur dibawah 12 tahun"; // Below 12 years
@@ -276,7 +377,32 @@ useEffect(() => {
             }
           }// Face detected
          
-        } else {
+        } 
+        if (detections.length >=2) {
+          if (summarizedGender === "female") {
+            if (averageAge < 12) {
+              promptLabel.innerText += " dan Pengunjung masih wanita kecil muda berumur dibawah 12 tahun"; // Below 12 years
+            } else if (averageAge < 30) {
+              promptLabel.innerText += " dan Pengunjung wanita muda antara 13-30 tahun"; // Female under 30
+            }else if (averageAge < 60) {
+              promptLabel.innerText += " dan Pengunjung wanita dewasa antara 31-60 tahun"; // Male 30 to 60
+        }  else {
+              promptLabel.innerText += " dan Pengunjung wanita tua berumur diatas 60 tahun"; // Female 30 and above
+            }
+          } else { // Male
+            if (averageAge < 12) {
+              promptLabel.innerText += " dan Pengunjung masih pria kecil muda berumur dibawah 12 tahun"; // Below 12 years
+            } else if (averageAge < 30) {
+              promptLabel.innerText += " dan Pengunjung pria muda antara 13-30 tahun"; // Male under 30
+            } else if (averageAge < 60) {
+                  promptLabel.innerText += " dan Pengunjung pria dewasa antara 31-60 tahun"; // Male 30 to 60
+            } else {
+              promptLabel.innerText = " dan Pengunjung pria tua berumur diatas 60 tahun"; // Male 60 and above
+            }
+          }// Face detected
+        }
+        
+        else {
           if(detections.length == 0){
           
    
@@ -286,10 +412,10 @@ useEffect(() => {
            
           totalDetectedFaces=0;
           summarizeLabel.innerText = "..."
-          promptLabel.innerText = "Mari kesini, aku AI yang bisa memandu di tempat ini"; // No face detected
+          promptLabel.innerText = promptNoPeople; // No face detected
         }
         promptLabel.innerText += " ,Orang didepan berjumlah:"+numberOfFaces;
-        promptKirim= "Sapalah pengunjung berikut ini, sertakan panggilan orang berdasarkan gender dan usia, dan Tambahkan basa basi seperti: trivia pengetahuan unik budaya indonesia atau topik cuaca atau kemacetan  atau keadaan di Galeri Indonesia Kaya atau lain sebagainya, dan bedakan berdasar jumlah orang, misal sendiri kamu bisa tambahkan kalimat: sendirian aja nih?, kalau berdua: wah, kalian temenan atau saudara nih?  kalo banyak: wah rombongan nih, silahkan kamu boleh improve kalimat basa basi yang lain, usahakan agar tiap saya kirim informasi kalimatnya berbeda,  berikut info yang tersedia: "+promptLabel.innerText;
+        promptKirim= promptIdentify+promptLabel.innerText;
         console.log("prompt kirim="+promptKirim);
       }
        
@@ -298,7 +424,7 @@ useEffect(() => {
       });
 // Update the prompt label based on face detection
 
-    },800);
+    },5800);
   }
 
 
@@ -320,6 +446,23 @@ useEffect(() => {
     <div className="myapp">
       <h3>Deteksi Wajah</h3>
  
+      {/* Pop-up untuk memasukkan API Key */}
+      {showPopup && (
+        <div className="popup">
+          <div className="popup-content">
+            <h4 style={{ color: 'blue' }}>Masukkan API Key</h4>
+            <textarea 
+              rows="4" // Menentukan jumlah baris
+              cols="50" // Menentukan jumlah kolom
+              value={apiKey} 
+              onChange={(e) => setApiKey(e.target.value)} 
+              placeholder="Masukkan API Key Anda" 
+            />
+            <button onClick={handleSaveApiKey}>OK</button>
+          </div>
+        </div>
+      )}
+
       <div className="appvide">
       
       <video crossOrigin="anonymous" ref={videoRef} autoPlay></video>
@@ -360,7 +503,7 @@ useEffect(() => {
         </tbody>
         
       </table>     
-      <table id="dataplayer" style={{ borderCollapse: 'collapse', width: '100%', textAlign: 'center', display: 'block' }}>
+      <table id="dataplayer" style={{ borderCollapse: 'collapse', width: '100%', textAlign: 'center', display: 'none' }}>
         <thead style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>
           <tr  style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>
             <th style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>Gender</th>
@@ -373,9 +516,43 @@ useEffect(() => {
           {/* Rows will be added here dynamically */}
         </tbody>
       </table>
-      <div style={{ marginTop: '20px', textAlign: 'center' }}>
-      
+       {/* Box isian untuk variabel */}
+       <div>
+        <label>Panggilan Per Detik:</label>
+        <input 
+          type="number" 
+          value={panggilanPerdetik} 
+          onChange={(e) => setPanggilanPerdetik(e.target.value)} 
+        />
       </div>
+      <div>
+        <label>Prompt Init:</label>
+        <textarea 
+          rows="15" 
+          cols="50" 
+          value={promptinit} 
+          onChange={(e) => setPromptInit(e.target.value)} 
+        />
+      </div>
+      <div>
+        <label>Prompt No People:</label>
+        <textarea 
+          rows="15" 
+          cols="50" 
+          value={promptNoPeople} 
+          onChange={(e) => setPromptNoPeople(e.target.value)} 
+        />
+      </div>
+      <div>
+        <label>Prompt Identify:</label>
+        <textarea 
+          rows="15" 
+          cols="50" 
+          value={promptIdentify} 
+          onChange={(e) => setPromptIdentify(e.target.value)} 
+        />
+      </div>
+
       </div>
           </div>
           

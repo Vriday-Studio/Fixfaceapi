@@ -1,16 +1,25 @@
-# Build settings (keep your existing ones if you already have them)
+# -------- Build settings --------
 [build]
   command = "npm run build"
   publish = "dist"
 
-# Proxy: your site /api/n8n/* -> n8n /webhook/* (production webhook)
+# -------- Proxy your app's /api/n8n/* to n8n /webhook/* --------
 [[redirects]]
   from = "/api/n8n/*"
   to = "https://n8n.srv954455.hstgr.cloud/webhook/:splat"
   status = 200
   force = true
-  headers = {
-    Access-Control-Allow-Origin = "*",
-    Access-Control-Allow-Headers = "*",
+
+# -------- CORS headers for the proxied path --------
+[[headers]]
+  for = "/api/n8n/*"
+  [headers.values]
+    Access-Control-Allow-Origin = "*"
+    Access-Control-Allow-Headers = "*"
     Access-Control-Allow-Methods = "POST, OPTIONS"
-  }
+
+# (Optional) SPA fallback for Vite/React Router
+# [[redirects]]
+#   from = "/*"
+#   to = "/index.html"
+#   status = 200

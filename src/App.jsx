@@ -123,17 +123,29 @@ export default function App() {
             : Promise.resolve(),
         ]);
 
-        // 3) backend: try WebGL, fallback CPU; allow ?forceCpu=1
-        const FORCE_CPU = /forceCpu=1/.test(window.location.search);
+        // Decide backend based on environment
+        const ON_NETLIFY = /\.netlify\.app$/.test(window.location.hostname);
+        // Allow manual override via ?forceCpu=1
+        const FORCE_CPU = ON_NETLIFY || /forceCpu=1/.test(window.location.search);
+
         try {
-          if (FORCE_CPU) throw new Error("Forced CPU via ?forceCpu=1");
+          if (FORCE_CPU) throw new Error("Force CPU due to CSP or param");
           await faceapi.tf.setBackend("webgl");
           await faceapi.tf.ready();
           console.log("Using WebGL");
         } catch (e) {
-          console.log("WebGL unavailable → CPU:", e?.message || e);
-          await faceapi.tf.setBackend("cpu");
-          await faceapi.tf.ready();
+          console.log("WebGL blocked/unavailable → trying WASM...");
+          try {
+            // Optional (see option B): WASM backend (fast + CSP-safe)
+            await faceapi.tf.setBackend("wasm");
+            await faceapi.tf.ready();
+            console.log("Using WASM backend");
+          } catch {
+            // Always works with strict CSP
+            await faceapi.tf.setBackend("cpu");
+            await faceapi.tf.ready();
+            console.log("Using CPU backend");
+          }
         }
 
         // 4) known faces (safe loader; may return null)

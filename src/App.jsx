@@ -1,562 +1,288 @@
-import {useRef,useEffect,useState} from 'react'
-import './App.css'
-import * as faceapi from 'face-api.js'
-import OpenAI from "openai";
-import { getResponse } from './example.mjs';
+import { useEffect, useRef } from "react";
+import * as faceapi from "face-api.js";
+import "./App.css";
 
-function App(){
-  const videoRef = useRef()
-  const canvasRef = useRef()
-  const faceWidthInMeters = 0.15; // Average face width in meters
-  const focalLength = 500; // Example focal length in pixels
-  const [nama, setNama] = useState("unknown");
-  
-  // State untuk API Key dan visibilitas pop-up
-  const [apiKey, setApiKey] = useState('');
-  const [showPopup, setShowPopup] = useState(true);
-const defaultProminit="Anda berperan sebagai Pemandu Pengunjung di Galeri Indonesia Kaya, Nama kamu adalah IKA, Sambutlah pengunjung sesuai informasi yang nanti akan saya kirimkan dengan ramah,  ,  jika mengerti  jawab dengan sapaan: Hai, namaku IKA, saya bisa membantu anda disini!";
-  
-  const defPromptNoPeople="Tak ada orang disini, buat kalimat menarik dan trivia tentang kebudayaaan indonesia yang bertujuan orang yang agak jauh agar mendekat";
-  const defPromptIdentify="Sapalah pengunjung berikut ini, sertakan panggilan orang berdasarkan gender dan usia, dan Tambahkan basa basi seperti: trivia pengetahuan unik budaya indonesia atau topik cuaca atau kemacetan  atau keadaan di Galeri Indonesia Kaya atau lain sebagainya, dan bedakan berdasar jumlah orang, misal sendiri kamu bisa tambahkan kalimat: sendirian aja nih?, kalau berdua: wah, kalian temenan atau saudara nih?  kalo banyak: wah rombongan nih, silahkan kamu boleh improve kalimat basa basi yang lain, usahakan agar tiap saya kirim informasi kalimatnya berbeda,  berikut info yang tersedia: ";
-  const cekppd = ()=>{
-    if(localStorage.getItem('panggilanPerdetik') == null){
-      return 11000;
-    }else{
-      return localStorage.getItem('panggilanPerdetik');
-    }
-  }
-  const cekinit = ()=>{
-    if(localStorage.getItem('promptinit') == null){
-      return defaultProminit;
-    }else{
-      return localStorage.getItem('promptinit');
-    }
-  }
-  const cekNopeople = ()=>{
-    if(localStorage.getItem('promptNoPeople') == null){
-      return defPromptNoPeople;
-    }else{
-      return localStorage.getItem('promptNoPeople');
-    }
-  }
-  const cekIdentify = ()=>{
-    if(localStorage.getItem('promptIdentify') == null){
-      return defPromptIdentify;
-    }else{
-      return localStorage.getItem('promptIdentify');
-    }
-  }
-  // State untuk variabel input
-  const [panggilanPerdetik, setPanggilanPerdetik] = useState(cekppd);
-  const [promptinit, setPromptInit] = useState(cekinit);
-  const [promptNoPeople, setPromptNoPeople] = useState(cekNopeople);
-  const [promptIdentify,setPromptIdentify] = useState(cekIdentify);
-  // Mengambil nilai dari localStorage saat komponen dimuat
-  useEffect(() => {
-    const storedPanggilanPerdetik = localStorage.getItem('panggilanPerdetik');
-    const storedPromptInit = localStorage.getItem('promptinit');
-    const storedPromptNoPeople = localStorage.getItem('promptNoPeople');
-    const storedPromptIdentify = localStorage.getItem('promptIdentify');
+/* ---------- CONFIG ---------- */
+const FACE_WIDTH_M = 0.15;              // avg face width (meters)
+const FOCAL_PX     = 500;               // tune if distance looks off
+const GREEN_M      = 0.8;               // <= 0.8 m = GREEN (greet), > 0.8 m = RED (call over)
+const SCORE_TH     = 0.3;               // detector sensitivity (lower = more sensitive)
+const INPUT_STEPS  = [320, 416, 512, 608]; // adaptive sizes to catch small/far faces
+const MATCH_THRESHOLD_PX = 60;          // tracking radius
+const TRACK_TIMEOUT_MS   = 1500;        // drop after unseen (new ID on re-entry)
+// const N8N_WEBHOOK_URL = "https://your-n8n/webhook-id"; // optional
 
-    if (storedPanggilanPerdetik) {
-      setPanggilanPerdetik(Number(storedPanggilanPerdetik));
-    }
-    if (storedPromptInit) {
-      setPromptInit(storedPromptInit);
-    }
-    if (storedPromptNoPeople) {
-      setPromptNoPeople(storedPromptNoPeople);
-    }
-    if (storedPromptIdentify) {
-      setPromptIdentify(storedPromptIdentify);
-    }
-    console.log("get item storedPanggilanPerdetik ="+storedPanggilanPerdetik );
-  }, []);
+/* ---------- helpers ---------- */
+const center = (b) => ({ cx: b.x + b.width / 2, cy: b.y + b.height / 2 });
+const euclid  = (a, b) => Math.hypot(a.cx - b.cx, a.cy - b.cy);
+const topExpression = (exp = {}) =>
+  Object.entries(exp)
+    .map(([expression, probability]) => ({ expression, probability }))
+    .sort((a, b) => b.probability - a.probability)[0] || { expression: "neutral", probability: 0 };
 
-  // Menyimpan nilai ke localStorage setiap kali ada perubahan
-  useEffect(() => {
-    console.log("Set item storedPanggilanPerdetik ="+ panggilanPerdetik );
-    localStorage.setItem('panggilanPerdetik', panggilanPerdetik);
-    localStorage.setItem('promptinit', promptinit);
-    localStorage.setItem('promptNoPeople', promptNoPeople);
-    localStorage.setItem('promptIdentify', promptIdentify);
-  }, [panggilanPerdetik, promptinit, promptNoPeople, promptIdentify]);
-
-  // Mengambil API Key dari localStorage saat komponen dimuat
-  useEffect(() => {
-    const storedApiKey = localStorage.getItem('apiKey');
-    if (storedApiKey) {
-      setApiKey(storedApiKey);
-    }
-  }, []);
-
-  // Fungsi untuk menyimpan API Key dan menutup pop-up
-  const handleSaveApiKey = () => {
-    localStorage.setItem('apiKey', apiKey);
-    setShowPopup(false);
-  };
- 
-let iternoFaces=0;
-  let totalDetectedFaces = 0;
-  let numberOfFaces=0;
-  let historySumarry="";  
-  let historyGender="";  
-  let historyAge=0;  
-  // LOAD FROM USEEFFECT
-  useEffect(() => {
-    console.log("App component mounted");
-  }, []);
-  useEffect(()=>{
-    startVideo()
-    videoRef && loadModels()
-
-  },[])
-//let promptinit=  "Anda berperan sebagai Pemandu Pengunjung di Galeri Indonesia Kaya, Nama kamu adalah IKA, Sambutlah pengunjung sesuai informasi yang nanti akan saya kirimkan dengan ramah,  ,  jika mengerti  jawab dengan sapaan: Hai, namaku IKA, saya bisa membantu anda disini!";
-
-let panggilAI=false;
-  let promptKirim = promptinit;
-  let jumlahpanggilan=0;
-// Fungsi untuk mendapatkan respons
-  const fetchResponse = async () => {
-    if(panggilAI){
-   // Ganti dengan prompt yang Anda inginkan
-jumlahpanggilan++;
-console.log("Jumlah Call:"+jumlahpanggilan );
-    const promptFinale = document.getElementById("promptFinal");
-    const response = await getResponse(promptKirim);
- 
-    promptFinale.innerText=response;
-  }else{
-    console.log("AI tak dipanggil");
-    const promptFinale = document.getElementById("promptFinal");
-    promptFinale.innerText="Hai Namaku IKA, aku pemandu disini"
-  } // Tampilkan respons di konsol
-};
-//let panggilanPerdetik=10000;
-// Panggil fetchResponse setiap 10 detik
-useEffect(() => {
-   fetchResponse(); // Panggil sekali saat komponen dimuat
-    const intervalId = setInterval(fetchResponse, panggilanPerdetik); // 10000 ms = 10 detik
-
-    return () => clearInterval(intervalId); // Bersihkan interval saat komponen di-unmount
-}, []);
-
-
-  // OPEN YOU FACE WEBCAM
-  const startVideo = ()=>{
-    navigator.mediaDevices.getUserMedia({video:true})
-    .then((currentStream)=>{
-      videoRef.current.srcObject = currentStream
-    })
-    .catch((err)=>{
-      console.log(err)
-    })
-  }
-  // LOAD MODELS FROM FACE API
-  const loadModels = ()=>{
-    Promise.all([
-      faceapi.nets.tinyFaceDetector.loadFromUri("/models"),
-     faceapi.nets.ssdMobilenetv1.loadFromUri("/models"),
-      faceapi.nets.faceLandmark68Net.loadFromUri("/models"),
-      faceapi.nets.faceRecognitionNet.loadFromUri("/models"),
-      faceapi.nets.faceExpressionNet.loadFromUri("/models"),
-      faceapi.nets.ageGenderNet.loadFromUri("/models")
-    ]).then(()=>{
-      //disable panggil AI OpenAI here
-    panggilAI=true;
-      faceMyDetect();
-    })
-  }
-  const getLabeledFaceDescription = () => {
-    const labels =["Raisa","Jokowi","JefriNichol","Vior"];
-    return Promise.all(
-      labels.map(async (label) => {
-        const descriptions = [];
-        for (let i = 1; i <= 4; i++) {
-          const img = await faceapi.fetchImage(`./labels/${label}/${i}.jpg`);
-         // console.log("Image loaded:"+ `${label}/${i}.jpg`);
-          const detections = await faceapi
-            .detectSingleFace(img)
-            .withFaceLandmarks()
-            .withFaceDescriptor();
-       // console.log("Detections image :"+i);
-          descriptions.push(detections.descriptor);
-        }
-      //  setNama(label);
-        return new faceapi.LabeledFaceDescriptors(label, descriptions);
-      })
-    );
-    }
-    var nametemp="Membaca Wajah...";
-    let iterDetect=0;
-  // let promptNoPeople="Tak ada orang disini, buat kalimat menarik dan trivia tentang kebudayaaan indonesia yang bertujuan orang yang agak jauh agar mendekat";
- //let promptIdentify="Sapalah pengunjung berikut ini, sertakan panggilan orang berdasarkan gender dan usia, dan Tambahkan basa basi seperti: trivia pengetahuan unik budaya indonesia atau topik cuaca atau kemacetan  atau keadaan di Galeri Indonesia Kaya atau lain sebagainya, dan bedakan berdasar jumlah orang, misal sendiri kamu bisa tambahkan kalimat: sendirian aja nih?, kalau berdua: wah, kalian temenan atau saudara nih?  kalo banyak: wah rombongan nih, silahkan kamu boleh improve kalimat basa basi yang lain, usahakan agar tiap saya kirim informasi kalimatnya berbeda,  berikut info yang tersedia: ";
-   const faceMyDetect = ()=>{
-    setInterval(async()=>{
-      const detections = await faceapi.detectAllFaces(videoRef.current,
-        new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks().withFaceExpressions().withAgeAndGender().withFaceDescriptors();
-       if(detections.length == 0){  
-       
-        iternoFaces++;
-        if(iternoFaces>20){
-          const promptLabelx = document.getElementById("prompt");
-          //console.log("No face detected Longtime");
-          promptKirim=promptNoPeople;
-          promptLabelx.innerText = "Tak ada orang disini, kirim trivia";
-        //  panggilAI=false;
-          iternoFaces=0;
-          numberOfFaces=0;
-        }
-      //  console.log("No face detected");
-       }else{
-        iternoFaces=0;
-        numberOfFaces=detections.length;
-       // panggilAI=true;
-       }
-        
-       // console.log("Number of Faces: "+numberOfFaces);
-      // DRAW YOU FACE IN WEBCAM
-      canvasRef.current.innerHtml = faceapi.createCanvasFromMedia(videoRef.current);
-      faceapi.matchDimensions(canvasRef.current,{ 
-        width:940,
-        height:650
-      });
-   //   const canvas = document.getElementById('canvasref');
-   //   canvas.style.left
-      const resized = faceapi.resizeResults(detections,{ 
-         width:940,
-        height:650
-      });
-
-      faceapi.draw.drawDetections(canvasRef.current,resized);
-      faceapi.draw.drawFaceLandmarks(canvasRef.current,resized);
-      faceapi.draw.drawFaceExpressions(canvasRef.current,resized);
-
-
-    
-   /*   
-    const labeledFaceDescriptors = await getLabeledFaceDescription();
-   // console.log("Labeled Face Descriptors:", labeledFaceDescriptors);
-
-     const faceMatcher = new faceapi.FaceMatcher(labeledFaceDescriptors);
-    // console.log("Face Matcher created:", faceMatcher);
-   
-     if (detections.length > 0) {
-      detections.forEach((detection) => {
-        const bestMatch = faceMatcher.findBestMatch(detection.descriptor);
-        console.log(`Detected: ${bestMatch.toString()}`); 
-        nametemp= "Wajah : "+ bestMatch.toString();
-        if (!nametemp.includes("unknown")) {
-          document.getElementById("prediksiwajah").innerHTML = nametemp;
-        }
-      //  setNama(bestMatch.toString());// Log the best match
-      
-      });
-    }
-      */
-      // Draw age and gender
-    
-      detections.forEach((detection, index) => { iterDetect++;
-        if(iterDetect>6){
-          iterDetect=0;
-        }
-       
-        const { age, gender } = detection;
-        const box = detection.detection.box;
-        const distance = (focalLength * faceWidthInMeters) / box.width;
-        const indekDetect=index;
-        //console.log("index: "+indekDetect);
-        // Create a new row
-        const newRow = document.createElement("tr");
-        newRow.innerHTML = `
-            <td style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>${gender}</td>
-            <td style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>${Math.round(age)}</td>
-            <td style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>${distance.toFixed(2)}</td>
-            <td style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>${nametemp}</td>
-        `;
-
-        // Append the new row to the table body
-        const dataBody = document.getElementById("dataBody");
-        if(newRow !== undefined){
-          dataBody.appendChild(newRow);
-        }
-     
-        if (dataBody.rows.length > 10) {
-           //Remove the oldest row
-         dataBody.deleteRow(0);
-     }
-      // Calculate averages every 10 rows
-      if (dataBody.rows.length % 10 === 0) {
-        let totalAge = 0;
-        let totalDistance = 0;
-        let maleCount = 0;
-        let femaleCount = 0;
-
-        for (let i = 0; i < dataBody.rows.length; i++) {
-          const row = dataBody.rows[i];
-          const rowGender = row.cells[0].innerText;
-          const rowAge = parseInt(row.cells[1].innerText);
-          const rowDistance = parseFloat(row.cells[2].innerText);
-
-          totalAge += rowAge;
-          totalDistance += rowDistance;
-
-          if (rowGender === "male") {
-            maleCount++;
-          } else if (rowGender === "female") {
-            femaleCount++;
-          }
-        }
-
-        const averageAge = totalAge / dataBody.rows.length;
-        const averageDistance = totalDistance / dataBody.rows.length;
-        const summarizedGender = maleCount > femaleCount ? "male" : "female";
-        const promptLabel = document.getElementById("prompt");
-
-        historyGender=summarizedGender;
-        historyAge=averageAge;
-     // Buat baris baru untuk dataBodyindex
-     const newRowIndex = document.createElement("tr");
-     newRowIndex.innerHTML = `
-         <td style="border: 4px solid white; padding: 8px; text-align: center;">${indekDetect}</td>
-         <td style="border: 4px solid white; padding: 8px; text-align: center;">${summarizedGender}</td>
-         <td style="border: 4px solid white; padding: 8px; text-align: center;">${Math.round(averageAge)}</td>
-         <td style="border: 4px solid white; padding: 8px; text-align: center;">${averageDistance.toFixed(2)}</td>
-         <td style="border: 4px solid white; padding: 8px; text-align: center;">${promptLabel.innerText}</td>
-     `;
-
-     // Tambahkan baris baru ke dataBodyindex
-     const dataBodyIndex = document.getElementById("dataBodyindex");
-     if (newRowIndex !== undefined) {
-  
-         dataBodyIndex.appendChild(newRowIndex);
-      
-     }
-     if (dataBodyIndex.rows.length > 5) {
-      //Remove the oldest row
-    dataBodyIndex.deleteRow(0);
-}  
-        //}
-        // Update the summarize label
-        const summarizeLabel = document.getElementById("summarize");
-        const rtTotalWajahLabel = document.getElementById("rtTotalWajah");
-        //console.log("iterDetect: "+iterDetect);
-        rtTotalWajahLabel.innerText="Realtime number of faces: " +numberOfFaces;
-        if(iterDetect==5){
-        summarizeLabel.innerText = `Rata-rata: Gender: ${summarizedGender}, 
-        Umur: ${Math.round(averageAge)}, Jarak: ${averageDistance.toFixed(2)}, 
-        Total Wajah: ${numberOfFaces}`; // Tambahkan total wajah const promptLabel = document.getElementById("prompt");
-        }
-        historySumarry=summarizeLabel.innerText;
-        promptLabel.innerText="";
-        let indexTempDet= 99;
-        if (detections.length >=1) {
-          promptLabel.innerText="";
-      //    setNumberOfFaces(detections.length);
-      indexTempDet=indekDetect;
-          console.log("indekdetek ="+indekDetect);
-          if (summarizedGender === "female") {
-            if (averageAge < 12) {
-              promptLabel.innerText = "Pengunjung masih wanita kecil muda berumur dibawah 12 tahun"; // Below 12 years
-            } else if (averageAge < 30) {
-              promptLabel.innerText = "Pengunjung wanita muda antara 13-30 tahun"; // Female under 30
-            }else if (averageAge < 60) {
-              promptLabel.innerText = "Pengunjung wanita dewasa antara 31-60 tahun"; // Male 30 to 60
-        }  else {
-              promptLabel.innerText = "Pengunjung wanita tua berumur diatas 60 tahun"; // Female 30 and above
-            }
-          } else { // Male
-            if (averageAge < 12) {
-              promptLabel.innerText = "Pengunjung masih pria kecil muda berumur dibawah 12 tahun"; // Below 12 years
-            } else if (averageAge < 30) {
-              promptLabel.innerText = "Pengunjung pria muda antara 13-30 tahun"; // Male under 30
-            } else if (averageAge < 60) {
-                  promptLabel.innerText = "Pengunjung pria dewasa antara 31-60 tahun"; // Male 30 to 60
-            } else {
-              promptLabel.innerText = "Pengunjung pria tua berumur diatas 60 tahun"; // Male 60 and above
-            }
-          }// Face detected
-         
-        } 
-        if (detections.length >=2) {
-          if (summarizedGender === "female") {
-            if (averageAge < 12) {
-              promptLabel.innerText += " dan Pengunjung masih wanita kecil muda berumur dibawah 12 tahun"; // Below 12 years
-            } else if (averageAge < 30) {
-              promptLabel.innerText += " dan Pengunjung wanita muda antara 13-30 tahun"; // Female under 30
-            }else if (averageAge < 60) {
-              promptLabel.innerText += " dan Pengunjung wanita dewasa antara 31-60 tahun"; // Male 30 to 60
-        }  else {
-              promptLabel.innerText += " dan Pengunjung wanita tua berumur diatas 60 tahun"; // Female 30 and above
-            }
-          } else { // Male
-            if (averageAge < 12) {
-              promptLabel.innerText += " dan Pengunjung masih pria kecil muda berumur dibawah 12 tahun"; // Below 12 years
-            } else if (averageAge < 30) {
-              promptLabel.innerText += " dan Pengunjung pria muda antara 13-30 tahun"; // Male under 30
-            } else if (averageAge < 60) {
-                  promptLabel.innerText += " dan Pengunjung pria dewasa antara 31-60 tahun"; // Male 30 to 60
-            } else {
-              promptLabel.innerText = " dan Pengunjung pria tua berumur diatas 60 tahun"; // Male 60 and above
-            }
-          }// Face detected
-        }
-        
-        else {
-          if(detections.length == 0){
-          
-   
-             console.log("No face detected");
-           }
-            
-           
-          totalDetectedFaces=0;
-          summarizeLabel.innerText = "..."
-          promptLabel.innerText = promptNoPeople; // No face detected
-        }
-        promptLabel.innerText += " ,Orang didepan berjumlah:"+numberOfFaces;
-        promptKirim= promptIdentify+promptLabel.innerText;
-        console.log("prompt kirim="+promptKirim);
-      }
-       
-   //   const rows = Array.from(dataBody.rows);
-     // console.log("data1"+row.cells[0].innerText);
-      });
-// Update the prompt label based on face detection
-
-    },5800);
-  }
-
-
-  const registerFace = () => {
-    console.log("Register Face clicked"); // Debugging line
-    console.log("Is face detected:", isFaceDetected); // Check if a face is detected
-    console.log("Models loaded:", modelsLoaded); // Check if models are loaded
-
-    if (isFaceDetected) {
-      console.log("Face registered!"); // Logic to register the face
-      // Here you would typically call your face recognition API or logic
-    } else {
-      alert("No face detected. Please ensure your face is visible.");
-    }
-  };
-
-
-  return (
-    <div className="myapp">
-      <h3>Deteksi Wajah</h3>
- 
-      {/* Pop-up untuk memasukkan API Key */}
-      {showPopup && (
-        <div className="popup">
-          <div className="popup-content">
-            <h4 style={{ color: 'blue' }}>Masukkan API Key</h4>
-            <textarea 
-              rows="4" // Menentukan jumlah baris
-              cols="50" // Menentukan jumlah kolom
-              value={apiKey} 
-              onChange={(e) => setApiKey(e.target.value)} 
-              placeholder="Masukkan API Key Anda" 
-            />
-            <button onClick={handleSaveApiKey}>OK</button>
-          </div>
-        </div>
-      )}
-
-      <div className="appvide">
-      
-      <video crossOrigin="anonymous" ref={videoRef} autoPlay></video>
-      </div>
-      <canvas ref={canvasRef} width="940" height="650"
-      className="appcanvas"/>
-           <div>
-           <label id="prediksiwajah"></label>
-           Prompt Chat AI Read:
-           <br></br>
-           <label id="promptFinal" style={{color: 'yellow'}}></label>
-           <br></br>
-           <br></br>
-           Prompt Send:
-           <br></br>
-           <label id="prompt">...</label>
-           <br></br>
-           <br></br>
-          
-           <label id="rtTotalWajah">Realtime number of faces: 0</label>
-           <br></br>
-           <label >Summarize:</label>
-           <label id="summarize">...</label>
-           <label id="iskeluarga"></label>
-                
-           <table id="dataplayerindex" style={{ borderCollapse: 'collapse', width: '100%', textAlign: 'center', display: 'block' }}>
-        <thead style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>
-          <tr  style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>
-          <th style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>Index</th>
-            <th style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>Gender</th>
-            <th style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>Umur</th>
-            <th style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>Jarak (m)</th>
-            <th style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>Prompt</th>
-          </tr>
-        </thead>
-        <tbody id="dataBodyindex" style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>
-          {/* Rows will be added here dynamically */}
-        </tbody>
-        
-      </table>     
-      <table id="dataplayer" style={{ borderCollapse: 'collapse', width: '100%', textAlign: 'center', display: 'none' }}>
-        <thead style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>
-          <tr  style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>
-            <th style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>Gender</th>
-            <th style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>Umur</th>
-            <th style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>Jarak (m)</th>
-            <th style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>Nama</th>
-          </tr>
-        </thead>
-        <tbody id="dataBody" style={{ border: '4px solid white', padding: '8px', textAlign: 'center' }}>
-          {/* Rows will be added here dynamically */}
-        </tbody>
-      </table>
-       {/* Box isian untuk variabel */}
-       <div>
-        <label>Panggilan Per Detik:</label>
-        <input 
-          type="number" 
-          value={panggilanPerdetik} 
-          onChange={(e) => setPanggilanPerdetik(e.target.value)} 
-        />
-      </div>
-      <div>
-        <label>Prompt Init:</label>
-        <textarea 
-          rows="15" 
-          cols="50" 
-          value={promptinit} 
-          onChange={(e) => setPromptInit(e.target.value)} 
-        />
-      </div>
-      <div>
-        <label>Prompt No People:</label>
-        <textarea 
-          rows="15" 
-          cols="50" 
-          value={promptNoPeople} 
-          onChange={(e) => setPromptNoPeople(e.target.value)} 
-        />
-      </div>
-      <div>
-        <label>Prompt Identify:</label>
-        <textarea 
-          rows="15" 
-          cols="50" 
-          value={promptIdentify} 
-          onChange={(e) => setPromptIdentify(e.target.value)} 
-        />
-      </div>
-
-      </div>
-          </div>
-          
-  );
+/* ---------- DPR-aware canvas prep ---------- */
+function prepCanvasForDisplay(video, canvas) {
+  const width  = video.clientWidth  || video.videoWidth  || 640;
+  const height = video.clientHeight || video.videoHeight || 480;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width  = Math.round(width * dpr);
+  canvas.height = Math.round(height * dpr);
+  canvas.style.width  = `${width}px`;
+  canvas.style.height = `${height}px`;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { width, height };
 }
 
-export default App;
+export default function App() {
+  const videoRef  = useRef(null);
+  const canvasRef = useRef(null);
+  const rafRef    = useRef(null);
+
+  // stable tracking state
+  const tracksRef = useRef([]); // [{id, detection, age, gender, expressions, cx, cy, lastSeen}]
+  const nextIdRef = useRef(1);
+  const cpuSetRef = useRef(false);
+  const lastGoodInputRef = useRef(INPUT_STEPS[0]); // remember last size that saw faces
+
+  useEffect(() => {
+    (async () => {
+      // 1) start camera
+      const s = await navigator.mediaDevices.getUserMedia({ video: true });
+      const v = videoRef.current;
+      v.srcObject = s;
+      await new Promise(res => { if (v.readyState >= 2) res(); else v.onloadedmetadata = () => res(); });
+      await v.play().catch(()=>{});
+      // 2) load models
+      await Promise.all([
+        faceapi.nets.tinyFaceDetector.loadFromUri("/models"),
+        faceapi.nets.faceLandmark68Net.loadFromUri("/models"),
+        faceapi.nets.faceExpressionNet.loadFromUri("/models"),
+        faceapi.nets.ageGenderNet.loadFromUri("/models"),
+      ]);
+      // 3) CPU backend (CSP-safe)
+      if (!cpuSetRef.current) {
+        await faceapi.tf.setBackend("cpu");
+        await faceapi.tf.ready();
+        cpuSetRef.current = true;
+      }
+      // 4) start loop
+      startLoop();
+    })();
+
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      const s = videoRef.current?.srcObject;
+      if (s) s.getTracks().forEach(t => t.stop());
+    };
+  }, []);
+
+  function startLoop() {
+    const tick = async () => {
+      const detections = await detectAdaptive();
+      const people = updateTracks(detections);
+      drawOverlayAndTable(people);
+      // await sendToN8N(people); // uncomment + set URL if you want to send
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+  }
+
+  async function detectOnce(inputSize) {
+    const v = videoRef.current;
+    if (!v) return [];
+    const opts = new faceapi.TinyFaceDetectorOptions({
+      inputSize,
+      scoreThreshold: SCORE_TH,
+    });
+    const det = await faceapi
+      .detectAllFaces(v, opts)
+      .withFaceLandmarks()
+      .withFaceExpressions()
+      .withAgeAndGender();
+
+    const displaySize = prepCanvasForDisplay(v, canvasRef.current);
+    return faceapi.resizeResults(det, displaySize);
+  }
+
+  // try lastGoodInput first, then fall back to larger sizes to catch far/small faces
+  async function detectAdaptive() {
+    const sizes = [lastGoodInputRef.current, ...INPUT_STEPS.filter(s => s !== lastGoodInputRef.current)];
+    for (const sz of sizes) {
+      const result = await detectOnce(sz);
+      if (result.length > 0) {
+        lastGoodInputRef.current = sz;
+        return result;
+      }
+    }
+    // none found; keep lastGoodInput as-is
+    return [];
+  }
+
+  function updateTracks(resized) {
+    const now  = Date.now();
+    const prev = tracksRef.current;
+    const next = [];
+
+    resized.forEach(d => {
+      const ctr = center(d.detection.box);
+      let bestIdx = -1, best = Infinity;
+      prev.forEach((p, i) => {
+        const dd = euclid(ctr, { cx: p.cx, cy: p.cy });
+        if (dd < MATCH_THRESHOLD_PX && dd < best) { best = dd; bestIdx = i; }
+      });
+
+      if (bestIdx >= 0) {
+        const p = { ...prev[bestIdx] };
+        p.detection   = d.detection;
+        p.age         = d.age;
+        p.gender      = d.gender;
+        p.expressions = d.expressions;
+        p.cx = ctr.cx; p.cy = ctr.cy;
+        p.lastSeen    = now;
+        next.push(p);
+      } else {
+        next.push({
+          id: nextIdRef.current++,
+          detection: d.detection,
+          age: d.age,
+          gender: d.gender,
+          expressions: d.expressions,
+          cx: ctr.cx, cy: ctr.cy,
+          lastSeen: now,
+        });
+      }
+    });
+
+    // drop stale tracks
+    const kept = next.filter(p => now - p.lastSeen < TRACK_TIMEOUT_MS);
+    kept.sort((a, b) => a.id - b.id);
+    tracksRef.current = kept;
+    return kept;
+  }
+
+  function drawOverlayAndTable(people) {
+    const v  = videoRef.current;
+    const displayW = v?.clientWidth  || 640;
+    const displayH = v?.clientHeight || 480;
+
+    const c   = canvasRef.current;
+    const ctx = c.getContext("2d");
+    ctx.clearRect(0, 0, displayW, displayH);
+
+    // boxes + labels
+    people.forEach(p => {
+      const b = p.detection.box;
+      const distanceM = (FOCAL_PX * FACE_WIDTH_M) / b.width;
+      const zone = distanceM <= GREEN_M ? "green" : "red";
+      const expr = topExpression(p.expressions);
+
+      const drawBox = new faceapi.draw.DrawBox(b, {
+        label: `P${p.id} • ${zone} • ${Math.round(p.age)} ${p.gender} • ${expr.expression}`,
+        boxColor: zone === "green" ? "#17c964" : "#f31260",
+        lineWidth: 2,
+      });
+      drawBox.draw(c);
+    });
+
+    // count
+    const countEl = document.getElementById("peopleCount");
+    if (countEl) countEl.innerText = `People on screen: ${people.length}`;
+
+    // table
+    const body = document.getElementById("dataBodyindex");
+    if (body) body.innerHTML = "";
+    people.forEach(p => {
+      const b = p.detection.box;
+      const distanceM = (FOCAL_PX * FACE_WIDTH_M) / b.width;
+      const zone = distanceM <= GREEN_M ? "green" : "red";
+      const expr = topExpression(p.expressions);
+
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td style="border:1px solid #fff;padding:6px;text-align:center;">P${p.id}</td>
+        <td style="border:1px solid #fff;padding:6px;text-align:center;">${p.gender}</td>
+        <td style="border:1px solid #fff;padding:6px;text-align:center;">${Math.round(p.age)}</td>
+        <td style="border:1px solid #fff;padding:6px;text-align:center;">${expr.expression} (${expr.probability.toFixed(2)})</td>
+        <td style="border:1px solid #fff;padding:6px;text-align:center;">${distanceM.toFixed(2)}</td>
+        <td style="border:1px solid #fff;padding:6px;text-align:center;">${zone}</td>
+      `;
+      body.appendChild(tr);
+    });
+  }
+
+  // OPTIONAL: send to n8n (uncomment N8N_WEBHOOK_URL above to enable)
+  // async function sendToN8N(people) {
+  //   if (!N8N_WEBHOOK_URL) return;
+  //   const payload = {
+  //     timestamp: new Date().toISOString(),
+  //     peopleCount: people.length,
+  //     anyInGreen: people.some(p => (FOCAL_PX * FACE_WIDTH_M) / p.detection.box.width <= GREEN_M),
+  //     people: people.map(p => {
+  //       const b = p.detection.box;
+  //       const distanceM = (FOCAL_PX * FACE_WIDTH_M) / b.width;
+  //       const expr = topExpression(p.expressions);
+  //       return {
+  //         id: p.id,
+  //         age: Math.round(p.age),
+  //         gender: p.gender,
+  //         emotion: expr.expression,
+  //         emotionProb: Number(expr.probability.toFixed(3)),
+  //         distanceM: Number(distanceM.toFixed(2)),
+  //         zone: distanceM <= GREEN_M ? "green" : "red",
+  //         box: { x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height) }
+  //       };
+  //     })
+  //   };
+  //   try {
+  //     await fetch(N8N_WEBHOOK_URL, {
+  //       method: "POST",
+  //       headers: { "Content-Type": "application/json" },
+  //       body: JSON.stringify(payload)
+  //     });
+  //   } catch (e) {
+  //     console.warn("n8n webhook failed:", e);
+  //   }
+  // }
+
+  return (
+    <div style={{ padding: 12 }}>
+      <h3>Face Tracker (near/far)</h3>
+
+      <div style={{ position: "relative", width: 940, height: 650 }}>
+        <video
+          ref={videoRef}
+          autoPlay
+          muted
+          playsInline
+          style={{ display: "block", width: "940px", height: "650px" }}
+        />
+        <canvas
+          ref={canvasRef}
+          style={{
+            position: "absolute", left: 0, top: 0,
+            width: "940px", height: "650px", pointerEvents: "none"
+          }}
+        />
+      </div>
+
+      <div id="peopleCount" style={{ marginTop: 8 }}>People on screen: 0</div>
+
+      <div style={{ maxHeight: "40vh", overflowY: "auto", marginTop: 8 }}>
+        <table style={{ borderCollapse: "collapse", width: "100%", textAlign: "center" }}>
+          <thead>
+            <tr>
+              <th style={{ border: "1px solid #fff", padding: 6 }}>Person</th>
+              <th style={{ border: "1px solid #fff", padding: 6 }}>Gender</th>
+              <th style={{ border: "1px solid #fff", padding: 6 }}>Age</th>
+              <th style={{ border: "1px solid #fff", padding: 6 }}>Emotion</th>
+              <th style={{ border: "1px solid #fff", padding: 6 }}>Distance (m)</th>
+              <th style={{ border: "1px solid #fff", padding: 6 }}>Zone</th>
+            </tr>
+          </thead>
+          <tbody id="dataBodyindex"></tbody>
+        </table>
+      </div>
+    </div>
+  );
+}

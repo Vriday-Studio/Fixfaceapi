@@ -4,7 +4,7 @@ import "./App.css";
 
 /* ======================== CONFIG ======================== */
 // Distance model
-const FACE_WIDTH_M = 0.15;                 // avg face width (m)
+const FACE_WIDTH_M = 0.15;                 // average face width (m)
 const FOCAL_PX     = 500;                  // tune per camera if needed
 const GREEN_M      = 0.8;                  // <= 0.8 m = GREEN (greet), > 0.8 m = RED
 
@@ -13,20 +13,22 @@ const SCORE_TH     = 0.3;                  // lower = more sensitive
 const INPUT_STEPS  = [320, 416, 512, 608]; // adaptive sizes for small/far faces
 
 // Tracking (frame-to-frame for stable overlay)
-const MATCH_THRESHOLD_PX = 60;             // pixel radius to match same person
-const TRACK_TIMEOUT_MS   = 1500;           // drop a track if unseen for this long
+const MATCH_THRESHOLD_PX = 60;             // proximity to match same person
+const TRACK_TIMEOUT_MS   = 1500;           // drop if unseen this long
 
 // Ephemeral recognition (RAM-only, non-persistent)
 const ENABLE_EPHEMERAL_RECOG       = true;
 const MAX_GALLERY                  = 50;
-const DESCRIPTOR_MATCH_THRESHOLD   = 0.55; // lower = stricter
+const DESCRIPTOR_MATCH_THRESHOLD   = 0.55; // for ephemeral matching
 const GALLERY_TTL_MS               = 24 * 60 * 60 * 1000; // 24h TTL
 
-// Known-face recognition via manifest in /public/labels/labels.json
+// Known-face recognition (files in /public/labels/<Name>/<1..N>.jpg)
 const ENABLE_KNOWN_RECOG           = true;
-const LABELS_MANIFEST_URL          = "/labels/labels.json"; // list of {name, images}
+const KNOWN_LABELS                 = ["Jokowi", "Raisa"]; // <-- put your folder names here
+const KNOWN_IMAGES_PER_LABEL       = 4;  // how many images per label to load
+const KNOWN_MATCH_THRESHOLD        = 0.52; // stricter than ephemeral
 
-// n8n webhook (minimal payload)
+// n8n webhook (minimal payload only)
 const N8N_WEBHOOK_URL = "https://n8n.srv954455.hstgr.cloud/webhook-test/camera";
 /* ======================================================== */
 
@@ -40,15 +42,6 @@ const topExpression = (exp = {}) =>
 
 function classifyAgeGroup(ageNum) {
   return ageNum >= 18 ? "adult" : "young";
-}
-
-// Draw a slightly smaller rectangle for nicer visuals
-function shrinkBox(box, ratio = 0.9) {
-  const nw = box.width  * ratio;
-  const nh = box.height * ratio;
-  const nx = box.x + (box.width  - nw) / 2;
-  const ny = box.y + (box.height - nh) / 2;
-  return new faceapi.Rect(nx, ny, nw, nh);
 }
 
 // DPR-aware canvas sizing aligned to the video’s displayed size
@@ -71,21 +64,21 @@ export default function App() {
   const canvasRef = useRef(null);
   const rafRef    = useRef(null);
 
-  // tracks for stable boxes
-  const tracksRef = useRef([]); // [{id, detection, age, gender, expressions, cx, cy, lastSeen, _knownName?, _ephemeralLabel?}]
+  // frame-to-frame tracker (for stable boxes)
+  const tracksRef = useRef([]); // [{id, detection, age, gender, expressions, cx, cy, lastSeen, _ephemeralLabel?, _knownName?}]
   const nextIdRef = useRef(1);
 
-  // ephemeral RAM gallery
+  // ephemeral recognition gallery (RAM-only)
   const galleryRef     = useRef([]); // [{ label, descriptor: Float32Array, lastSeen, createdAt }]
   const nextLabelRef   = useRef(1);
 
-  // known recognition
+  // known recognition matcher
   const faceMatcherRef = useRef(null);
 
   // CPU backend flag
   const cpuSetRef      = useRef(false);
 
-  // adaptive detection memory
+  // far-face adaptive memory
   const lastGoodInputRef = useRef(INPUT_STEPS[0]);
 
   // webhook change detection
@@ -95,14 +88,14 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        // 1) camera
+        // 1) start camera
         const stream = await navigator.mediaDevices.getUserMedia({ video: true });
         const v = videoRef.current;
         v.srcObject = stream;
         await new Promise(res => { if (v.readyState >= 2) res(); else v.onloadedmetadata = () => res(); });
         await v.play().catch(() => {});
 
-        // 2) models
+        // 2) load models
         await Promise.all([
           faceapi.nets.tinyFaceDetector.loadFromUri("/models"),
           faceapi.nets.faceLandmark68Net.loadFromUri("/models"),
@@ -113,17 +106,16 @@ export default function App() {
             : Promise.resolve(),
         ]);
 
-        // 3) CPU backend (CSP-safe on Netlify)
+        // 3) CPU backend (CSP-safe)
         if (!cpuSetRef.current) {
           await faceapi.tf.setBackend("cpu");
           await faceapi.tf.ready();
           cpuSetRef.current = true;
         }
 
-        // 4) known faces via manifest
-        if (ENABLE_KNOWN_RECOG) {
-          const entries = await loadLabelsManifest();
-          faceMatcherRef.current = await buildKnownFaceMatcher(entries);
+        // 4) load known faces (optional)
+        if (ENABLE_KNOWN_RECOG && KNOWN_LABELS.length > 0) {
+          faceMatcherRef.current = await buildKnownFaceMatcher(KNOWN_LABELS, KNOWN_IMAGES_PER_LABEL);
         }
 
         // 5) start loop
@@ -140,54 +132,36 @@ export default function App() {
     };
   }, []);
 
-  /* -------- load labeled faces from labels.json -------- */
-  async function loadLabelsManifest() {
-    try {
-      const res = await fetch(LABELS_MANIFEST_URL, { cache: "no-store" });
-      if (!res.ok) throw new Error("labels.json not found");
-      const data = await res.json();
-      const people = Array.isArray(data.people) ? data.people : [];
-      // normalize: [{name, images}]
-      return people
-        .filter(p => p && p.name)
-        .map(p => ({ name: p.name, images: Math.max(1, Number(p.images || 1)) }));
-    } catch (e) {
-      console.warn("[labels] manifest missing or invalid; skipping known recognition.");
-      return [];
-    }
-  }
-
-  async function buildKnownFaceMatcher(entries /* [{name, images}] */) {
-    if (!entries.length) return new faceapi.FaceMatcher([], 0.6);
-    const labeled = [];
-    for (const { name, images } of entries) {
+  /* -------- load labeled faces and create a FaceMatcher -------- */
+  async function buildKnownFaceMatcher(labels, imagesPerLabel) {
+    const descriptors = [];
+    for (const label of labels) {
       const ds = [];
-      for (let i = 1; i <= images; i++) {
+      for (let i = 1; i <= imagesPerLabel; i++) {
         try {
-          const img = await faceapi.fetchImage(`/labels/${name}/${i}.jpg`);
+          const img = await faceapi.fetchImage(`/labels/${label}/${i}.jpg`);
           const det = await faceapi
             .detectSingleFace(img, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: SCORE_TH }))
             .withFaceLandmarks()
             .withFaceDescriptor();
-          if (det?.descriptor) ds.push(det.descriptor);
-        } catch {
-          // ignore missing/bad images
+          if (det && det.descriptor) ds.push(det.descriptor);
+        } catch (e) {
+          // ignore missing images
         }
       }
-      if (ds.length) labeled.push(new faceapi.LabeledFaceDescriptors(name, ds));
+      if (ds.length) descriptors.push(new faceapi.LabeledFaceDescriptors(label, ds));
     }
-    // stricter threshold for known names
-    return new faceapi.FaceMatcher(labeled, 0.52);
+    return new faceapi.FaceMatcher(descriptors, KNOWN_MATCH_THRESHOLD);
   }
 
   /* ------------------------- main loop ------------------------- */
   function startLoop() {
     const tick = async () => {
       const detections = await detectAdaptive();
-      const people = updateTracksAndLabels(detections); // stable boxes + known/ephemeral name
+      const people = updateTracksAndLabels(detections); // stable boxes + names/ephemeral labels
       drawOverlay(people);
       drawTable(people);
-      await sendToN8N_Minimal(people);                  // minimal payload incl. name
+      await sendToN8N_Minimal(people);
       rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
@@ -197,8 +171,12 @@ export default function App() {
   async function detectOnce(inputSize) {
     const v = videoRef.current;
     if (!v) return [];
-    const opts = new faceapi.TinyFaceDetectorOptions({ inputSize, scoreThreshold: SCORE_TH });
+    const opts = new faceapi.TinyFaceDetectorOptions({
+      inputSize,
+      scoreThreshold: SCORE_TH,
+    });
 
+    // chain models (add descriptors for recognition)
     const chain = faceapi
       .detectAllFaces(v, opts)
       .withFaceLandmarks()
@@ -210,16 +188,19 @@ export default function App() {
     const displaySize = prepCanvasForDisplay(v, canvasRef.current);
     const resized = faceapi.resizeResults(det, displaySize);
 
-    // attach known/ephemeral labels
+    // attach known names / ephemeral labels
     resized.forEach(d => {
+      // known recognition first
       let name = null;
       if (ENABLE_KNOWN_RECOG && faceMatcherRef.current && d.descriptor) {
         const best = faceMatcherRef.current.findBestMatch(d.descriptor);
-        if (best && best.label && best.label !== "unknown" && best.distance <= 0.52) {
+        if (best && best.label && best.label !== "unknown" && best.distance <= KNOWN_MATCH_THRESHOLD) {
           name = best.label;
         }
       }
       d._knownName = name;
+
+      // ephemeral RAM-only label if not known
       if (!name && ENABLE_EPHEMERAL_RECOG && d.descriptor) {
         d._ephemeralLabel = upsertEphemeralIdentity(d.descriptor);
       }
@@ -228,6 +209,7 @@ export default function App() {
     return resized;
   }
 
+  // try last good size first; if no faces, try larger sizes to catch far/small faces
   async function detectAdaptive() {
     const sizes = [lastGoodInputRef.current, ...INPUT_STEPS.filter(s => s !== lastGoodInputRef.current)];
     for (const sz of sizes) {
@@ -273,7 +255,12 @@ export default function App() {
       return galleryRef.current[best.idx].label; // e.g., "G12"
     }
     const label = `G${nextLabelRef.current++}`;
-    galleryRef.current.push({ label, descriptor, lastSeen: now, createdAt: now });
+    galleryRef.current.push({
+      label,
+      descriptor,
+      lastSeen: now,
+      createdAt: now
+    });
     purgeStaleFromGallery(now);
     return label;
   }
@@ -300,6 +287,7 @@ export default function App() {
         p.expressions = d.expressions;
         p.cx = ctr.cx; p.cy = ctr.cy;
         p.lastSeen    = now;
+        // names/labels
         p._knownName      = d._knownName ?? p._knownName ?? null;
         p._ephemeralLabel = (!p._knownName) ? (d._ephemeralLabel ?? p._ephemeralLabel ?? null) : p._ephemeralLabel;
         next.push(p);
@@ -318,8 +306,11 @@ export default function App() {
       }
     });
 
+    // drop stale tracks
     const kept = next.filter(p => now - p.lastSeen < TRACK_TIMEOUT_MS);
+    // sort by creation id (stable row order)
     kept.sort((a, b) => a.id - b.id);
+
     tracksRef.current = kept;
     return kept;
   }
@@ -335,20 +326,22 @@ export default function App() {
     ctx.clearRect(0, 0, displayW, displayH);
 
     people.forEach(p => {
-      const rawBox = p.detection.box;
-      const box = shrinkBox(rawBox, 0.9); // smaller
-      const distanceM = (FOCAL_PX * FACE_WIDTH_M) / rawBox.width;
+      const b = p.detection.box;
+      const distanceM = (FOCAL_PX * FACE_WIDTH_M) / b.width;
       const zone = distanceM <= GREEN_M ? "green" : "red";
       const expr = topExpression(p.expressions);
-      const who  = p._knownName ? p._knownName : (p._ephemeralLabel || "P?");
 
+      const who =
+        p._knownName ? p._knownName :
+        (p._ephemeralLabel ? p._ephemeralLabel : "P?");
       const label = `${who} • ${zone} • ${Math.round(p.age)} ${p.gender} • ${expr.expression}`;
 
-      new faceapi.draw.DrawBox(box, {
+      const drawBox = new faceapi.draw.DrawBox(b, {
         label,
         boxColor: zone === "green" ? "#17c964" : "#f31260",
         lineWidth: 2,
-      }).draw(c);
+      });
+      drawBox.draw(c);
     });
 
     const el = document.getElementById("peopleCount");
@@ -362,11 +355,13 @@ export default function App() {
     body.innerHTML = "";
 
     people.forEach(p => {
-      const rawBox = p.detection.box;
-      const distanceM = (FOCAL_PX * FACE_WIDTH_M) / rawBox.width;
+      const b = p.detection.box;
+      const distanceM = (FOCAL_PX * FACE_WIDTH_M) / b.width;
       const zone = distanceM <= GREEN_M ? "green" : "red";
       const expr = topExpression(p.expressions);
-      const who  = p._knownName ? p._knownName : (p._ephemeralLabel || "—");
+      const who =
+        p._knownName ? p._knownName :
+        (p._ephemeralLabel ? p._ephemeralLabel : "—");
 
       const tr = document.createElement("tr");
       tr.innerHTML = `
@@ -405,13 +400,14 @@ export default function App() {
           gender: p.gender === "female" ? "female" : "male",
           ageGroup: classifyAgeGroup(Math.round(p.age)), // "adult" | "young"
           zone,                                         // "green" | "red"
-          name: p._knownName || null                    // include name if recognized
+          // emotion: topExpression(p.expressions).expression, // keep if you want
+          // name: p._knownName || undefined, // you said you don't need names in webhook; uncomment if you do
         };
       })
     };
 
     const h = simpleHash(minimal);
-    if (h === lastPayloadHashRef.current) return; // send only when changed
+    if (h === lastPayloadHashRef.current) return; // only send on change
     lastPayloadHashRef.current = h;
 
     try {
@@ -428,7 +424,7 @@ export default function App() {
   /* ---------------------------- UI ---------------------------- */
   return (
     <div style={{ padding: 12 }}>
-      <h3>Face Tracker (Netlify • Known Names • Table)</h3>
+      <h3>Face Tracker (Table + Known Names)</h3>
 
       <div style={{ position: "relative", width: 940, height: 650 }}>
         <video

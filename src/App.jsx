@@ -36,7 +36,7 @@ const LABELS_MANIFEST_URL = `${BASE}labels/labels.json`;
 const KNOWN_MATCH_THRESHOLD = 0.52;
 
 // n8n webhook (through Netlify proxy → same origin)
-const N8N_WEBHOOK_URL = "/api/n8n/camera";
+const N8N_WEBHOOK_URL = "/api/n8n-test/camera";
 /* ======================================================== */
 
 const center = (b) => ({ cx: b.x + b.width / 2, cy: b.y + b.height / 2 });
@@ -123,29 +123,17 @@ export default function App() {
             : Promise.resolve(),
         ]);
 
-        // Decide backend based on environment
-        const ON_NETLIFY = /\.netlify\.app$/.test(window.location.hostname);
-        // Allow manual override via ?forceCpu=1
-        const FORCE_CPU = ON_NETLIFY || /forceCpu=1/.test(window.location.search);
-
+        // 3) backend: try WebGL, fallback CPU; allow ?forceCpu=1
+        const FORCE_CPU = /forceCpu=1/.test(window.location.search);
         try {
-          if (FORCE_CPU) throw new Error("Force CPU due to CSP or param");
+          if (FORCE_CPU) throw new Error("Forced CPU via ?forceCpu=1");
           await faceapi.tf.setBackend("webgl");
           await faceapi.tf.ready();
           console.log("Using WebGL");
         } catch (e) {
-          console.log("WebGL blocked/unavailable → trying WASM...");
-          try {
-            // Optional (see option B): WASM backend (fast + CSP-safe)
-            await faceapi.tf.setBackend("wasm");
-            await faceapi.tf.ready();
-            console.log("Using WASM backend");
-          } catch {
-            // Always works with strict CSP
-            await faceapi.tf.setBackend("cpu");
-            await faceapi.tf.ready();
-            console.log("Using CPU backend");
-          }
+          console.log("WebGL unavailable → CPU:", e?.message || e);
+          await faceapi.tf.setBackend("cpu");
+          await faceapi.tf.ready();
         }
 
         // 4) known faces (safe loader; may return null)

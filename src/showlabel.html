@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Show Label</title>
+</head>
+<body>
+    <div id="promptDisplay"></div>
+
+    <script>
+        // Retrieve the value from local storage
+        const latestPrompt = localStorage.getItem("latestPrompt") || "No people";
+
+        // Display the value in the div
+        document.getElementById("promptDisplay").innerText = latestPrompt;
+    </script>
+</body>
+</html>

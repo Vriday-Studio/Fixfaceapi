@@ -5,31 +5,37 @@ import * as faceapi from "face-api.js";
    CONFIG
    ────────────────────────────────────────────────────────────────────────────── */
 
-const MODEL_URL = "/models";          // face-api models path
-const FACE_WIDTH_M = 0.15;            // average face width (meters)
-const FOCAL_PX = 500;                 // adjust per camera for better distance
-const GREEN_MAX_M = 0.8;              // <= 0.8m => green zone
+// Face-API models
+const MODEL_URL = "/models";
 
-// tiny detector options (balanced for speed + accuracy)
+// Distance estimation
+const FACE_WIDTH_M = 0.15;  // average face width in meters
+const FOCAL_PX     = 1350;   // tune per camera for better distance accuracy
+const GREEN_MAX_M  = 1.0;   // <= 0.6m => green; further => red
+
+// Detector
 const TINY_OPTS = new faceapi.TinyFaceDetectorOptions({
-  inputSize: 224,
-  scoreThreshold: 0.5,
+  inputSize: 320,
+  scoreThreshold: 0.35,
 });
 
-// session timings
-const START_FRAMES = 8;      // require N consecutive frames to start a session
-const END_AFTER_MS = 8000;   // stop after 8s of no faces
-const SNAPSHOT_EVERY = 900;  // at most one snapshot every 900ms
+// Session timing
+const START_FRAMES    = 8;     // need N consecutive frames with faces to start
+const END_AFTER_MS    = 8000;  // stop after 8s of no faces
+const SNAPSHOT_EVERY  = 900;   // post at most once per 900ms
+const DETECTOR_STEPMS = 120;   // ~8 FPS detection pacing
+
+// Box appearance
+const BOX_SHRINK = 0.7;  // 0.6 tighter, 0.8 looser
 
 /* ──────────────────────────────────────────────────────────────────────────────
    N8N ENDPOINT RESOLVER
-   - Default: on Netlify use TEST proxy, locally use PROD proxy.
-   - URL flags:
-       ?useTest=1   -> force test
-       ?useProd=1   -> force prod
-       ?direct=1    -> bypass proxy & hit n8n directly
-       ?debugPost=1 -> await HTTP responses (instead of beacon)
-   - Netlify proxy paths must match your netlify.toml redirects.
+   URL flags:
+     ?useTest=1   -> force test
+     ?useProd=1   -> force prod
+     ?direct=1    -> hit n8n directly (no Netlify proxy)
+     ?debugPost=1 -> await HTTP responses (debug)
+     ?camera=environment | user
    ────────────────────────────────────────────────────────────────────────────── */
 
 const QS = new URLSearchParams(window.location.search);
@@ -40,15 +46,11 @@ const FORCE_PROD = QS.has("useProd");
 const USE_DIRECT = QS.has("direct");
 const DEBUG_FETCH = QS.has("debugPost");
 
-// default behavior: Netlify => TEST; local dev => PROD (you can override with flags)
-const DEFAULT_TEST = !IS_LOCAL;
+const DEFAULT_TEST = !IS_LOCAL;              // Netlify => test, local => prod (override with flags)
 const useTest = FORCE_TEST ? true : FORCE_PROD ? false : DEFAULT_TEST;
 
-// Netlify proxy bases
-const BASE_TEST = "/api/n8n-test";
-const BASE_PROD = "/api/n8n";
-
-// Direct (no proxy) bases (edit if your domain changes)
+const BASE_TEST = "/api/n8n-test";           // Netlify proxy → /webhook-test
+const BASE_PROD = "/api/n8n";                // Netlify proxy → /webhook
 const DIRECT_TEST = "https://n8n.srv954455.hstgr.cloud/webhook-test";
 const DIRECT_PROD = "https://n8n.srv954455.hstgr.cloud/webhook";
 
@@ -58,9 +60,9 @@ function pickBase() {
 }
 function mkEndpoints(base) {
   return {
-    start: `${base}/camera/start`,
+    start:    `${base}/camera/start`,
     snapshot: `${base}/camera/snapshot`,
-    stop: `${base}/camera/stop`,
+    stop:     `${base}/camera/stop`,
   };
 }
 const N8N = mkEndpoints(pickBase());
@@ -70,8 +72,8 @@ const N8N = mkEndpoints(pickBase());
    ────────────────────────────────────────────────────────────────────────────── */
 
 const uuid = () =>
-  (crypto?.randomUUID ? crypto.randomUUID() :
-   Math.random().toString(36).slice(2) + Date.now().toString(36));
+  (crypto?.randomUUID ? crypto.randomUUID()
+   : Math.random().toString(36).slice(2) + Date.now().toString(36));
 
 const estimateDistanceM = (faceBoxWidthPx) =>
   faceBoxWidthPx ? (FOCAL_PX * FACE_WIDTH_M) / faceBoxWidthPx : null;
@@ -84,12 +86,25 @@ const ageGroupOf = (age) => {
   return "child";
 };
 
-const zoneOf = (distanceM) => (distanceM != null && distanceM <= GREEN_MAX_M ? "green" : "red");
+const zoneOf = (distanceM) =>
+  distanceM != null && distanceM <= GREEN_MAX_M ? "green" : "red";
 
 const topExpression = (expressions) => {
   if (!expressions) return "neutral";
   return Object.entries(expressions).reduce((a, b) => (a[1] > b[1] ? a : b))[0];
 };
+
+// Make a smaller rectangle centered inside the original
+function shrinkBox(b, factor = BOX_SHRINK) {
+  const w = b.width * factor;
+  const h = b.height * factor;
+  return {
+    x: b.x + (b.width - w) / 2,
+    y: b.y + (b.height - h) / 2,
+    width: w,
+    height: h,
+  };
+}
 
 /* ──────────────────────────────────────────────────────────────────────────────
    APP
@@ -108,7 +123,8 @@ export default function App() {
   const [lastSent, setLastSent] = useState({ start: "-", snapshot: "-", stop: "-" });
   const [lastHttp, setLastHttp] = useState({ start: "", snapshot: "", stop: "" });
 
-  const [table, setTable] = useState([]); // rows for the UI table
+  const [table, setTable] = useState([]); // only GREEN faces (max 5) for UI
+  const [totals, setTotals] = useState({ all: 0, green: 0, red: 0 });
 
   const faceMatcherRef = useRef(null);
 
@@ -123,7 +139,7 @@ export default function App() {
   /* ── init: backend, models, labels, camera ──────────────────────────────── */
   useEffect(() => {
     (async () => {
-      // backend fallback chain
+      // backend fallback: webgl → wasm → cpu
       try {
         await faceapi.tf.setBackend("webgl");
         await faceapi.tf.ready();
@@ -148,51 +164,47 @@ export default function App() {
         faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
       ]);
 
-      // optional face recognition using /labels/labels.json
+      // Optional name recognition via /labels/labels.json
       try {
-        // expected format:
-        // { "people": [ { "name": "Raisa", "images": 4 }, ... ] }
         const res = await fetch("/labels/labels.json", { cache: "no-store" });
         if (res.ok) {
-          const manifest = await res.json();
+          const manifest = await res.json(); // { people:[{name,images}] }
           const labeled = [];
           for (const person of manifest.people || []) {
             const descs = [];
             for (let i = 1; i <= Number(person.images || 0); i++) {
-              const img = await faceapi.fetchImage(`/labels/${person.name}/${i}.jpg`);
-              const d = await faceapi
-                .detectSingleFace(img, TINY_OPTS)
-                .withFaceLandmarks()
-                .withFaceDescriptor();
-              if (d?.descriptor) descs.push(d.descriptor);
+              try {
+                const img = await faceapi.fetchImage(`/labels/${person.name}/${i}.jpg`);
+                const d = await faceapi
+                  .detectSingleFace(img, TINY_OPTS)
+                  .withFaceLandmarks()
+                  .withFaceDescriptor();
+                if (d?.descriptor) descs.push(d.descriptor);
+              } catch {}
             }
-            if (descs.length) {
-              labeled.push(new faceapi.LabeledFaceDescriptors(person.name, descs));
-            }
+            if (descs.length) labeled.push(new faceapi.LabeledFaceDescriptors(person.name, descs));
           }
-          if (labeled.length) {
-            faceMatcherRef.current = new faceapi.FaceMatcher(labeled, 0.6);
-          }
+          if (labeled.length) faceMatcherRef.current = new faceapi.FaceMatcher(labeled, 0.65);
         }
-      } catch {
-        // no labels available → skip silently
-      }
+      } catch {}
 
-      // camera selection: default front camera; override via ?camera=environment
-      const requestedFacing = QS.get("camera") || "user"; // "user" | "environment"
+      // Camera: allow ?camera=environment | user
+      const requestedFacing = QS.get("camera") || "user";
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: requestedFacing,
-          width: { ideal: 1280 }, // give the detector enough pixels
-          height: { ideal: 720 },
-        },
+        video: { facingMode: requestedFacing, width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false,
       });
       if (videoRef.current) videoRef.current.srcObject = stream;
 
       setReady(true);
-      console.log(`[n8n] using ${useTest ? "TEST" : "PROD"} ${USE_DIRECT ? "direct" : "proxy"} endpoints`, N8N);
+      console.log(`[n8n] ${useTest ? "TEST" : "PROD"} ${USE_DIRECT ? "direct" : "proxy"} →`, N8N);
     })();
+
+    return () => {
+      const s = videoRef.current?.srcObject;
+      if (s) s.getTracks()?.forEach(t => t.stop());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /* ── detection loop ─────────────────────────────────────────────────────── */
@@ -213,11 +225,10 @@ export default function App() {
 
     let raf = 0;
     let lastRun = 0;
-    const STEP_MS = 120; // ~8 FPS
 
     const loop = async (ts) => {
       raf = requestAnimationFrame(loop);
-      if (ts - lastRun < STEP_MS) return;
+      if (ts - lastRun < DETECTOR_STEPMS) return;
       lastRun = ts;
       if (!video.videoWidth) return;
 
@@ -229,46 +240,35 @@ export default function App() {
         .withFaceDescriptors();
 
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      const resized = faceapi.resizeResults(dets, { width: canvas.width, height: canvas.height });
+
+      const resized = faceapi
+        .resizeResults(dets, { width: canvas.width, height: canvas.height })
+        .sort((a, b) => a.detection.box.x - b.detection.box.x);
+
       const matcher = faceMatcherRef.current;
-
-      // left→right for stable table rows
-      resized.sort((a, b) => a.detection.box.x - b.detection.box.x);
-
-      const rows = [];
+      const allRows = [];
       const peopleForPost = [];
 
-      resized.forEach((det, i) => {
-        const box = det.detection.box;
+      for (let i = 0; i < resized.length; i++) {
+        const det = resized[i];
+        const box = det.detection.box;                // original box for distance math
         const distM = estimateDistanceM(box.width);
-        const zone = zoneOf(distM);
+        const zone  = zoneOf(distM);
         const color = zone === "green" ? "#22c55e" : "#ef4444";
 
-        // optional name
-        const name =
-          matcher && det.descriptor
-            ? (() => {
-                const best = matcher.findBestMatch(det.descriptor);
-                return best?.label && best.label !== "unknown" ? best.label : null;
-              })()
-            : null;
+        // Optional name
+        let name = null;
+        if (matcher && det.descriptor) {
+          const best = matcher.findBestMatch(det.descriptor);
+          if (best?.label && best.label !== "unknown") name = best.label;
+        }
 
-        /* ─ draw a slimmer box + readable label ─ */
-        const shrinkFactor = 0.7; // adjust 0.6–0.8 until it feels right
-
-        const newWidth = box.width * shrinkFactor;
-        const newHeight = box.height * shrinkFactor;
-        const offsetX = (box.width - newWidth) / 2;
-        const offsetY = (box.height - newHeight) / 2;
-
-        const x = box.x + offsetX;
-        const y = box.y + offsetY;
-        const w = newWidth;
-        const h = newHeight;
+        // Draw smaller, centered box + label
+        const dbox = shrinkBox(box, BOX_SHRINK);
 
         ctx.strokeStyle = color;
-        ctx.lineWidth = 5;
-        ctx.strokeRect(x, y, w, h);
+        ctx.lineWidth = 2;
+        ctx.strokeRect(dbox.x, dbox.y, dbox.width, dbox.height);
 
         const label =
           `${zone} • ${Math.max(0, Math.round(det.age))} ${det.gender}` +
@@ -276,18 +276,19 @@ export default function App() {
           (name ? ` • ${name}` : "");
 
         ctx.font = "14px system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
-        const padX = 3, padY = 3;
+        const padX = 6, padY = 4;
         const textW = ctx.measureText(label).width + padX * 2;
         const textH = 18 + padY * 2;
-        const labelX = Math.max(0, Math.min(x, canvas.width - textW));
-        const labelY = Math.max(0, y - textH - 4);
+        const labelX = Math.max(0, Math.min(dbox.x, canvas.width - textW));
+        const labelY = Math.max(0, dbox.y - textH - 4);
 
         ctx.fillStyle = color;
         ctx.fillRect(labelX, labelY, textW, textH);
         ctx.fillStyle = "#fff";
         ctx.fillText(label, labelX + padX, labelY + 14);
 
-        rows.push({
+        // all rows (we will filter to GREEN for the table)
+        allRows.push({
           idx: i + 1,
           gender: (det.gender || "").toLowerCase(),
           ageGroup: ageGroupOf(det.age),
@@ -296,22 +297,35 @@ export default function App() {
           distance: distM ? distM.toFixed(2) + " m" : "-",
         });
 
+        // Always send ALL people to n8n
         peopleForPost.push({
           gender: (det.gender || "").toLowerCase(),
           ageGroup: ageGroupOf(det.age),
           zone,
           name: name || null,
         });
-      });
-
-      // keep 5 rows for a stable table
-      const filled = rows.slice(0, 5);
-      for (let i = filled.length; i < 5; i++) {
-        filled.push({ idx: i + 1, gender: "-", ageGroup: "-", zone: "-", name: "-", distance: "-" });
       }
-      setTable(filled);
 
-      // session FSM update
+      // Totals (all faces)
+      const green = allRows.filter(r => r.zone === "green").length;
+      const red   = allRows.filter(r => r.zone === "red").length;
+      setTotals({ all: allRows.length, green, red });
+
+      // UI table: only GREEN (max 5), padded to 5 rows
+      const greenRows = allRows.filter(r => r.zone === "green").slice(0, 5);
+      while (greenRows.length < 5) {
+        greenRows.push({
+          idx: greenRows.length + 1,
+          gender: "-",
+          ageGroup: "-",
+          zone: "-",
+          name: "-",
+          distance: "-",
+        });
+      }
+      setTable(greenRows);
+
+      // Session FSM uses ALL people (greens + reds)
       await updateSession(peopleForPost);
     };
 
@@ -322,45 +336,45 @@ export default function App() {
     };
   }, [ready]);
 
-  /* ── posting helpers (sendBeacon by default) ───────────────────────────── */
+  /* ── posting helpers (sendBeacon by default, fetch fallback) ───────────── */
   const post = async (which, payload) => {
     const url = N8N[which];
     const nowStr = new Date().toLocaleTimeString();
 
-    // default: beacon (non-blocking)
     if (!DEBUG_FETCH) {
-      const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
-      const ok = navigator.sendBeacon(url, blob);
-      setPosts((p) => ({ ...p, [which]: p[which] + 1 }));
-      setLastSent((s) => ({ ...s, [which]: nowStr }));
-      setLastHttp((h) => ({ ...h, [which]: ok ? "sent (beacon)" : "fallback sent" }));
-      if (!ok) {
-        try {
+      // fire-and-forget
+      try {
+        const ok = navigator.sendBeacon(url, new Blob([JSON.stringify(payload)], { type: "application/json" }));
+        if (!ok) {
           const r = await fetch(url, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify(payload),
           });
-          setLastHttp((h) => ({ ...h, [which]: r.ok ? "OK (fetch)" : `HTTP ${r.status}` }));
-        } catch (e) {
-          setLastHttp((h) => ({ ...h, [which]: `ERR ${String(e)}` }));
+          setLastHttp(h => ({ ...h, [which]: r.ok ? "OK (fetch)" : `HTTP ${r.status}` }));
+        } else {
+          setLastHttp(h => ({ ...h, [which]: "sent (beacon)" }));
         }
+      } catch (e) {
+        setLastHttp(h => ({ ...h, [which]: `ERR ${String(e)}` }));
       }
+      setPosts(p => ({ ...p, [which]: p[which] + 1 }));
+      setLastSent(s => ({ ...s, [which]: nowStr }));
       return;
     }
 
-    // debug: await response
+    // debug: await the response
     try {
       const r = await fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(payload),
       });
-      setPosts((p) => ({ ...p, [which]: p[which] + 1 }));
-      setLastSent((s) => ({ ...s, [which]: nowStr }));
-      setLastHttp((h) => ({ ...h, [which]: r.ok ? "OK" : `HTTP ${r.status}` }));
+      setPosts(p => ({ ...p, [which]: p[which] + 1 }));
+      setLastSent(s => ({ ...s, [which]: nowStr }));
+      setLastHttp(h => ({ ...h, [which]: r.ok ? "OK" : `HTTP ${r.status}` }));
     } catch (e) {
-      setLastHttp((h) => ({ ...h, [which]: `ERR ${String(e)}` }));
+      setLastHttp(h => ({ ...h, [which]: `ERR ${String(e)}` }));
     }
   };
 
@@ -404,14 +418,10 @@ export default function App() {
   }
 
   /* ── UI ────────────────────────────────────────────────────────────────── */
-  const totalOnScreen = table.filter(r => r.zone === "green" || r.zone === "red").length;
   const statusDot = (s) => ({
     display: "inline-block",
-    width: 10,
-    height: 10,
-    borderRadius: 999,
-    marginRight: 6,
-    background: s === "ACTIVE" ? "#22c55e" : "#fbbf24", // green / amber
+    width: 10, height: 10, borderRadius: 999, marginRight: 6,
+    background: s === "ACTIVE" ? "#22c55e" : "#fbbf24",
   });
 
   return (
@@ -427,95 +437,59 @@ export default function App() {
           fontSize: 14,
         }}
       >
-        <div
-          style={{
-            background: "#1a1a1a",
-            borderRadius: 8,
-            padding: 10,
-            display: "flex",
-            flexDirection: "column",
-            gap: 4,
-          }}
-        >
+        <div style={{ background:"#1a1a1a", borderRadius:8, padding:10, display:"flex", flexDirection:"column", gap:4 }}>
           <div><strong>Backend:</strong> {backend}</div>
           <div><strong>Models:</strong> {ready ? "loaded" : "loading…"}</div>
-          <div>
-            <span style={statusDot(sessionStatus)} />
-            <strong>Session:</strong> {sessionStatus}{sessionId ? ` (${sessionId.slice(0, 8)})` : ""}
-          </div>
+          <div><span style={statusDot(sessionStatus)} /><strong>Session:</strong> {sessionStatus}{sessionId ? ` (${sessionId.slice(0,8)})` : ""}</div>
           <div><strong>Posts:</strong> start {posts.start} · snap {posts.snapshot} · stop {posts.stop}</div>
         </div>
-
-        <div
-          style={{
-            background: "#1a1a1a",
-            borderRadius: 8,
-            padding: 10,
-            display: "flex",
-            flexDirection: "column",
-            gap: 4,
-          }}
-        >
+        <div style={{ background:"#1a1a1a", borderRadius:8, padding:10, display:"flex", flexDirection:"column", gap:4 }}>
           <div><strong>Last Sent:</strong> start {lastSent.start} · snap {lastSent.snapshot} · stop {lastSent.stop}</div>
-          <div style={{ opacity: 0.85 }}>
-            <strong>HTTP:</strong>{" "}
-            start {lastHttp.start || "-"} · snap {lastHttp.snapshot || "-"} · stop {lastHttp.stop || "-"}
+          <div style={{ opacity:.85 }}>
+            <strong>HTTP:</strong> start {lastHttp.start || "-"} · snap {lastHttp.snapshot || "-"} · stop {lastHttp.stop || "-"}
             {DEBUG_FETCH ? " (debug)" : " (beacon)"}
           </div>
-          <div style={{ opacity: 0.75 }}>
-            <strong>n8n:</strong> {useTest ? "TEST" : "PROD"} {USE_DIRECT ? "(direct)" : "(proxy)"}
-          </div>
+          <div style={{ opacity:.75 }}><strong>n8n:</strong> {useTest ? "TEST" : "PROD"} {USE_DIRECT ? "(direct)" : "(proxy)"}</div>
+          <div style={{ opacity:.75 }}><strong>Faces:</strong> total {totals.all} • green {totals.green} • red {totals.red}</div>
         </div>
       </div>
 
       {/* Video + overlay */}
-      <div style={{ position: "relative", maxWidth: 960, margin: "0 auto" }}>
-        <video
-          ref={videoRef}
-          autoPlay
-          muted
-          playsInline
-          style={{ width: "100%", borderRadius: 8, background: "#000" }}
-        />
-        <canvas
-          ref={canvasRef}
-          style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }}
-        />
+      <div style={{ position:"relative", maxWidth:960, margin:"0 auto" }}>
+        <video ref={videoRef} autoPlay muted playsInline style={{ width:"100%", borderRadius:8, background:"#000" }} />
+        <canvas ref={canvasRef} style={{ position:"absolute", inset:0, width:"100%", height:"100%" }} />
       </div>
 
-      {/* Table */}
-      <div style={{ maxWidth: 960, margin: "10px auto 40px" }}>
-        <div style={{ margin: "8px 4px", fontSize: 14, opacity: 0.9 }}>
-          <strong>Total on screen:</strong> {totalOnScreen}
+      {/* Table (only GREEN rows) */}
+      <div style={{ maxWidth:960, margin:"10px auto 40px" }}>
+        <div style={{ margin:"8px 4px", fontSize:14, opacity:.9 }}>
+          <strong>Shown in table:</strong> up to 5 GREEN faces (n8n still receives ALL)
         </div>
-        <div style={{ overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
+        <div style={{ overflowX:"auto" }}>
+          <table style={{ width:"100%", borderCollapse:"collapse", fontSize:14 }}>
             <thead>
-              <tr style={{ background: "#1f1f1f" }}>
+              <tr style={{ background:"#1f1f1f" }}>
                 {["#", "Gender", "AgeGroup", "Zone", "Name", "Distance"].map((h) => (
-                  <th key={h} style={{ textAlign: "left", padding: "8px 10px" }}>{h}</th>
+                  <th key={h} style={{ textAlign:"left", padding:"8px 10px" }}>{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
               {table.map((r) => (
-                <tr key={r.idx} style={{ borderTop: "1px solid #222" }}>
-                  <td style={{ padding: "8px 10px" }}>{r.idx}</td>
-                  <td style={{ padding: "8px 10px" }}>{r.gender}</td>
-                  <td style={{ padding: "8px 10px" }}>{r.ageGroup}</td>
-                  <td style={{ padding: "8px 10px", color: r.zone === "green" ? "#22c55e" : r.zone === "red" ? "#ef4444" : "#aaa" }}>
-                    {r.zone}
-                  </td>
-                  <td style={{ padding: "8px 10px" }}>{r.name}</td>
-                  <td style={{ padding: "8px 10px" }}>{r.distance}</td>
+                <tr key={r.idx} style={{ borderTop:"1px solid #222" }}>
+                  <td style={{ padding:"8px 10px" }}>{r.idx}</td>
+                  <td style={{ padding:"8px 10px" }}>{r.gender}</td>
+                  <td style={{ padding:"8px 10px" }}>{r.ageGroup}</td>
+                  <td style={{ padding:"8px 10px", color: r.zone === "green" ? "#22c55e" : r.zone === "red" ? "#ef4444" : "#aaa" }}>{r.zone}</td>
+                  <td style={{ padding:"8px 10px" }}>{r.name}</td>
+                  <td style={{ padding:"8px 10px" }}>{r.distance}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
-        <div style={{ marginTop: 6, fontSize: 12, opacity: 0.7 }}>
-          Tip: add <code>?debugPost=1</code> to await responses and see “OK/ERR” above.  
-          Use <code>?useTest=1</code> / <code>?useProd=1</code> and <code>?direct=1</code> to switch modes quickly.
+        <div style={{ marginTop:6, fontSize:12, opacity:.7 }}>
+          Add <code>?useTest=1</code> / <code>?useProd=1</code>, <code>?direct=1</code>, <code>?debugPost=1</code>, and <code>?camera=environment</code> if needed.
         </div>
       </div>
     </main>

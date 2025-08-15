@@ -1,477 +1,434 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as faceapi from "face-api.js";
-import "./App.css";
 
-/* ======================== CONFIG ======================== */
-// Base path (works for Netlify subpaths)
-const BASE = (import.meta?.env?.BASE_URL) ? import.meta.env.BASE_URL : "/";
+// ====== CONFIG ======
+const MODEL_URL = "/models";                 // face-api models path
+const FACE_WIDTH_M = 0.15;                   // avg face width (m)
+const FOCAL_PX = 500;                        // tune per camera if needed
+const GREEN_MAX_M = 0.8;                     // <= 0.8m → green
 
-// Camera
-const CAM_W = 640, CAM_H = 480, CAM_FPS = 30;
+const TINY_OPTS = new faceapi.TinyFaceDetectorOptions({
+  inputSize: 224,
+  scoreThreshold: 0.5,
+});
 
-// Distance model (tune FOCAL_PX per camera if needed)
-const FACE_WIDTH_M = 0.15;
-const FOCAL_PX     = 500;
-const GREEN_M      = 0.8; // <= 0.8 m = green; otherwise red
+// n8n (proxied by netlify.toml)
+const N8N = {
+  start: "/api/n8n/start",
+  snapshot: "/api/n8n/snapshot",
+  stop: "/api/n8n/stop",
+};
 
-// Detection cadence
-const SCORE_TH     = 0.3;
-const INPUT_STEPS  = [320, 416, 512]; // try bigger only after consecutive misses
-const TICK_MS      = 120;              // compute interval (~8 fps)
-const HEAVY_EVERY  = 3;                // heavy pass (age/gender/desc) every Nth tick
+// session timings
+const START_FRAMES = 8;      // need N consecutive frames w/ faces to start
+const END_AFTER_MS = 8000;   // stop after 8s of no faces
+const SNAPSHOT_EVERY = 600;  // snapshot at most once per 600ms
 
-// Tracking & identity
-const MATCH_THRESHOLD_PX = 60;
-const TRACK_TIMEOUT_MS   = 1200;
+// ====== HELPERS ======
+const uuid = () =>
+  (crypto?.randomUUID ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2) + Date.now().toString(36));
 
-// Ephemeral (RAM-only) recognition
-const ENABLE_EPHEMERAL_RECOG     = true;
-const MAX_GALLERY                = 50;
-const DESCRIPTOR_MATCH_THRESHOLD = 0.55;
-const GALLERY_TTL_MS             = 12 * 60 * 60 * 1000; // 12h
+const estimateDistanceM = (faceBoxWidthPx) =>
+  faceBoxWidthPx ? (FOCAL_PX * FACE_WIDTH_M) / faceBoxWidthPx : null;
 
-// Known faces via manifest
-const ENABLE_KNOWN_RECOG  = true;
-const LABELS_MANIFEST_URL = `${BASE}labels/labels.json`;
-const KNOWN_MATCH_THRESHOLD = 0.52;
+const ageGroupOf = (age) => {
+  if (age == null) return "unknown";
+  const a = Math.round(age);
+  if (a >= 18) return "adult";
+  if (a >= 12) return "teen";
+  return "child";
+};
 
-// n8n webhook (through Netlify proxy → same origin)
-const N8N_WEBHOOK_URL = "/api/n8n-test/camera";
-/* ======================================================== */
+const zoneOf = (distanceM) =>
+  distanceM != null && distanceM <= GREEN_MAX_M ? "green" : "red";
 
-const center = (b) => ({ cx: b.x + b.width / 2, cy: b.y + b.height / 2 });
-const euclid = (a, b) => Math.hypot(a.cx - b.cx, a.cy - b.cy);
-const topExpression = (exp = {}) =>
-  Object.entries(exp)
-    .map(([expression, probability]) => ({ expression, probability }))
-    .sort((a, b) => b.probability - a.probability)[0] || { expression: "neutral", probability: 0 };
-const classifyAgeGroup = (age) => (age >= 18 ? "adult" : "young");
+const topExpression = (expressions) => {
+  if (!expressions) return "neutral";
+  return Object.entries(expressions).reduce((a, b) => (a[1] > b[1] ? a : b))[0];
+};
 
-function shrinkBox(box, ratio = 0.9) {
-  const nw = box.width  * ratio;
-  const nh = box.height * ratio;
-  const nx = box.x + (box.width  - nw) / 2;
-  const ny = box.y + (box.height - nh) / 2;
-  return new faceapi.Rect(nx, ny, nw, nh);
-}
-function prepCanvasForDisplay(video, canvas) {
-  const width  = video.clientWidth  || video.videoWidth  || CAM_W;
-  const height = video.clientHeight || video.videoHeight || CAM_H;
-  const dpr = window.devicePixelRatio || 1;
-  canvas.width  = Math.round(width * dpr);
-  canvas.height = Math.round(height * dpr);
-  canvas.style.width  = `${width}px`;
-  canvas.style.height = `${height}px`;
-  const ctx = canvas.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  return { width, height };
-}
-
-function setStatus(text, color) {
-  const el = document.getElementById("statusLight");
-  if (!el) return;
-  el.textContent = text;
-  el.style.color = color;
-}
-const setOK = () => setStatus("OK", "#17c964");
-const setERR = () => setStatus("ERR", "#f31260");
-
+// ====== APP ======
 export default function App() {
-  const videoRef  = useRef(null);
+  const videoRef = useRef(null);
   const canvasRef = useRef(null);
 
-  const loopTimerRef = useRef(null);
-  const tickIdxRef   = useRef(0);
+  const [ready, setReady] = useState(false);
+  const [backend, setBackend] = useState("cpu");
 
-  const tracksRef = useRef([]); // stable boxes per frame
-  const nextIdRef = useRef(1);
+  const [sessionStatus, setSessionStatus] = useState("IDLE"); // IDLE | ACTIVE
+  const [sessionId, setSessionId] = useState(null);
+  const [posts, setPosts] = useState({ start: 0, snapshot: 0, stop: 0 });
+  const [lastSent, setLastSent] = useState({ start: "-", snapshot: "-", stop: "-" });
+  const [lastHttp, setLastHttp] = useState({ start: "", snapshot: "", stop: "" }); // OK / error (debug)
+  const [table, setTable] = useState([]); // [{idx, gender, ageGroup, zone, name}…]
 
-  const lastGoodInputRef = useRef(INPUT_STEPS[0]);
-  const emptyStreakRef   = useRef(0);
+  const faceMatcherRef = useRef(null);
 
-  const faceMatcherRef   = useRef(null); // known faces
-  const galleryRef       = useRef([]);   // ephemeral
-  const nextLabelRef     = useRef(1);
+  // FSM scratch
+  const S = useRef({
+    id: null,
+    seenFrames: 0,
+    lastFaceTs: 0,
+    lastSnapshotTs: 0,
+  });
 
-  const lastPayloadHashRef = useRef("");
+  const DEBUG_FETCH = /[?&]debugPost=1\b/.test(window.location.search);
 
+  // --- init: backend, models, labels, camera ---
   useEffect(() => {
     (async () => {
+      // backend fallback (webgl → wasm → cpu)
       try {
-        // 1) start camera
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            width:  { ideal: CAM_W, max: CAM_W },
-            height: { ideal: CAM_H, max: CAM_H },
-            frameRate: { ideal: CAM_FPS }
-          },
-          audio: false
-        });
-        const v = videoRef.current;
-        v.srcObject = stream;
-        await new Promise(res => { if (v.readyState >= 2) res(); else v.onloadedmetadata = () => res(); });
-        await v.play().catch(() => {});
-
-        // 2) load models (only what we need)
-        await Promise.all([
-          faceapi.nets.tinyFaceDetector.loadFromUri(`${BASE}models`),
-          faceapi.nets.faceLandmark68Net.loadFromUri(`${BASE}models`),
-          faceapi.nets.faceExpressionNet.loadFromUri(`${BASE}models`),
-          faceapi.nets.ageGenderNet.loadFromUri(`${BASE}models`),
-          (ENABLE_EPHEMERAL_RECOG || ENABLE_KNOWN_RECOG)
-            ? faceapi.nets.faceRecognitionNet.loadFromUri(`${BASE}models`)
-            : Promise.resolve(),
-        ]);
-
-        // 3) backend: try WebGL, fallback CPU; allow ?forceCpu=1
-        const FORCE_CPU = /forceCpu=1/.test(window.location.search);
+        await faceapi.tf.setBackend("webgl");
+        await faceapi.tf.ready();
+        setBackend("webgl");
+      } catch {
         try {
-          if (FORCE_CPU) throw new Error("Forced CPU via ?forceCpu=1");
-          await faceapi.tf.setBackend("webgl");
+          await faceapi.tf.setBackend("wasm");
           await faceapi.tf.ready();
-          console.log("Using WebGL");
-        } catch (e) {
-          console.log("WebGL unavailable → CPU:", e?.message || e);
+          setBackend("wasm");
+        } catch {
           await faceapi.tf.setBackend("cpu");
           await faceapi.tf.ready();
+          setBackend("cpu");
         }
-
-        // 4) known faces (safe loader; may return null)
-        if (ENABLE_KNOWN_RECOG) faceMatcherRef.current = await loadKnownMatcherSafe();
-
-        // 5) start loop
-        startLoop();
-      } catch (e) {
-        console.error("[init] failed:", e);
-        setERR();
       }
-    })();
 
-    return () => {
-      if (loopTimerRef.current) clearInterval(loopTimerRef.current);
-      const s = videoRef.current?.srcObject;
-      if (s) s.getTracks().forEach(t => t.stop());
-    };
+      await Promise.all([
+        faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+        faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+        faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL),
+        faceapi.nets.ageGenderNet.loadFromUri(MODEL_URL),
+        faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
+      ]);
+
+      // optional face recognition via /labels/labels.json
+      try {
+        const res = await fetch("/labels/labels.json", { cache: "no-store" });
+        if (res.ok) {
+          const manifest = await res.json(); // { people:[{name,images}] }
+          const labeled = [];
+          for (const person of manifest.people || []) {
+            const descs = [];
+            for (let i = 1; i <= Number(person.images || 0); i++) {
+              const img = await faceapi.fetchImage(`/labels/${person.name}/${i}.jpg`);
+              const d = await faceapi
+                .detectSingleFace(img, TINY_OPTS)
+                .withFaceLandmarks()
+                .withFaceDescriptor();
+              if (d?.descriptor) descs.push(d.descriptor);
+            }
+            if (descs.length) labeled.push(new faceapi.LabeledFaceDescriptors(person.name, descs));
+          }
+          if (labeled.length) faceMatcherRef.current = new faceapi.FaceMatcher(labeled, 0.6);
+        }
+      } catch {
+        // no labels/manifest.json available → ignore
+      }
+
+      // start camera
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user" },
+        audio: false,
+      });
+      if (videoRef.current) videoRef.current.srcObject = stream;
+
+      setReady(true);
+    })();
   }, []);
 
-  async function loadKnownMatcherSafe() {
-    try {
-      const res = await fetch(LABELS_MANIFEST_URL, { cache: "no-store" });
-      if (!res.ok) throw new Error("labels.json not found");
-      const data = await res.json();
-      const entries = Array.isArray(data.people) ? data.people : [];
+  // --- detection loop ---
+  useEffect(() => {
+    if (!ready) return;
 
-      const labeled = [];
-      for (const { name, images } of entries) {
-        if (!name) continue;
-        const count = Math.max(1, Number(images || 1));
-        const ds = [];
-        for (let i = 1; i <= count; i++) {
-          try {
-            const url = `${BASE}labels/${name}/${i}.jpg`;
-            const img = await faceapi.fetchImage(url);
-            const det = await faceapi
-              .detectSingleFace(img, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: SCORE_TH }))
-              .withFaceLandmarks()
-              .withFaceDescriptor();
-            if (det?.descriptor) ds.push(det.descriptor);
-            else console.warn(`[labels] No face in ${url} — skipped`);
-          } catch (e) {
-            console.warn(`[labels] Failed ${name}/${i}.jpg — skipped`, e?.message || e);
-          }
-        }
-        if (ds.length) labeled.push(new faceapi.LabeledFaceDescriptors(name, ds));
-        else console.warn(`[labels] "${name}" had 0 usable images — omitted`);
-      }
-      if (!labeled.length) {
-        console.warn("[labels] No valid labeled faces — running without known matching.");
-        return null;
-      }
-      return new faceapi.FaceMatcher(labeled, KNOWN_MATCH_THRESHOLD);
-    } catch (e) {
-      console.warn("[labels] manifest error — skip known faces:", e?.message || e);
-      return null;
-    }
-  }
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext("2d");
 
-  function startLoop() {
-    if (loopTimerRef.current) clearInterval(loopTimerRef.current);
-    loopTimerRef.current = setInterval(tick, TICK_MS);
-  }
+    const resize = () => {
+      if (!video) return;
+      canvas.width = video.videoWidth || 940;
+      canvas.height = video.videoHeight || 650;
+    };
+    video.addEventListener("loadedmetadata", resize);
+    resize();
 
-  async function tick() {
-    try {
-      const heavy = (tickIdxRef.current++ % HEAVY_EVERY) === 0;
-      const detections = await detectAdaptive(heavy);
-      const people = updateTracks(detections, heavy);
-      drawOverlay(people);
-      drawTable(people);
-      sendToN8N_Minimal(people); // sendBeacon (non-blocking)
-      setOK();
-    } catch (e) {
-      console.error("[tick] error:", e);
-      setERR();
-    }
-  }
+    let raf = 0;
+    let lastRun = 0;
+    const STEP_MS = 120; // ~8 FPS detector
 
-  async function detectAdaptive(heavy) {
-    const sizes = (emptyStreakRef.current >= 3) ? INPUT_STEPS : [INPUT_STEPS[0]];
-    for (const sz of sizes) {
-      const r = await detectOnce(sz, heavy);
-      if (r.length) {
-        emptyStreakRef.current = 0;
-        lastGoodInputRef.current = sz;
-        return r;
-      }
-    }
-    emptyStreakRef.current++;
-    return [];
-  }
+    const loop = async (ts) => {
+      raf = requestAnimationFrame(loop);
+      if (ts - lastRun < STEP_MS) return;
+      lastRun = ts;
+      if (!video.videoWidth) return;
 
-  async function detectOnce(inputSize, heavy) {
-    const v = videoRef.current; if (!v) return [];
-    const opts = new faceapi.TinyFaceDetectorOptions({ inputSize, scoreThreshold: SCORE_TH });
-    const base = faceapi.detectAllFaces(v, opts).withFaceLandmarks();
+      const dets = await faceapi
+        .detectAllFaces(video, TINY_OPTS)
+        .withFaceLandmarks()
+        .withFaceExpressions()
+        .withAgeAndGender()
+        .withFaceDescriptors();
 
-    let det;
-    if (heavy) {
-      const chain = base.withFaceExpressions().withAgeAndGender();
-      det = (ENABLE_EPHEMERAL_RECOG || ENABLE_KNOWN_RECOG) ? await chain.withFaceDescriptors() : await chain;
-    } else {
-      det = await base; // light pass
-    }
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const resized = faceapi.resizeResults(dets, { width: canvas.width, height: canvas.height });
+      const matcher = faceMatcherRef.current;
 
-    const displaySize = prepCanvasForDisplay(v, canvasRef.current);
-    const resized = faceapi.resizeResults(det, displaySize);
+      // Sort by x (left→right) for stable table ordering
+      resized.sort((a, b) => a.detection.box.x - b.detection.box.x);
 
-    if (heavy) {
-      resized.forEach(d => {
-        let name = null;
-        if (ENABLE_KNOWN_RECOG && faceMatcherRef.current && d.descriptor) {
-          const best = faceMatcherRef.current.findBestMatch(d.descriptor);
-          if (best && best.label && best.label !== "unknown" && best.distance <= KNOWN_MATCH_THRESHOLD) {
-            name = best.label;
-          }
-        }
-        d._knownName = name;
-        if (!name && ENABLE_EPHEMERAL_RECOG && d.descriptor) {
-          d._ephemeralLabel = upsertEphemeralIdentity(d.descriptor);
-        }
-      });
-    }
-    return resized;
-  }
+      const rows = [];
+      const peopleForPost = [];
 
-  function purgeStaleFromGallery(now = Date.now()) {
-    galleryRef.current = galleryRef.current.filter(e => now - e.lastSeen < GALLERY_TTL_MS);
-    while (galleryRef.current.length > MAX_GALLERY) {
-      let oldest = 0;
-      for (let i = 1; i < galleryRef.current.length; i++) {
-        if (galleryRef.current[i].lastSeen < galleryRef.current[oldest].lastSeen) oldest = i;
-      }
-      galleryRef.current.splice(oldest, 1);
-    }
-  }
-  function upsertEphemeralIdentity(descriptor) {
-    const now = Date.now();
-    purgeStaleFromGallery(now);
-    // find best
-    let bestIdx = -1, bestDist = Infinity;
-    for (let i = 0; i < galleryRef.current.length; i++) {
-      const d = faceapi.euclideanDistance(galleryRef.current[i].descriptor, descriptor);
-      if (d < bestDist) { bestDist = d; bestIdx = i; }
-    }
-    if (bestIdx >= 0 && bestDist <= DESCRIPTOR_MATCH_THRESHOLD) {
-      galleryRef.current[bestIdx].lastSeen = now;
-      return galleryRef.current[bestIdx].label;
-    }
-    // new
-    const label = `G${nextLabelRef.current++}`;
-    galleryRef.current.push({ label, descriptor, lastSeen: now, createdAt: now });
-    purgeStaleFromGallery(now);
-    return label;
-  }
+      resized.forEach((det, i) => {
+        const box = det.detection.box;
+        const distM = estimateDistanceM(box.width);
+        const zone = zoneOf(distM);
+        const color = zone === "green" ? "#22c55e" : "#ef4444";
 
-  function updateTracks(resized, heavy) {
-    const now  = Date.now();
-    const prev = tracksRef.current;
-    const next = [];
+        // optional name via faceMatcher
+        const name =
+          matcher && det.descriptor
+            ? (() => {
+                const best = matcher.findBestMatch(det.descriptor);
+                return best?.label && best.label !== "unknown" ? best.label : null;
+              })()
+            : null;
 
-    resized.forEach(d => {
-      const ctr = center(d.detection.box);
-      let bestIdx = -1, best = Infinity;
-      prev.forEach((p, i) => {
-        const dd = euclid(ctr, { cx: p.cx, cy: p.cy });
-        if (dd < MATCH_THRESHOLD_PX && dd < best) { best = dd; bestIdx = i; }
-      });
+        // draw box
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 3;
+        ctx.strokeRect(box.x, box.y, box.width, box.height);
 
-      if (bestIdx >= 0) {
-        const p = { ...prev[bestIdx] };
-        p.detection = d.detection;
-        p.cx = ctr.cx; p.cy = ctr.cy;
-        p.lastSeen = now;
-        if (heavy) {
-          if (d.age != null)        p.age = d.age;
-          if (d.gender != null)     p.gender = d.gender;
-          if (d.expressions != null)p.expressions = d.expressions;
-          p._knownName      = d._knownName ?? p._knownName ?? null;
-          p._ephemeralLabel = (!p._knownName) ? (d._ephemeralLabel ?? p._ephemeralLabel ?? null) : p._ephemeralLabel;
-        }
-        next.push(p);
-      } else {
-        next.push({
-          id: nextIdRef.current++,
-          detection: d.detection,
-          age: d.age,
-          gender: d.gender,
-          expressions: d.expressions,
-          cx: ctr.cx, cy: ctr.cy,
-          lastSeen: now,
-          _knownName: d._knownName ?? null,
-          _ephemeralLabel: (!d._knownName) ? (d._ephemeralLabel ?? null) : null,
+        // label
+        const lbl =
+          `${zone} • ${Math.max(0, Math.round(det.age))} ${det.gender}` +
+          ` • ${topExpression(det.expressions)}` +
+          (name ? ` • ${name}` : "");
+        ctx.font = "16px system-ui, sans-serif";
+        const pad = 6;
+        const textW = ctx.measureText(lbl).width + pad * 2;
+        const textH = 22;
+        const y = Math.max(0, box.y - textH - 4);
+        ctx.fillStyle = color;
+        ctx.fillRect(box.x, y, textW, textH);
+        ctx.fillStyle = "#fff";
+        ctx.fillText(lbl, box.x + pad, y + 16);
+
+        rows.push({
+          idx: i + 1,
+          gender: (det.gender || "").toLowerCase(),
+          ageGroup: ageGroupOf(det.age),
+          zone,
+          name: name || "-",
+          distance: distM ? distM.toFixed(2) + " m" : "-",
         });
+
+        peopleForPost.push({
+          gender: (det.gender || "").toLowerCase(),
+          ageGroup: ageGroupOf(det.age),
+          zone,
+          name: name || null,
+        });
+      });
+
+      // Fill table to 5 rows for a stable view
+      const filled = rows.slice(0, 5);
+      for (let i = filled.length; i < 5; i++) {
+        filled.push({ idx: i + 1, gender: "-", ageGroup: "-", zone: "-", name: "-", distance: "-" });
       }
-    });
+      setTable(filled);
 
-    const kept = next.filter(p => now - p.lastSeen < TRACK_TIMEOUT_MS);
-    kept.sort((a, b) => a.id - b.id);
-    tracksRef.current = kept;
-    return kept;
-  }
-
-  function drawOverlay(people) {
-    const v  = videoRef.current;
-    const displayW = v?.clientWidth  || CAM_W;
-    const displayH = v?.clientHeight || CAM_H;
-
-    const c   = canvasRef.current;
-    const ctx = c.getContext("2d");
-    ctx.clearRect(0, 0, displayW, displayH);
-
-    people.forEach(p => {
-      const rawBox = p.detection.box;
-      const box = shrinkBox(rawBox, 0.9);
-      const distanceM = (FOCAL_PX * FACE_WIDTH_M) / rawBox.width;
-      const zone = distanceM <= GREEN_M ? "green" : "red";
-      const expr = topExpression(p.expressions || { neutral: 1 });
-      const who  = p._knownName ? p._knownName : (p._ephemeralLabel || "P?");
-      const label = `${who} • ${zone} • ${Math.round(p.age ?? 0)} ${p.gender ?? "?"} • ${expr.expression}`;
-
-      new faceapi.draw.DrawBox(box, {
-        label,
-        boxColor: zone === "green" ? "#17c964" : "#f31260",
-        lineWidth: 2,
-      }).draw(c);
-    });
-
-    const el = document.getElementById("peopleCount");
-    if (el) el.innerText = `People on screen: ${people.length}`;
-  }
-
-  function drawTable(people) {
-    const body = document.getElementById("dataBodyindex");
-    if (!body) return;
-    body.innerHTML = "";
-    people.forEach(p => {
-      const rawBox = p.detection.box;
-      const distanceM = (FOCAL_PX * FACE_WIDTH_M) / rawBox.width;
-      const zone = distanceM <= GREEN_M ? "green" : "red";
-      const expr = topExpression(p.expressions || { neutral: 1 });
-      const who  = p._knownName ? p._knownName : (p._ephemeralLabel || "—");
-
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td style="border:1px solid #fff;padding:6px;text-align:center;">${who}</td>
-        <td style="border:1px solid #fff;padding:6px;text-align:center;">${p.gender ?? "-"}</td>
-        <td style="border:1px solid #fff;padding:6px;text-align:center;">${p.age != null ? Math.round(p.age) : "-"}</td>
-        <td style="border:1px solid #fff;padding:6px;text-align:center;">${expr.expression}</td>
-        <td style="border:1px solid #fff;padding:6px;text-align:center;">${isFinite(distanceM) ? distanceM.toFixed(2) : "-"}</td>
-        <td style="border:1px solid #fff;padding:6px;text-align:center;">${zone}</td>
-      `;
-      body.appendChild(tr);
-    });
-  }
-
-  // --- sendBeacon (preferred) with JSON body; fetch keepalive fallback ---
-  function sendToN8N_Minimal(people) {
-    if (!N8N_WEBHOOK_URL) return;
-
-    const payload = {
-      timestamp: new Date().toISOString(),
-      peopleCount: people.length,
-      anyInGreen: people.some(p => {
-        const b = p.detection.box;
-        const distanceM = (FOCAL_PX * FACE_WIDTH_M) / b.width;
-        return distanceM <= GREEN_M;
-      }),
-      people: people.map(p => {
-        const b = p.detection.box;
-        const distanceM = (FOCAL_PX * FACE_WIDTH_M) / b.width;
-        return {
-          gender: p.gender === "female" ? "female" : "male",
-          ageGroup: classifyAgeGroup(Math.round(p.age ?? 0)),
-          zone: distanceM <= GREEN_M ? "green" : "red",
-          name: p._knownName || null
-        };
-      })
+      // update session FSM
+      await updateSession(peopleForPost);
     };
 
-    const h = JSON.stringify(payload);
-    if (h === lastPayloadHashRef.current) return;
-    lastPayloadHashRef.current = h;
+    raf = requestAnimationFrame(loop);
+    return () => {
+      cancelAnimationFrame(raf);
+      video?.removeEventListener("loadedmetadata", resize);
+    };
+  }, [ready]);
 
-    try {
-      if (navigator.sendBeacon) {
-        const blob = new Blob([h], { type: "application/json" });
-        navigator.sendBeacon(N8N_WEBHOOK_URL, blob);
-        return;
+  // --- posting helpers (beacon by default, fetch if ?debugPost=1) ---
+  const post = async (which, payload) => {
+    const url = N8N[which];
+    const nowStr = new Date().toLocaleTimeString();
+    if (!DEBUG_FETCH) {
+      // fire-and-forget
+      const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
+      const ok = navigator.sendBeacon(url, blob);
+      setPosts((p) => ({ ...p, [which]: p[which] + 1 }));
+      setLastSent((s) => ({ ...s, [which]: nowStr }));
+      setLastHttp((h) => ({ ...h, [which]: ok ? "sent (beacon)" : "fallback sent" }));
+      if (!ok) {
+        // fallback
+        try {
+          const r = await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          setLastHttp((h) => ({ ...h, [which]: r.ok ? "OK (fetch)" : `HTTP ${r.status}` }));
+        } catch (e) {
+          setLastHttp((h) => ({ ...h, [which]: `ERR ${String(e)}` }));
+        }
       }
-      fetch(N8N_WEBHOOK_URL, {
+      return;
+    }
+
+    // debug path: await response & show OK/ERR
+    try {
+      const r = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: h,
-        keepalive: true
-      }).catch(() => {});
-    } catch { /* ignore */ }
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      setPosts((p) => ({ ...p, [which]: p[which] + 1 }));
+      setLastSent((s) => ({ ...s, [which]: nowStr }));
+      setLastHttp((h) => ({ ...h, [which]: r.ok ? "OK" : `HTTP ${r.status}` }));
+    } catch (e) {
+      setLastHttp((h) => ({ ...h, [which]: `ERR ${String(e)}` }));
+    }
+  };
+
+  // --- tiny session FSM ---
+  async function updateSession(people) {
+    const now = Date.now();
+    const anyFace = Array.isArray(people) && people.length > 0;
+
+    if (!S.current.id) {
+      if (anyFace) {
+        S.current.seenFrames++;
+        if (S.current.seenFrames >= START_FRAMES) {
+          S.current.id = uuid();
+          S.current.lastFaceTs = now;
+          S.current.lastSnapshotTs = 0;
+          setSessionId(S.current.id);
+          setSessionStatus("ACTIVE");
+          await post("start", { sessionId: S.current.id, ts: now });
+        }
+      } else {
+        S.current.seenFrames = 0;
+      }
+      return;
+    }
+
+    if (anyFace) {
+      S.current.lastFaceTs = now;
+      if (now - S.current.lastSnapshotTs >= SNAPSHOT_EVERY) {
+        S.current.lastSnapshotTs = now;
+        await post("snapshot", { sessionId: S.current.id, ts: now, people });
+      }
+    } else {
+      if (now - S.current.lastFaceTs >= END_AFTER_MS) {
+        await post("stop", { sessionId: S.current.id, ts: now });
+        S.current.id = null;
+        S.current.seenFrames = 0;
+        setSessionId(null);
+        setSessionStatus("IDLE");
+      }
+    }
   }
 
   return (
-    <div style={{ padding: 12 }}>
-      <h3>Face Tracker</h3>
+    <main style={{ background: "#0b0b0b", color: "#ebebeb", minHeight: "100vh", padding: 10 }}>
+      {/* Status bar */}
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "1fr 1fr",
+          gap: 8,
+          maxWidth: 960,
+          margin: "0 auto 10px",
+          fontSize: 14,
+        }}
+      >
+        <div
+          style={{
+            background: "#1a1a1a",
+            borderRadius: 8,
+            padding: 10,
+            display: "flex",
+            flexDirection: "column",
+            gap: 4,
+          }}
+        >
+          <div><strong>Backend:</strong> {backend}</div>
+          <div><strong>Models:</strong> {ready ? "loaded" : "loading…"}</div>
+          <div><strong>Session:</strong> {sessionStatus}{sessionId ? ` (${sessionId.slice(0, 8)})` : ""}</div>
+          <div><strong>Posts:</strong> start {posts.start} · snap {posts.snapshot} · stop {posts.stop}</div>
+        </div>
 
-      <div style={{ position: "relative", width: CAM_W, height: CAM_H }}>
+        <div
+          style={{
+            background: "#1a1a1a",
+            borderRadius: 8,
+            padding: 10,
+            display: "flex",
+            flexDirection: "column",
+            gap: 4,
+          }}
+        >
+          <div><strong>Last Sent:</strong> start {lastSent.start} · snap {lastSent.snapshot} · stop {lastSent.stop}</div>
+          <div style={{ opacity: 0.8 }}>
+            <strong>HTTP:</strong>{" "}
+            start {lastHttp.start || "-"} · snap {lastHttp.snapshot || "-"} · stop {lastHttp.stop || "-"}
+            {DEBUG_FETCH ? " (debug)" : " (beacon)"}
+          </div>
+        </div>
+      </div>
+
+      {/* Video + overlay */}
+      <div style={{ position: "relative", maxWidth: 960, margin: "0 auto" }}>
         <video
           ref={videoRef}
           autoPlay
           muted
           playsInline
-          style={{ display: "block", width: `${CAM_W}px`, height: `${CAM_H}px` }}
+          style={{ width: "100%", borderRadius: 8, background: "#000" }}
         />
         <canvas
           ref={canvasRef}
-          style={{ position: "absolute", left: 0, top: 0, width: `${CAM_W}px`, height: `${CAM_H}px`, pointerEvents: "none" }}
+          style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }}
         />
       </div>
 
-      <div style={{ marginTop: 8 }}>
-        People: <span id="peopleCount">0</span> • Status: <span id="statusLight" style={{ fontWeight: 600 }}>…</span>
+      {/* Table */}
+      <div style={{ maxWidth: 960, margin: "10px auto 40px" }}>
+        <div style={{ margin: "8px 4px", fontSize: 14, opacity: 0.9 }}>
+          <strong>Total on screen:</strong> {table.filter(r => r.zone === "green" || r.zone === "red").length}
+        </div>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
+            <thead>
+              <tr style={{ background: "#1f1f1f" }}>
+                {["#", "Gender", "AgeGroup", "Zone", "Name", "Distance"].map((h) => (
+                  <th key={h} style={{ textAlign: "left", padding: "8px 10px" }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {table.map((r) => (
+                <tr key={r.idx} style={{ borderTop: "1px solid #222" }}>
+                  <td style={{ padding: "8px 10px" }}>{r.idx}</td>
+                  <td style={{ padding: "8px 10px" }}>{r.gender}</td>
+                  <td style={{ padding: "8px 10px" }}>{r.ageGroup}</td>
+                  <td style={{ padding: "8px 10px", color: r.zone === "green" ? "#22c55e" : r.zone === "red" ? "#ef4444" : "#aaa" }}>
+                    {r.zone}
+                  </td>
+                  <td style={{ padding: "8px 10px" }}>{r.name}</td>
+                  <td style={{ padding: "8px 10px" }}>{r.distance}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div style={{ marginTop: 6, fontSize: 12, opacity: 0.7 }}>
+          Tip: add <code>?debugPost=1</code> to the URL to await HTTP responses and see “OK/ERR” above.
+        </div>
       </div>
-
-      <div style={{ maxHeight: "40vh", overflowY: "auto", marginTop: 8 }}>
-        <table style={{ borderCollapse: "collapse", width: "100%", textAlign: "center" }}>
-          <thead>
-            <tr>
-              <th style={{ border: "1px solid #fff", padding: 6 }}>Name</th>
-              <th style={{ border: "1px solid #fff", padding: 6 }}>Gender</th>
-              <th style={{ border: "1px solid #fff", padding: 6 }}>Age</th>
-              <th style={{ border: "1px solid #fff", padding: 6 }}>Emotion</th>
-              <th style={{ border: "1px solid #fff", padding: 6 }}>Distance (m)</th>
-              <th style={{ border: "1px solid #fff", padding: 6 }}>Zone</th>
-            </tr>
-          </thead>
-          <tbody id="dataBodyindex"></tbody>
-        </table>
-      </div>
-    </div>
+    </main>
   );
 }

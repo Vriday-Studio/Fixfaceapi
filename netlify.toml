@@ -21,13 +21,6 @@
   status = 200
   force  = true
 
-# Catch-all production proxy for any other n8n webhook
- [[redirects]]
-  from = "/api/n8n/*"
-  to   = "https://n8n.srv954455.hstgr.cloud/webhook-test/:splat"
-  status = 200
-  force  = true
-
 # --- headers ---
 [[headers]]
   for = "/*.wasm"

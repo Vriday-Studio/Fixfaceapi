@@ -328,6 +328,7 @@ export default function App(){
             zone,
             name: name || null,     // known name if any
             gid: guestId || null,   // Guest01… when unknown
+            emotion: expr,        // <-- send emotion to n8n
           });
 
           total++; if (zone==="green") green++; else if (zone==="red") red++;

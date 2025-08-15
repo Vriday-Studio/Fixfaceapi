@@ -14,7 +14,9 @@ const TINY_OPTS = new faceapi.TinyFaceDetectorOptions({
 
 // recognition strictness
 const MATCH_THRESHOLD = 0.5; // tighter than 0.60 (try 0.50–0.55)
-const MATCH_MARGIN    = 0.06; // best must beat 2nd-best by ≥ this
+const MATCH_MARGIN    = 0.08; // best must beat 2nd-best by ≥ this
+// how many frames a name must "win" before we show it
+const STABILIZE_FRAMES = 3; // try 2–4
 
 const BOX_SHRINK     = 0.7;
 const BOX_LINE_WIDTH = 5;
@@ -43,6 +45,19 @@ const topExpression = (e) => (!e ? "neutral" : Object.entries(e).reduce((a,b)=>a
 const shrinkBox = (b, f=BOX_SHRINK) => {
   const w=b.width*f, h=b.height*f;
   return { x:b.x+(b.width-w)/2, y:b.y+(b.height-h)/2, width:w, height:h };
+
+// best & second-best distances so we can enforce a margin
+function bestTwoMatches(matcher, queryDesc){
+  let best={label:null,dist:1}, second={label:null,dist:1};
+  for (const ld of matcher.labeledDescriptors){
+    for (const d of ld.descriptors){
+      const dist = faceapi.euclideanDistance(queryDesc, d);
+      if (dist < best.dist){ second=best; best={label:ld.label,dist}; }
+      else if (dist < second.dist){ second={label:ld.label,dist}; }
+    }
+  }
+  return { best, second };
+}
 };
 
 /* -------------------- App -------------------- */
@@ -52,6 +67,9 @@ export default function App(){
 
   const [ready, setReady] = useState(false);
   const [backend, setBackend] = useState("cpu");
+
+  // left→right name stabilizer (one slot per visible face index)
+  const nameTracksRef = useRef([]); // [{shown, candidate, streak}]
 
   const [sessionStatus, setSessionStatus] = useState("IDLE");
   const [sessionId, setSessionId] = useState(null);

@@ -3,26 +3,26 @@
   publish = "dist"
 
 # --- PRODUCTION camera endpoints (specific first) ---
-# [[redirects]]
+[[redirects]]
   from = "/api/n8n/start"
   to   = "https://n8n.srv954455.hstgr.cloud/webhook/camera/start"
   status = 200
   force  = true
 
-# [[redirects]]
+[[redirects]]
   from = "/api/n8n/snapshot"
   to   = "https://n8n.srv954455.hstgr.cloud/webhook/camera/snapshot"
   status = 200
   force  = true
 
-# [[redirects]]
+[[redirects]]
   from = "/api/n8n/stop"
   to   = "https://n8n.srv954455.hstgr.cloud/webhook/camera/stop"
   status = 200
   force  = true
 
 # Catch-all production proxy for any other n8n webhook
-# [[redirects]]
+ [[redirects]]
   from = "/api/n8n/*"
   to   = "https://n8n.srv954455.hstgr.cloud/webhook/:splat"
   status = 200

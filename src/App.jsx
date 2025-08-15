@@ -13,11 +13,20 @@ const TINY_OPTS = new faceapi.TinyFaceDetectorOptions({
 });
 
 // n8n (proxied by netlify.toml)
-const N8N = {
-  start: "/api/n8n/start",
-  snapshot: "/api/n8n/snapshot",
-  stop: "/api/n8n/stop",
-};
+const IS_LOCALHOST = /^(localhost|127\.0\.0\.1|\d+\.\d+\.\d+\.\d+)$/.test(location.hostname);
+const FORCE_TEST   = /[?&]forceTest=1\b/.test(location.search); // manual override via URL param
+
+const N8N = (IS_LOCALHOST || FORCE_TEST)
+  ? { // test (webhook-test): works only while node is "Listening…"
+      start: "/api/n8n-test/camera/start",
+      snapshot: "/api/n8n-test/camera/snapshot",
+      stop: "/api/n8n-test/camera/stop",
+    }
+  : { // production (webhook): requires workflow Activated
+      start: "/api/n8n/start",
+      snapshot: "/api/n8n/snapshot",
+      stop: "/api/n8n/stop",
+    };
 
 // session timings
 const START_FRAMES = 8;      // need N consecutive frames w/ faces to start

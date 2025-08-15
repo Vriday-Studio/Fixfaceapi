@@ -12,6 +12,10 @@ const TINY_OPTS = new faceapi.TinyFaceDetectorOptions({
   scoreThreshold: 0.3,
 });
 
+// recognition strictness
+const MATCH_THRESHOLD = 0.5; // tighter than 0.60 (try 0.50–0.55)
+const MATCH_MARGIN    = 0.06; // best must beat 2nd-best by ≥ this
+
 const BOX_SHRINK     = 0.7;
 const BOX_LINE_WIDTH = 5;
 

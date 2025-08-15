@@ -1,42 +1,77 @@
 import { useEffect, useRef, useState } from "react";
 import * as faceapi from "face-api.js";
 
-// ====== CONFIG ======
-const MODEL_URL = "/models";                 // face-api models path
-const FACE_WIDTH_M = 0.15;                   // avg face width (m)
-const FOCAL_PX = 500;                        // tune per camera if needed
-const GREEN_MAX_M = 0.8;                     // <= 0.8m → green
+/* ──────────────────────────────────────────────────────────────────────────────
+   CONFIG
+   ────────────────────────────────────────────────────────────────────────────── */
 
+const MODEL_URL = "/models";          // face-api models path
+const FACE_WIDTH_M = 0.15;            // average face width (meters)
+const FOCAL_PX = 500;                 // adjust per camera for better distance
+const GREEN_MAX_M = 0.8;              // <= 0.8m => green zone
+
+// tiny detector options (balanced for speed + accuracy)
 const TINY_OPTS = new faceapi.TinyFaceDetectorOptions({
   inputSize: 224,
   scoreThreshold: 0.5,
 });
 
-// n8n (proxied by netlify.toml)
-const IS_LOCALHOST = /^(localhost|127\.0\.0\.1|\d+\.\d+\.\d+\.\d+)$/.test(location.hostname);
-const FORCE_TEST   = /[?&]forceTest=1\b/.test(location.search); // manual override via URL param
-
-const N8N = (IS_LOCALHOST || FORCE_TEST)
-  ? { // test (webhook-test): works only while node is "Listening…"
-      start: "/api/n8n-test/camera/start",
-      snapshot: "/api/n8n-test/camera/snapshot",
-      stop: "/api/n8n-test/camera/stop",
-    }
-  : { // production (webhook): requires workflow Activated
-      start: "/api/n8n/start",
-      snapshot: "/api/n8n/snapshot",
-      stop: "/api/n8n/stop",
-    };
-
 // session timings
-const START_FRAMES = 8;      // need N consecutive frames w/ faces to start
+const START_FRAMES = 8;      // require N consecutive frames to start a session
 const END_AFTER_MS = 8000;   // stop after 8s of no faces
-const SNAPSHOT_EVERY = 600;  // snapshot at most once per 600ms
+const SNAPSHOT_EVERY = 900;  // at most one snapshot every 900ms
 
-// ====== HELPERS ======
+/* ──────────────────────────────────────────────────────────────────────────────
+   N8N ENDPOINT RESOLVER
+   - Default: on Netlify use TEST proxy, locally use PROD proxy.
+   - URL flags:
+       ?useTest=1   -> force test
+       ?useProd=1   -> force prod
+       ?direct=1    -> bypass proxy & hit n8n directly
+       ?debugPost=1 -> await HTTP responses (instead of beacon)
+   - Netlify proxy paths must match your netlify.toml redirects.
+   ────────────────────────────────────────────────────────────────────────────── */
+
+const QS = new URLSearchParams(window.location.search);
+const IS_LOCAL = ["localhost", "127.0.0.1"].includes(window.location.hostname);
+
+const FORCE_TEST = QS.has("useTest");
+const FORCE_PROD = QS.has("useProd");
+const USE_DIRECT = QS.has("direct");
+const DEBUG_FETCH = QS.has("debugPost");
+
+// default behavior: Netlify => TEST; local dev => PROD (you can override with flags)
+const DEFAULT_TEST = !IS_LOCAL;
+const useTest = FORCE_TEST ? true : FORCE_PROD ? false : DEFAULT_TEST;
+
+// Netlify proxy bases
+const BASE_TEST = "/api/n8n-test";
+const BASE_PROD = "/api/n8n";
+
+// Direct (no proxy) bases (edit if your domain changes)
+const DIRECT_TEST = "https://n8n.srv954455.hstgr.cloud/webhook-test";
+const DIRECT_PROD = "https://n8n.srv954455.hstgr.cloud/webhook";
+
+function pickBase() {
+  if (USE_DIRECT) return useTest ? DIRECT_TEST : DIRECT_PROD;
+  return useTest ? BASE_TEST : BASE_PROD;
+}
+function mkEndpoints(base) {
+  return {
+    start: `${base}/camera/start`,
+    snapshot: `${base}/camera/snapshot`,
+    stop: `${base}/camera/stop`,
+  };
+}
+const N8N = mkEndpoints(pickBase());
+
+/* ──────────────────────────────────────────────────────────────────────────────
+   HELPERS
+   ────────────────────────────────────────────────────────────────────────────── */
+
 const uuid = () =>
-  (crypto?.randomUUID ? crypto.randomUUID()
-    : Math.random().toString(36).slice(2) + Date.now().toString(36));
+  (crypto?.randomUUID ? crypto.randomUUID() :
+   Math.random().toString(36).slice(2) + Date.now().toString(36));
 
 const estimateDistanceM = (faceBoxWidthPx) =>
   faceBoxWidthPx ? (FOCAL_PX * FACE_WIDTH_M) / faceBoxWidthPx : null;
@@ -49,15 +84,17 @@ const ageGroupOf = (age) => {
   return "child";
 };
 
-const zoneOf = (distanceM) =>
-  distanceM != null && distanceM <= GREEN_MAX_M ? "green" : "red";
+const zoneOf = (distanceM) => (distanceM != null && distanceM <= GREEN_MAX_M ? "green" : "red");
 
 const topExpression = (expressions) => {
   if (!expressions) return "neutral";
   return Object.entries(expressions).reduce((a, b) => (a[1] > b[1] ? a : b))[0];
 };
 
-// ====== APP ======
+/* ──────────────────────────────────────────────────────────────────────────────
+   APP
+   ────────────────────────────────────────────────────────────────────────────── */
+
 export default function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
@@ -69,8 +106,9 @@ export default function App() {
   const [sessionId, setSessionId] = useState(null);
   const [posts, setPosts] = useState({ start: 0, snapshot: 0, stop: 0 });
   const [lastSent, setLastSent] = useState({ start: "-", snapshot: "-", stop: "-" });
-  const [lastHttp, setLastHttp] = useState({ start: "", snapshot: "", stop: "" }); // OK / error (debug)
-  const [table, setTable] = useState([]); // [{idx, gender, ageGroup, zone, name}…]
+  const [lastHttp, setLastHttp] = useState({ start: "", snapshot: "", stop: "" });
+
+  const [table, setTable] = useState([]); // rows for the UI table
 
   const faceMatcherRef = useRef(null);
 
@@ -82,12 +120,10 @@ export default function App() {
     lastSnapshotTs: 0,
   });
 
-  const DEBUG_FETCH = /[?&]debugPost=1\b/.test(window.location.search);
-
-  // --- init: backend, models, labels, camera ---
+  /* ── init: backend, models, labels, camera ──────────────────────────────── */
   useEffect(() => {
     (async () => {
-      // backend fallback (webgl → wasm → cpu)
+      // backend fallback chain
       try {
         await faceapi.tf.setBackend("webgl");
         await faceapi.tf.ready();
@@ -112,11 +148,13 @@ export default function App() {
         faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
       ]);
 
-      // optional face recognition via /labels/labels.json
+      // optional face recognition using /labels/labels.json
       try {
+        // expected format:
+        // { "people": [ { "name": "Raisa", "images": 4 }, ... ] }
         const res = await fetch("/labels/labels.json", { cache: "no-store" });
         if (res.ok) {
-          const manifest = await res.json(); // { people:[{name,images}] }
+          const manifest = await res.json();
           const labeled = [];
           for (const person of manifest.people || []) {
             const descs = [];
@@ -128,26 +166,36 @@ export default function App() {
                 .withFaceDescriptor();
               if (d?.descriptor) descs.push(d.descriptor);
             }
-            if (descs.length) labeled.push(new faceapi.LabeledFaceDescriptors(person.name, descs));
+            if (descs.length) {
+              labeled.push(new faceapi.LabeledFaceDescriptors(person.name, descs));
+            }
           }
-          if (labeled.length) faceMatcherRef.current = new faceapi.FaceMatcher(labeled, 0.6);
+          if (labeled.length) {
+            faceMatcherRef.current = new faceapi.FaceMatcher(labeled, 0.6);
+          }
         }
       } catch {
-        // no labels/manifest.json available → ignore
+        // no labels available → skip silently
       }
 
-      // start camera
+      // camera selection: default front camera; override via ?camera=environment
+      const requestedFacing = QS.get("camera") || "user"; // "user" | "environment"
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user" },
+        video: {
+          facingMode: requestedFacing,
+          width: { ideal: 1280 }, // give the detector enough pixels
+          height: { ideal: 720 },
+        },
         audio: false,
       });
       if (videoRef.current) videoRef.current.srcObject = stream;
 
       setReady(true);
+      console.log(`[n8n] using ${useTest ? "TEST" : "PROD"} ${USE_DIRECT ? "direct" : "proxy"} endpoints`, N8N);
     })();
   }, []);
 
-  // --- detection loop ---
+  /* ── detection loop ─────────────────────────────────────────────────────── */
   useEffect(() => {
     if (!ready) return;
 
@@ -165,7 +213,7 @@ export default function App() {
 
     let raf = 0;
     let lastRun = 0;
-    const STEP_MS = 120; // ~8 FPS detector
+    const STEP_MS = 120; // ~8 FPS
 
     const loop = async (ts) => {
       raf = requestAnimationFrame(loop);
@@ -184,7 +232,7 @@ export default function App() {
       const resized = faceapi.resizeResults(dets, { width: canvas.width, height: canvas.height });
       const matcher = faceMatcherRef.current;
 
-      // Sort by x (left→right) for stable table ordering
+      // left→right for stable table rows
       resized.sort((a, b) => a.detection.box.x - b.detection.box.x);
 
       const rows = [];
@@ -196,7 +244,7 @@ export default function App() {
         const zone = zoneOf(distM);
         const color = zone === "green" ? "#22c55e" : "#ef4444";
 
-        // optional name via faceMatcher
+        // optional name
         const name =
           matcher && det.descriptor
             ? (() => {
@@ -205,25 +253,39 @@ export default function App() {
               })()
             : null;
 
-        // draw box
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 3;
-        ctx.strokeRect(box.x, box.y, box.width, box.height);
+        /* ─ draw a slimmer box + readable label ─ */
+        const shrinkFactor = 0.7; // adjust 0.6–0.8 until it feels right
 
-        // label
-        const lbl =
+        const newWidth = box.width * shrinkFactor;
+        const newHeight = box.height * shrinkFactor;
+        const offsetX = (box.width - newWidth) / 2;
+        const offsetY = (box.height - newHeight) / 2;
+
+        const x = box.x + offsetX;
+        const y = box.y + offsetY;
+        const w = newWidth;
+        const h = newHeight;
+
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 5;
+        ctx.strokeRect(x, y, w, h);
+
+        const label =
           `${zone} • ${Math.max(0, Math.round(det.age))} ${det.gender}` +
           ` • ${topExpression(det.expressions)}` +
           (name ? ` • ${name}` : "");
-        ctx.font = "16px system-ui, sans-serif";
-        const pad = 6;
-        const textW = ctx.measureText(lbl).width + pad * 2;
-        const textH = 22;
-        const y = Math.max(0, box.y - textH - 4);
+
+        ctx.font = "14px system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
+        const padX = 3, padY = 3;
+        const textW = ctx.measureText(label).width + padX * 2;
+        const textH = 18 + padY * 2;
+        const labelX = Math.max(0, Math.min(x, canvas.width - textW));
+        const labelY = Math.max(0, y - textH - 4);
+
         ctx.fillStyle = color;
-        ctx.fillRect(box.x, y, textW, textH);
+        ctx.fillRect(labelX, labelY, textW, textH);
         ctx.fillStyle = "#fff";
-        ctx.fillText(lbl, box.x + pad, y + 16);
+        ctx.fillText(label, labelX + padX, labelY + 14);
 
         rows.push({
           idx: i + 1,
@@ -242,14 +304,14 @@ export default function App() {
         });
       });
 
-      // Fill table to 5 rows for a stable view
+      // keep 5 rows for a stable table
       const filled = rows.slice(0, 5);
       for (let i = filled.length; i < 5; i++) {
         filled.push({ idx: i + 1, gender: "-", ageGroup: "-", zone: "-", name: "-", distance: "-" });
       }
       setTable(filled);
 
-      // update session FSM
+      // session FSM update
       await updateSession(peopleForPost);
     };
 
@@ -260,19 +322,19 @@ export default function App() {
     };
   }, [ready]);
 
-  // --- posting helpers (beacon by default, fetch if ?debugPost=1) ---
+  /* ── posting helpers (sendBeacon by default) ───────────────────────────── */
   const post = async (which, payload) => {
     const url = N8N[which];
     const nowStr = new Date().toLocaleTimeString();
+
+    // default: beacon (non-blocking)
     if (!DEBUG_FETCH) {
-      // fire-and-forget
       const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
       const ok = navigator.sendBeacon(url, blob);
       setPosts((p) => ({ ...p, [which]: p[which] + 1 }));
       setLastSent((s) => ({ ...s, [which]: nowStr }));
       setLastHttp((h) => ({ ...h, [which]: ok ? "sent (beacon)" : "fallback sent" }));
       if (!ok) {
-        // fallback
         try {
           const r = await fetch(url, {
             method: "POST",
@@ -287,7 +349,7 @@ export default function App() {
       return;
     }
 
-    // debug path: await response & show OK/ERR
+    // debug: await response
     try {
       const r = await fetch(url, {
         method: "POST",
@@ -302,7 +364,7 @@ export default function App() {
     }
   };
 
-  // --- tiny session FSM ---
+  /* ── tiny session FSM ──────────────────────────────────────────────────── */
   async function updateSession(people) {
     const now = Date.now();
     const anyFace = Array.isArray(people) && people.length > 0;
@@ -341,6 +403,17 @@ export default function App() {
     }
   }
 
+  /* ── UI ────────────────────────────────────────────────────────────────── */
+  const totalOnScreen = table.filter(r => r.zone === "green" || r.zone === "red").length;
+  const statusDot = (s) => ({
+    display: "inline-block",
+    width: 10,
+    height: 10,
+    borderRadius: 999,
+    marginRight: 6,
+    background: s === "ACTIVE" ? "#22c55e" : "#fbbf24", // green / amber
+  });
+
   return (
     <main style={{ background: "#0b0b0b", color: "#ebebeb", minHeight: "100vh", padding: 10 }}>
       {/* Status bar */}
@@ -366,7 +439,10 @@ export default function App() {
         >
           <div><strong>Backend:</strong> {backend}</div>
           <div><strong>Models:</strong> {ready ? "loaded" : "loading…"}</div>
-          <div><strong>Session:</strong> {sessionStatus}{sessionId ? ` (${sessionId.slice(0, 8)})` : ""}</div>
+          <div>
+            <span style={statusDot(sessionStatus)} />
+            <strong>Session:</strong> {sessionStatus}{sessionId ? ` (${sessionId.slice(0, 8)})` : ""}
+          </div>
           <div><strong>Posts:</strong> start {posts.start} · snap {posts.snapshot} · stop {posts.stop}</div>
         </div>
 
@@ -381,10 +457,13 @@ export default function App() {
           }}
         >
           <div><strong>Last Sent:</strong> start {lastSent.start} · snap {lastSent.snapshot} · stop {lastSent.stop}</div>
-          <div style={{ opacity: 0.8 }}>
+          <div style={{ opacity: 0.85 }}>
             <strong>HTTP:</strong>{" "}
             start {lastHttp.start || "-"} · snap {lastHttp.snapshot || "-"} · stop {lastHttp.stop || "-"}
             {DEBUG_FETCH ? " (debug)" : " (beacon)"}
+          </div>
+          <div style={{ opacity: 0.75 }}>
+            <strong>n8n:</strong> {useTest ? "TEST" : "PROD"} {USE_DIRECT ? "(direct)" : "(proxy)"}
           </div>
         </div>
       </div>
@@ -407,7 +486,7 @@ export default function App() {
       {/* Table */}
       <div style={{ maxWidth: 960, margin: "10px auto 40px" }}>
         <div style={{ margin: "8px 4px", fontSize: 14, opacity: 0.9 }}>
-          <strong>Total on screen:</strong> {table.filter(r => r.zone === "green" || r.zone === "red").length}
+          <strong>Total on screen:</strong> {totalOnScreen}
         </div>
         <div style={{ overflowX: "auto" }}>
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
@@ -435,7 +514,8 @@ export default function App() {
           </table>
         </div>
         <div style={{ marginTop: 6, fontSize: 12, opacity: 0.7 }}>
-          Tip: add <code>?debugPost=1</code> to the URL to await HTTP responses and see “OK/ERR” above.
+          Tip: add <code>?debugPost=1</code> to await responses and see “OK/ERR” above.  
+          Use <code>?useTest=1</code> / <code>?useProd=1</code> and <code>?direct=1</code> to switch modes quickly.
         </div>
       </div>
     </main>

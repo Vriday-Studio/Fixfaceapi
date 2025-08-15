@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import * as faceapi from "face-api.js";
 
-/* -------------------- CONFIG (simple & stable) -------------------- */
-const MODEL_URL = "/models";
+/* -------------------- CONFIG -------------------- */
+const MODEL_URL  = "/models";
 const LABELS_URL = "/labels/labels.json";
 
 const FACE_WIDTH_M = 0.15;
@@ -15,39 +15,40 @@ const TINY_OPTS = new faceapi.TinyFaceDetectorOptions({
 });
 
 // recognition strictness
-const MATCH_THRESHOLD   = 0.52; // tighten if needed (0.50–0.55)
-const MATCH_MARGIN      = 0.06; // best must beat 2nd-best by this
-const STABILIZE_FRAMES  = 4;    // frames of disagreement before switching
+const MATCH_THRESHOLD  = 0.5; // tighten if needed (0.48–0.55)
+const MATCH_MARGIN     = 0.08; // best must beat 2nd-best by this
+const STABILIZE_FRAMES = 5;    // frames required before switching label
 
 // drawing
 const BOX_SHRINK     = 0.7;
 const BOX_LINE_WIDTH = 5;
 
-// session pacing
+// pacing
 const START_FRAMES   = 8;
 const END_AFTER_MS   = 8000;
 const SNAPSHOT_EVERY = 900;
 const LOOP_STEP_MS   = 120;
 
-// n8n (Netlify function proxy)
+// n8n (Netlify proxy)
 const N8N = {
-  start:   "/api/n8n-test/camera/start",
-  snapshot:"/api/n8n-test/camera/snapshot",
-  stop:    "/api/n8n-test/camera/stop",
+  start:    "/api/n8n-test/camera/start",
+  snapshot: "/api/n8n-test/camera/snapshot",
+  stop:     "/api/n8n-test/camera/stop",
 };
 
 const DEBUG_FETCH = /[?&]debugPost=1\b/.test(window.location.search);
 
 /* -------------------- Guest ID memory (per page session) -------------------- */
-const guestSeqRef = { current: 1 };                 // Guest01, Guest02, ...
-const guestMemRef = { current: [] };                // [{ id, desc: Float32Array }]
-const GUEST_TOL   = 0.56;                           // reuse a guest if <= this dist
+const guestSeqRef = { current: 1 };          // Guest01, Guest02, ...
+const guestMemRef = { current: [] };         // [{ id, desc: Float32Array }]
+const GUEST_TOL   = 0.60;                    // reuse a guest if <= this dist
 
 function assignGuestIdFor(descriptor) {
+  // handle rare null/empty descriptor frames
   if (!descriptor || !descriptor.length) {
-    const id = `Guest${String(guestSeqRef.current++).padStart(2, "0")}`;
-    return id;
+    return `Guest${String(guestSeqRef.current++).padStart(2, "0")}`;
   }
+
   const mem = guestMemRef.current;
   let bestIdx = -1, bestDist = 1;
   for (let i = 0; i < mem.length; i++) {
@@ -55,17 +56,20 @@ function assignGuestIdFor(descriptor) {
     if (d < bestDist) { bestDist = d; bestIdx = i; }
   }
   if (bestIdx >= 0 && bestDist <= GUEST_TOL) return mem[bestIdx].id;
+
   const id = `Guest${String(guestSeqRef.current++).padStart(2, "0")}`;
   mem.push({ id, desc: Float32Array.from(descriptor) });
   return id;
 }
 
 /* -------------------- helpers -------------------- */
-const uuid = () => (crypto?.randomUUID ? crypto.randomUUID()
-  : Math.random().toString(36).slice(2) + Date.now().toString(36));
+const uuid = () =>
+  (crypto?.randomUUID ? crypto.randomUUID()
+   : Math.random().toString(36).slice(2) + Date.now().toString(36));
 
 const estimateDistanceM = (wPx) => (wPx ? (FOCAL_PX * FACE_WIDTH_M) / wPx : null);
-const ageGroupOf = (age) => (age == null ? "unknown" : (Math.round(age) >= 18 ? "adult" : (Math.round(age) >= 12 ? "teen" : "child")));
+const ageGroupOf = (age) => (age == null ? "unknown"
+  : (Math.round(age) >= 18 ? "adult" : (Math.round(age) >= 12 ? "teen" : "child")));
 const zoneOf = (d) => (d != null && d <= GREEN_MAX_M ? "green" : "red");
 const topExpression = (e) => (!e ? "neutral" : Object.entries(e).reduce((a,b)=>a[1]>b[1]?a:b)[0]);
 
@@ -109,8 +113,8 @@ export default function App(){
   const faceMatcherRef = useRef(null);
   const [knownCount, setKnownCount] = useState(0);
 
-  // per-face (approx box) debounce cache to reduce flicker
-  const recentMapRef = useRef({}); // key -> { name, count }
+  // per-index label stabilizer: { [i]: { name, count } }
+  const recentMapRef = useRef({});
 
   // session state
   const S = useRef({ id:null, seenFrames:0, lastFaceTs:0, lastSnapshotTs:0 });
@@ -132,7 +136,7 @@ export default function App(){
         faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
       ]);
 
-      // known faces via labels.json (Tiny pipeline for parity)
+      // known faces via labels.json
       try {
         let total = 0;
         const res = await fetch(LABELS_URL, { cache:"no-store" });
@@ -154,7 +158,7 @@ export default function App(){
                 .withFaceLandmarks()
                 .withFaceDescriptor();
               if (d?.descriptor) descs.push(d.descriptor);
-            }catch{}
+            }catch{/* ignore bad image */}
           }
           if (descs.length){
             labeled.push(new faceapi.LabeledFaceDescriptors(name, descs));
@@ -211,141 +215,146 @@ export default function App(){
     video.addEventListener("loadedmetadata", resize);
     resize();
 
-    let raf = 0, lastRun = 0;
+    let raf = 0;
+    let lastRun = 0;
 
-    const loop = async (ts) => {
+    const loop = () => {
       raf = requestAnimationFrame(loop);
-      if (ts - lastRun < LOOP_STEP_MS) return;
-      lastRun = ts;
+
+      const now = performance.now();
+      if (now - lastRun < LOOP_STEP_MS) return;
+      lastRun = now;
       if (!video.videoWidth) return;
 
-      const dets = await faceapi
-        .detectAllFaces(video, TINY_OPTS)
-        .withFaceLandmarks()
-        .withFaceExpressions()
-        .withAgeAndGender()
-        .withFaceDescriptors();
+      (async () => {
+        // detect
+        const dets = await faceapi
+          .detectAllFaces(video, TINY_OPTS)
+          .withFaceLandmarks()
+          .withFaceExpressions()
+          .withAgeAndGender()
+          .withFaceDescriptors();
 
-      ctx.clearRect(0,0,canvas.width,canvas.height);
+        // clear + resize results
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+        const resized = faceapi
+          .resizeResults(dets, { width: canvas.width, height: canvas.height })
+          .sort((a,b)=>a.detection.box.x - b.detection.box.x);
 
-      const resized = faceapi
-        .resizeResults(dets, { width: canvas.width, height: canvas.height })
-        .sort((a,b)=>a.detection.box.x - b.detection.box.x);
+        const matcher = faceMatcherRef.current;
+        const rows = [];
+        const peopleForPost = [];
+        let total=0, green=0, red=0;
 
-      const matcher = faceMatcherRef.current;
-      const rows = [];
-      const peopleForPost = [];
-      let total=0, green=0, red=0;
+        // per-index stabilizer store
+        const tracks = recentMapRef.current; // { [i]: { name, count } }
 
-      for (const det of resized){
-        const box  = det.detection.box;
-        const dist = estimateDistanceM(box.width);
-        const zone = zoneOf(dist);
-        const color = zone === "green" ? "#22c55e" : "#ef4444";
-        const gender = (det.gender||"").toLowerCase();
-        const expr = topExpression(det.expressions);
+        for (let i = 0; i < resized.length; i++) {
+          const det  = resized[i];
+          const box  = det.detection.box;
+          const dist = estimateDistanceM(box.width);
+          const zone = zoneOf(dist);
+          const color = zone === "green" ? "#22c55e" : "#ef4444";
+          const gender = (det.gender || "").toLowerCase();
+          const expr = topExpression(det.expressions);
 
-        // known match with margin check
-        let name = null;
-        if (matcher && det.descriptor) {
-          // First, use FaceMatcher’s own threshold (simple + robust)
-          const bestOnly = matcher.findBestMatch(det.descriptor);
-          if (bestOnly && bestOnly.label !== "unknown" && bestOnly.distance <= MATCH_THRESHOLD) {
-            name = bestOnly.label;
-          } else if (bestOnly && bestOnly.label !== "unknown" && bestOnly.distance <= (MATCH_THRESHOLD + 0.05)) {
-            // Soft accept path: allow slightly looser distance if it also clears a small margin
-            const { best, second } = bestTwoMatches(matcher, det.descriptor);
-            // Use a SMALL margin so we don’t kill legit matches
-            const SMALL_MARGIN = 0.03; 
-            if (best.label && best.label !== "unknown" && (second.dist - best.dist) >= SMALL_MARGIN) {
+          // known face: strict threshold + small margin check
+          let name = null;
+          if (matcher && det.descriptor) {
+            const best = matcher.findBestMatch(det.descriptor);
+            if (best && best.label !== "unknown" && best.distance <= MATCH_THRESHOLD) {
               name = best.label;
+            } else if (best && best.label !== "unknown" && best.distance <= (MATCH_THRESHOLD + 0.03)) {
+              const { best: b, second: s } = bestTwoMatches(matcher, det.descriptor);
+              if (b.label && b.label !== "unknown" && (s.dist - b.dist) >= 0.03) {
+                name = b.label;
+              }
             }
           }
-        }
 
-        
+          // stable GuestXX when not known
+          let guestId = null;
+          if (!name) {
+            guestId = assignGuestIdFor(det.descriptor);
+          }
 
-        // stable GuestXX when not known
-        let guestId = null;
-        if (!name) {
-          guestId = assignGuestIdFor(det.descriptor);
-        }
+          // per-index stabilizer (reduce flicker). Index is left→right i
+          let displayName = name || guestId || "Guest";
+          const t = tracks[i];
 
-        // debounced display label (reduce flicker)
-        let displayName = name || guestId || "Guest";
-        const key = [
-          Math.round(box.x),
-          Math.round(box.y),
-          Math.round(box.width),
-          Math.round(box.height),
-        ].join("-");
-        const cache = recentMapRef.current;
-        const entry = cache[key];
-
-        if (entry) {
-          if (entry.name !== displayName) {
-            if ((entry.count || 0) < STABILIZE_FRAMES) {
-              displayName = entry.name;            // keep old until stable
-              entry.count = (entry.count || 0) + 1;
+          if (t && t.name !== displayName) {
+            if ((t.count || 0) < STABILIZE_FRAMES) {
+              displayName = t.name;                 // hold old label until stable
+              t.count = (t.count || 0) + 1;
             } else {
-              cache[key] = { name: displayName, count: 0 }; // accept new
+              tracks[i] = { name: displayName, count: 0 }; // accept new one
             }
           } else {
-            entry.count = 0; // same label → reset counter
+            tracks[i] = { name: displayName, count: 0 };   // first time or same
           }
-        } else {
-          cache[key] = { name: displayName, count: 0 };
-        }
 
-        // draw
-        const dbox = shrinkBox(box);
-        ctx.strokeStyle = color;
-        ctx.lineWidth = BOX_LINE_WIDTH;
-        ctx.strokeRect(dbox.x, dbox.y, dbox.width, dbox.height);
+          // draw
+          const dbox = shrinkBox(box);
+          ctx.strokeStyle = color;
+          ctx.lineWidth = BOX_LINE_WIDTH;
+          ctx.strokeRect(dbox.x, dbox.y, dbox.width, dbox.height);
 
-        const label = `${displayName} • ${zone} • ${Math.max(0,Math.round(det.age))} ${gender} • ${expr}`;
-        ctx.font = "14px system-ui,-apple-system,Segoe UI,Roboto,sans-serif";
-        const padX=6, padY=4;
-        const tw = ctx.measureText(label).width + padX*2;
-        const th = 18 + padY*2;
-        const lx = Math.max(0, Math.min(dbox.x, canvas.width - tw));
-        const ly = Math.max(0, dbox.y - th - 4);
-        ctx.fillStyle = color; ctx.fillRect(lx, ly, tw, th);
-        ctx.fillStyle = "#fff"; ctx.fillText(label, lx + padX, ly + 14);
+          const label = `${displayName} • ${zone} • ${Math.max(0,Math.round(det.age))} ${gender} • ${expr}`;
+          ctx.font = "24px system-ui,-apple-system,Segoe UI,Roboto,sans-serif";
+          const padX=6, padY=-2;
+          const tw = ctx.measureText(label).width + padX*2;
+          const th = 18 + padY*2;
+          const lx = Math.max(0, Math.min(dbox.x, canvas.width - tw));
+          const ly = Math.max(0, dbox.y - th - 4);
+          ctx.fillStyle = color; ctx.fillRect(lx, ly, tw, th);
+          ctx.fillStyle = "#fff"; ctx.fillText(label, lx + padX, ly + 14);
 
-        // table (first 5)
-        if (rows.length < 5){
-          rows.push({
-            idx: rows.length+1,
+          // table (first 5)
+          if (rows.length < 5){
+            rows.push({
+              idx: rows.length+1,
+              gender,
+              ageGroup: ageGroupOf(det.age),
+              zone,
+              name: name || null, // show known or GuestXX
+              distance: dist ? dist.toFixed(2)+" m" : "-",
+            });
+          }
+
+          // payload (ALL faces)
+          peopleForPost.push({
             gender,
             ageGroup: ageGroupOf(det.age),
             zone,
-            name: name || "-", // show GuestXX or known name
-            distance: dist ? dist.toFixed(2)+" m" : "-",
+            name: name || null,     // known name if any
+            gid: guestId || null,   // Guest01… when unknown
           });
+
+          total++; if (zone==="green") green++; else if (zone==="red") red++;
         }
 
-        // payload (ALL faces)
-        peopleForPost.push({
-          gender,
-          ageGroup: ageGroupOf(det.age),
-          zone,
-          name: name || null,   // known name if any
-          gid: guestId || null, // Guest01… when unknown
-        });
+        // trim unused stabilizer slots when faces leave
+        const keys = Object.keys(tracks);
+        for (const k of keys) {
+          const idx = Number(k);
+          if (idx >= resized.length) delete tracks[idx];
+        }
 
-        total++; if (zone==="green") green++; else if (zone==="red") red++;
-      }
+        // update UI + post
+        while (rows.length < 5) rows.push({ idx: rows.length+1, gender:"-", ageGroup:"-", zone:"-", name:"-", distance:"-" });
+        setTable(rows);
+        setTotals({ all: total, green, red });
 
-      while (rows.length < 5) rows.push({ idx: rows.length+1, gender:"-", ageGroup:"-", zone:"-", name:"-", distance:"-" });
-      setTable(rows);
-      setTotals({ all: total, green, red });
-
-      await updateSession(peopleForPost);
+        // fire-and-forget so we don't block FPS
+        updateSession(peopleForPost).catch(() => {});
+      })();
     };
 
     raf = requestAnimationFrame(loop);
-    return () => { cancelAnimationFrame(raf); video?.removeEventListener("loadedmetadata", resize); };
+    return () => {
+      cancelAnimationFrame(raf);
+      video?.removeEventListener("loadedmetadata", resize);
+    };
   }, [ready]);
 
   /* ------------------------------ posting ------------------------------ */
@@ -406,7 +415,7 @@ export default function App(){
         await post("stop", { sessionId: S.current.id, ts: now });
         S.current.id = null; S.current.seenFrames = 0;
         setSessionId(null); setSessionStatus("IDLE");
-        recentMapRef.current = {}; // clear debounce cache on stop
+        recentMapRef.current = {}; // clear stabilizer cache on stop
       }
     }
   }

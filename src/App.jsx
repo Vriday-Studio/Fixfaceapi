@@ -35,11 +35,11 @@ const MATCH_MARGIN      = 0.06; // best must beat 2nd-best by this margin
 const STABILIZE_FRAMES  = 3;    // require N consecutive frames to switch
 const MAX_SLOTS         = 5;    // how many left→right slots to stabilize
 
-// n8n TEST (direct)
+// FORCE TEST (simple and reliable for n8n community)
 const N8N = {
-  start:    "https://n8n.srv954455.hstgr.cloud/webhook-test/camera/start",
-  snapshot: "https://n8n.srv954455.hstgr.cloud/webhook-test/camera/snapshot",
-  stop:     "https://n8n.srv954455.hstgr.cloud/webhook-test/camera/stop",
+  start:   "/api/n8n-test/camera/start",
+  snapshot:"/api/n8n-test/camera/snapshot",
+  stop:    "/api/n8n-test/camera/stop",
 };
 
 // optional debug flag: await responses and show OK/ERR

@@ -341,13 +341,49 @@ export default function App(){
           if (idx >= resized.length) delete tracks[idx];
         }
 
-        // update UI + post
-        while (rows.length < 5) rows.push({ idx: rows.length+1, gender:"-", ageGroup:"-", zone:"-", name:"-", distance:"-" });
+        // --- END OF LOOP: update UI + post (non-blocking) ---
+
+        // keep table at 5 rows for the UI
+        while (rows.length < 5) {
+          rows.push({ idx: rows.length + 1, gender: "-", ageGroup: "-", zone: "-", name: "-", distance: "-" });
+        }
+
+        // update UI stats
         setTable(rows);
         setTotals({ all: total, green, red });
 
+        // build enriched snapshot payload for n8n
+        const count = peopleForPost.length;
+
+        const top5 = rows.slice(0, 5).map(r => ({
+          idx: r.idx,
+          name: r.name !== "-" ? r.name : null,
+          zone: r.zone !== "-" ? r.zone : null,
+          gender: r.gender !== "-" ? r.gender : null,
+          ageGroup: r.ageGroup !== "-" ? r.ageGroup : null,
+          distance: r.distance !== "-" ? r.distance : null,
+        }));
+
+        // easy access slots (null when empty)
+        const slots = {
+          slot1: rows[0]?.name && rows[0].name !== "-" ? rows[0].name : null,
+          slot2: rows[1]?.name && rows[1].name !== "-" ? rows[1].name : null,
+          slot3: rows[2]?.name && rows[2].name !== "-" ? rows[2].name : null,
+          slot4: rows[3]?.name && rows[3].name !== "-" ? rows[3].name : null,
+          slot5: rows[4]?.name && rows[4].name !== "-" ? rows[4].name : null,
+        };
+
+        const snapshotPayload = {
+          people: peopleForPost,   // your existing per-face objects (now can also include emotion if you added it)
+          count,                   // total faces this frame
+          greenCount: green,
+          redCount: red,
+          top5,
+          ...slots,
+        };
+
         // fire-and-forget so we don't block FPS
-        updateSession(peopleForPost).catch(() => {});
+        updateSession(snapshotPayload).catch(() => {});
       })();
     };
 
@@ -385,41 +421,43 @@ export default function App(){
   };
 
   /* ------------------------------ session FSM ------------------------------ */
-  async function updateSession(people){
-    const now = Date.now();
-    const any = Array.isArray(people) && people.length > 0;
+  async function updateSession(payload) {
+  const now = Date.now();
+  const any = payload && Array.isArray(payload.people) && payload.people.length > 0;
 
-    if (!S.current.id){
-      if (any){
-        S.current.seenFrames++;
-        if (S.current.seenFrames >= START_FRAMES){
-          S.current.id = uuid();
-          S.current.lastFaceTs = now;
-          S.current.lastSnapshotTs = 0;
-          setSessionId(S.current.id); setSessionStatus("ACTIVE");
-          await post("start", { sessionId: S.current.id, ts: now });
-        }
-      } else {
-        S.current.seenFrames = 0;
-      }
-      return;
-    }
-
-    if (any){
-      S.current.lastFaceTs = now;
-      if (now - S.current.lastSnapshotTs >= SNAPSHOT_EVERY){
-        S.current.lastSnapshotTs = now;
-        await post("snapshot", { sessionId: S.current.id, ts: now, people });
+  if (!S.current.id) {
+    if (any) {
+      S.current.seenFrames++;
+      if (S.current.seenFrames >= START_FRAMES) {
+        S.current.id = uuid();
+        S.current.lastFaceTs = now;
+        S.current.lastSnapshotTs = 0;
+        setSessionId(S.current.id); setSessionStatus("ACTIVE");
+        // start: minimal payload
+        updatePost("start", { sessionId: S.current.id, ts: now }).catch(()=>{});
       }
     } else {
-      if (now - S.current.lastFaceTs >= END_AFTER_MS){
-        await post("stop", { sessionId: S.current.id, ts: now });
-        S.current.id = null; S.current.seenFrames = 0;
-        setSessionId(null); setSessionStatus("IDLE");
-        recentMapRef.current = {}; // clear stabilizer cache on stop
-      }
+      S.current.seenFrames = 0;
+    }
+    return;
+  }
+
+  if (any) {
+    S.current.lastFaceTs = now;
+    if (now - S.current.lastSnapshotTs >= SNAPSHOT_EVERY) {
+      S.current.lastSnapshotTs = now;
+      // snapshot: send the enriched payload
+      updatePost("snapshot", { sessionId: S.current.id, ts: now, ...payload }).catch(()=>{});
+    }
+  } else {
+    if (now - S.current.lastFaceTs >= END_AFTER_MS) {
+      updatePost("stop", { sessionId: S.current.id, ts: now }).catch(()=>{});
+      S.current.id = null; S.current.seenFrames = 0;
+      setSessionId(null); setSessionStatus("IDLE");
+      recentMapRef.current = {}; // optional: clear debounce cache when session ends
     }
   }
+}
 
   /* ------------------------------ UI ------------------------------ */
   const statusDot = (s) => ({

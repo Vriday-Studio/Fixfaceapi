@@ -21,7 +21,7 @@ const STABILIZE_FRAMES = 5;    // frames required before switching label
 
 // drawing
 const BOX_SHRINK     = 0.7;
-const BOX_LINE_WIDTH = 5;
+const BOX_LINE_WIDTH = 8;
 
 // pacing
 const START_FRAMES   = 8;
@@ -301,9 +301,9 @@ export default function App(){
 
           const label = `${displayName} • ${zone} • ${Math.max(0,Math.round(det.age))} ${gender} • ${expr}`;
           ctx.font = "24px system-ui,-apple-system,Segoe UI,Roboto,sans-serif";
-          const padX=6, padY=-2;
+          const padX=6, padY=-4;
           const tw = ctx.measureText(label).width + padX*2;
-          const th = 18 + padY*2;
+          const th = 24 + padY*2;
           const lx = Math.max(0, Math.min(dbox.x, canvas.width - tw));
           const ly = Math.max(0, dbox.y - th - 4);
           ctx.fillStyle = color; ctx.fillRect(lx, ly, tw, th);
@@ -434,7 +434,7 @@ export default function App(){
         S.current.lastSnapshotTs = 0;
         setSessionId(S.current.id); setSessionStatus("ACTIVE");
         // start: minimal payload
-        updatePost("start", { sessionId: S.current.id, ts: now }).catch(()=>{});
+        post("start", { sessionId: S.current.id, ts: now }).catch(()=>{});
       }
     } else {
       S.current.seenFrames = 0;
@@ -447,11 +447,11 @@ export default function App(){
     if (now - S.current.lastSnapshotTs >= SNAPSHOT_EVERY) {
       S.current.lastSnapshotTs = now;
       // snapshot: send the enriched payload
-      updatePost("snapshot", { sessionId: S.current.id, ts: now, ...payload }).catch(()=>{});
+      post("snapshot", { sessionId: S.current.id, ts: now, ...payload }).catch(()=>{});
     }
   } else {
     if (now - S.current.lastFaceTs >= END_AFTER_MS) {
-      updatePost("stop", { sessionId: S.current.id, ts: now }).catch(()=>{});
+      post("stop", { sessionId: S.current.id, ts: now }).catch(()=>{});
       S.current.id = null; S.current.seenFrames = 0;
       setSessionId(null); setSessionStatus("IDLE");
       recentMapRef.current = {}; // optional: clear debounce cache when session ends

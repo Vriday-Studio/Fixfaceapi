@@ -3,8 +3,8 @@
   publish = "dist"
 
 [[redirects]]
-  from   = "/api/n8n-test/*"
-  to     = "https://n8n.srv954455.hstgr.cloud/webhook-test/:splat"
+  from   = "/api/n8n/*"
+  to     = "https://n8n.srv954455.hstgr.cloud/webhook/:splat"
   status = 200
   force  = true
 

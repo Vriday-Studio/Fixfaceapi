@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import * as faceapi from "face-api.js";
 
-/* -------------------- CONFIG (simple & stable) -------------------- */
-const MODEL_URL = "/models";
-const FACE_WIDTH_M = 0.15;
-let   FOCAL_PX     = 500;
-const GREEN_MAX_M  = 0.8;
+/* ====================== CONFIG ====================== */
+const MODEL_URL  = "/models";
+const LABELS_URL = "/labels/labels.json";
+
+const FACE_WIDTH_M  = 0.15;
+let   FOCAL_PX      = 500;     // will be adjusted after video loads
+const GREEN_MAX_M   = 0.8;
 
 const TINY_OPTS = new faceapi.TinyFaceDetectorOptions({
   inputSize: 512,
@@ -13,93 +15,91 @@ const TINY_OPTS = new faceapi.TinyFaceDetectorOptions({
 });
 
 // recognition strictness
-const MATCH_THRESHOLD = 0.5; // tighter than 0.60 (try 0.50–0.55)
-const MATCH_MARGIN    = 0.08; // best must beat 2nd-best by ≥ this
-// how many frames a name must "win" before we show it
-const STABILIZE_FRAMES = 3; // try 2–4
+const MATCH_THRESHOLD  = 0.50; // tighten/loosen (0.48–0.55)
+const MATCH_MARGIN     = 0.03; // how much best must beat 2nd-best
+const STABILIZE_FRAMES = 5;    // frames before switching label
 
+// drawing
 const BOX_SHRINK     = 0.7;
 const BOX_LINE_WIDTH = 5;
+const LABEL_FONT     = "16px system-ui,-apple-system,Segoe UI,Roboto,sans-serif"; // readable
+const LABEL_PAD_X    = 8;
+const LABEL_PAD_Y    = 6; // bigger background
 
+// pacing
 const START_FRAMES   = 8;
 const END_AFTER_MS   = 8000;
 const SNAPSHOT_EVERY = 900;
 const LOOP_STEP_MS   = 120;
 
+// n8n (Netlify proxy)
 const N8N = {
-  start:   "/api/n8n-test/camera/start",
-  snapshot:"/api/n8n-test/camera/snapshot",
-  stop:    "/api/n8n-test/camera/stop",
+  start:    "/api/n8n/camera/start",
+  snapshot: "/api/n8n/camera/snapshot",
+  stop:     "/api/n8n/camera/stop",
 };
 
 const DEBUG_FETCH = /[?&]debugPost=1\b/.test(window.location.search);
 
-// --- Guest ID memory (stable within a page session) ---
-const guestSeqRef = { current: 1 };           // Guest01, Guest02, ...
-const guestMemRef = { current: [] };          // [{ id, desc: Float32Array }]
-const GUEST_TOL   = 0.60;                     // reuse a guest if <= this dist
+/* ====================== Guest ID memory ====================== */
+const guestSeqRef = { current: 1 };     // Guest01, Guest02, ...
+const guestMemRef = { current: [] };    // [{ id, desc: Float32Array }]
+const GUEST_TOL   = 0.60;
 
 function assignGuestIdFor(descriptor) {
-  // Fallback if descriptor is missing or malformed
+  // handle rare null/empty descriptor frames
   if (!descriptor || !descriptor.length) {
-    const id = `Guest${String(guestSeqRef.current++).padStart(2, "0")}`;
-    return id;
+    return `Guest${String(guestSeqRef.current++).padStart(2, "0")}`;
   }
-
   const mem = guestMemRef.current;
   let bestIdx = -1, bestDist = 1;
-
   for (let i = 0; i < mem.length; i++) {
     const d = faceapi.euclideanDistance(descriptor, mem[i].desc);
     if (d < bestDist) { bestDist = d; bestIdx = i; }
   }
-
-  if (bestIdx >= 0 && bestDist <= GUEST_TOL) {
-    return mem[bestIdx].id;
-  }
+  if (bestIdx >= 0 && bestDist <= GUEST_TOL) return mem[bestIdx].id;
 
   const id = `Guest${String(guestSeqRef.current++).padStart(2, "0")}`;
   mem.push({ id, desc: Float32Array.from(descriptor) });
   return id;
 }
 
-/* -------------------- helpers -------------------- */
-const uuid = () => (crypto?.randomUUID ? crypto.randomUUID()
-  : Math.random().toString(36).slice(2) + Date.now().toString(36));
+/* ====================== helpers ====================== */
+const uuid = () =>
+  (crypto?.randomUUID ? crypto.randomUUID()
+   : Math.random().toString(36).slice(2) + Date.now().toString(36));
 
 const estimateDistanceM = (wPx) => (wPx ? (FOCAL_PX * FACE_WIDTH_M) / wPx : null);
-const ageGroupOf = (age) => (age == null ? "unknown" : (Math.round(age) >= 18 ? "adult" : (Math.round(age) >= 12 ? "teen" : "child")));
+const ageGroupOf = (age) => (age == null ? "unknown"
+  : (Math.round(age) >= 18 ? "adult" : (Math.round(age) >= 12 ? "teen" : "child")));
 const zoneOf = (d) => (d != null && d <= GREEN_MAX_M ? "green" : "red");
 const topExpression = (e) => (!e ? "neutral" : Object.entries(e).reduce((a,b)=>a[1]>b[1]?a:b)[0]);
 
 const shrinkBox = (b, f = BOX_SHRINK) => {
   const w = b.width * f, h = b.height * f;
   return { x: b.x + (b.width - w) / 2, y: b.y + (b.height - h) / 2, width: w, height: h };
-}; // <— CLOSES shrinkBox properly
+};
 
-// best & second-best distances so we can enforce a margin
+// compute best & second-best so we can enforce a margin
 function bestTwoMatches(matcher, queryDesc){
   let best={label:null,dist:1}, second={label:null,dist:1};
   for (const ld of matcher.labeledDescriptors){
     for (const d of ld.descriptors){
       const dist = faceapi.euclideanDistance(queryDesc, d);
-      if (dist < best.dist){ second=best; best={label:ld.label,dist}; }
-      else if (dist < second.dist){ second={label:ld.label,dist}; }
+      if (dist < best.dist){ second = best; best = { label: ld.label, dist }; }
+      else if (dist < second.dist){ second = { label: ld.label, dist }; }
     }
   }
   return { best, second };
 }
 
-/* -------------------- App -------------------- */
+/* ====================== App ====================== */
 export default function App(){
   const videoRef  = useRef(null);
   const canvasRef = useRef(null);
 
   const [ready, setReady] = useState(false);
   const [backend, setBackend] = useState("cpu");
-
-  // left→right name stabilizer (one slot per visible face index)
-  const nameTracksRef = useRef([]); // [{shown, candidate, streak}]
 
   const [sessionStatus, setSessionStatus] = useState("IDLE");
   const [sessionId, setSessionId] = useState(null);
@@ -113,20 +113,21 @@ export default function App(){
   );
 
   const faceMatcherRef = useRef(null);
-  const recentMapRef = useRef({});
   const [knownCount, setKnownCount] = useState(0);
 
+  // per-index label stabilizer: { [i]: { name, count } }
+  const recentMapRef = useRef({});
+
+  // session state
   const S = useRef({ id:null, seenFrames:0, lastFaceTs:0, lastSnapshotTs:0 });
 
-  /* init */
+  /* ---------- init: backend, models, labels, camera ---------- */
   useEffect(() => {
     (async () => {
-      // backend
       try { await faceapi.tf.setBackend("webgl"); await faceapi.tf.ready(); setBackend("webgl"); }
       catch { try { await faceapi.tf.setBackend("wasm"); await faceapi.tf.ready(); setBackend("wasm"); }
               catch { await faceapi.tf.setBackend("cpu"); await faceapi.tf.ready(); setBackend("cpu"); } }
 
-      // nets (Tiny + recognition stack)
       await Promise.all([
         faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
         faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
@@ -135,10 +136,10 @@ export default function App(){
         faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
       ]);
 
-      // build labeled descriptors using the SAME Tiny pipeline
+      // known faces via labels.json (Tiny pipeline)
       try {
         let total = 0;
-        const res = await fetch("/labels/labels.json", { cache:"no-store" });
+        const res = await fetch(LABELS_URL, { cache:"no-store" });
         const manifest = res.ok ? await res.json() : { people:[] };
         const labeled = [];
 
@@ -165,7 +166,7 @@ export default function App(){
           }
         }
         if (labeled.length){
-          faceMatcherRef.current = new faceapi.FaceMatcher(labeled, 0.6);
+          faceMatcherRef.current = new faceapi.FaceMatcher(labeled, MATCH_THRESHOLD);
           setKnownCount(total);
         } else {
           faceMatcherRef.current = null;
@@ -198,12 +199,13 @@ export default function App(){
     };
   }, []);
 
-  /* loop */
+  /* ------------------------------ loop ------------------------------ */
   useEffect(() => {
     if (!ready) return;
-    const video = videoRef.current;
+
+    const video  = videoRef.current;
     const canvas = canvasRef.current;
-    const ctx = canvas.getContext("2d");
+    const ctx    = canvas.getContext("2d");
 
     const resize = () => {
       if (!video) return;
@@ -213,113 +215,174 @@ export default function App(){
     video.addEventListener("loadedmetadata", resize);
     resize();
 
-    let raf = 0, lastRun = 0;
+    let raf = 0;
+    let lastRun = 0;
 
-    const loop = async (ts) => {
+    const loop = () => {
       raf = requestAnimationFrame(loop);
-      if (ts - lastRun < LOOP_STEP_MS) return;
-      lastRun = ts;
+
+      const now = performance.now();
+      if (now - lastRun < LOOP_STEP_MS) return;
+      lastRun = now;
       if (!video.videoWidth) return;
 
-      const dets = await faceapi
-        .detectAllFaces(video, TINY_OPTS)
-        .withFaceLandmarks()
-        .withFaceExpressions()
-        .withAgeAndGender()
-        .withFaceDescriptors();
+      (async () => {
+        // detect
+        const dets = await faceapi
+          .detectAllFaces(video, TINY_OPTS)
+          .withFaceLandmarks()
+          .withFaceExpressions()
+          .withAgeAndGender()
+          .withFaceDescriptors();
 
-      ctx.clearRect(0,0,canvas.width,canvas.height);
+        // clear + resize results
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+        const resized = faceapi
+          .resizeResults(dets, { width: canvas.width, height: canvas.height })
+          .sort((a,b)=>a.detection.box.x - b.detection.box.x);
 
-      const resized = faceapi
-        .resizeResults(dets, { width: canvas.width, height: canvas.height })
-        .sort((a,b)=>a.detection.box.x - b.detection.box.x);
+        const matcher = faceMatcherRef.current;
+        const rows = [];
+        const peopleForPost = [];
+        let total=0, green=0, red=0;
 
-      const matcher = faceMatcherRef.current;
-      const rows = [];
-      const peopleForPost = [];
-      let total=0, green=0, red=0;
+        const tracks = recentMapRef.current; // { [i]: { name, count } }
 
-      for (const det of resized){
-        const box  = det.detection.box;
-        const dist = estimateDistanceM(box.width);
-        const zone = zoneOf(dist);
-        const color = zone === "green" ? "#22c55e" : "#ef4444";
-        const gender = (det.gender||"").toLowerCase();
-        const expr = topExpression(det.expressions);
+        for (let i = 0; i < resized.length; i++) {
+          const det  = resized[i];
+          const box  = det.detection.box;
+          const dist = estimateDistanceM(box.width);
+          const zone = zoneOf(dist);
+          const color = zone === "green" ? "#22c55e" : "#ef4444";
+          const gender = (det.gender || "").toLowerCase();
+          const expr = topExpression(det.expressions);
 
-        let name = null;
-        if (matcher && det.descriptor){
-          const best = matcher.findBestMatch(det.descriptor);
-          if (best && best.label !== "unknown" && best.distance <= MATCH_THRESHOLD /* or 0.6 */) {
-            name = best.label;
+          // known face with threshold + small margin check
+          let name = null;
+          if (matcher && det.descriptor) {
+            const best = matcher.findBestMatch(det.descriptor);
+            if (best && best.label !== "unknown" && best.distance <= MATCH_THRESHOLD) {
+              name = best.label;
+            } else if (best && best.label !== "unknown" && best.distance <= (MATCH_THRESHOLD + 0.03)) {
+              const { best: b, second: s } = bestTwoMatches(matcher, det.descriptor);
+              if (b.label && b.label !== "unknown" && (s.dist - b.dist) >= MATCH_MARGIN) {
+                name = b.label;
+              }
+            }
           }
-        }
 
-        // If still unknown, assign a stable GuestXX (even if descriptor is missing)
-        let guestId = null;
-        if (!name) {
-          if (det.descriptor) {
-            guestId = assignGuestIdFor(det.descriptor);
+          // stable GuestXX when not known
+          let guestId = null;
+          if (!name) guestId = assignGuestIdFor(det.descriptor);
+
+          // per-index stabilizer (reduce flicker). Index is left→right i
+          let displayName = name || guestId || "Guest";
+          const t = tracks[i];
+          if (t && t.name !== displayName) {
+            if ((t.count || 0) < STABILIZE_FRAMES) {
+              displayName = t.name;                 // hold old label until stable
+              t.count = (t.count || 0) + 1;
+            } else {
+              tracks[i] = { name: displayName, count: 0 }; // accept new one
+            }
           } else {
-            // fallback for the rare frame with no descriptor
-            guestId = assignGuestIdFor(null);
+            tracks[i] = { name: displayName, count: 0 };   // first time or same
           }
-        }
 
-        const displayName = name || guestId; // <- no "Guest" fallback needed anymore
+          // draw
+          const dbox = shrinkBox(box);
+          ctx.strokeStyle = color;
+          ctx.lineWidth = BOX_LINE_WIDTH;
+          ctx.strokeRect(dbox.x, dbox.y, dbox.width, dbox.height);
 
-        // draw
-        const dbox = shrinkBox(box);
-        ctx.strokeStyle = color;
-        ctx.lineWidth = BOX_LINE_WIDTH;
-        ctx.strokeRect(dbox.x, dbox.y, dbox.width, dbox.height);
+          const label = `${displayName} • ${zone} • ${Math.max(0,Math.round(det.age))} ${gender} • ${expr}`;
+          ctx.font = LABEL_FONT;
+          const tw = ctx.measureText(label).width + LABEL_PAD_X * 2;
+          const th = 18 + LABEL_PAD_Y * 2; // taller background
+          const lx = Math.max(0, Math.min(dbox.x, canvas.width - tw));
+          const ly = Math.max(0, dbox.y - th - 4);
+          ctx.fillStyle = color; ctx.fillRect(lx, ly, tw, th);
+          ctx.fillStyle = "#fff"; ctx.fillText(label, lx + LABEL_PAD_X, ly + (th - LABEL_PAD_Y - 4));
 
-        const label = `${displayName} • ${zone} • ${Math.max(0,Math.round(det.age))} ${gender} • ${expr}`;
-        ctx.font = "14px system-ui,-apple-system,Segoe UI,Roboto,sans-serif";
-        const padX=6, padY=4;
-        const tw = ctx.measureText(label).width + padX*2;
-        const th = 18 + padY*2;
-        const lx = Math.max(0, Math.min(dbox.x, canvas.width - tw));
-        const ly = Math.max(0, dbox.y - th - 4);
-        ctx.fillStyle = color; ctx.fillRect(lx, ly, tw, th);
-        ctx.fillStyle = "#fff"; ctx.fillText(label, lx + padX, ly + 14);
+          // table (first 5)
+          if (rows.length < 5){
+            rows.push({
+              idx: rows.length+1,
+              gender,
+              ageGroup: ageGroupOf(det.age),
+              zone,
+              name: displayName, // show GuestXX or known
+              distance: dist ? dist.toFixed(2)+" m" : "-",
+            });
+          }
 
-        // table (first 5)
-        if (rows.length < 5){
-          rows.push({
-            idx: rows.length+1,
+          // payload (ALL faces)
+          peopleForPost.push({
             gender,
             ageGroup: ageGroupOf(det.age),
             zone,
-            name: name || "-",
-            distance: dist ? dist.toFixed(2)+" m" : "-",
+            name: name || null,     // known name if any
+            gid: guestId || null,   // Guest01… when unknown
+            emotion: expr,
           });
+
+          total++; if (zone==="green") green++; else if (zone==="red") red++;
         }
 
-        // payload (ALL faces)
-        peopleForPost.push({
-          gender,
-          ageGroup: ageGroupOf(det.age),
-          zone,
-          name: name || null,
-          gid: guestId || null,    // <— new: Guest01, Guest02, ... when unknown
-        });
+        // trim unused stabilizer slots when faces leave
+        const keys = Object.keys(tracks);
+        for (const k of keys) {
+          const idx = Number(k);
+          if (idx >= resized.length) delete tracks[idx];
+        }
 
-        total++; if (zone==="green") green++; else if (zone==="red") red++;
-      }
+        // --- END OF LOOP: update UI + post (non-blocking) ---
+        while (rows.length < 5) {
+          rows.push({ idx: rows.length + 1, gender: "-", ageGroup: "-", zone: "-", name: "-", distance: "-" });
+        }
+        setTable(rows);
+        setTotals({ all: total, green, red });
 
-      while (rows.length < 5) rows.push({ idx: rows.length+1, gender:"-", ageGroup:"-", zone:"-", name:"-", distance:"-" });
-      setTable(rows);
-      setTotals({ all: total, green, red });
+        const count = peopleForPost.length;
+        const top5 = rows.slice(0, 5).map(r => ({
+          idx: r.idx,
+          name: r.name !== "-" ? r.name : null,
+          zone: r.zone !== "-" ? r.zone : null,
+          gender: r.gender !== "-" ? r.gender : null,
+          ageGroup: r.ageGroup !== "-" ? r.ageGroup : null,
+          distance: r.distance !== "-" ? r.distance : null,
+        }));
 
-      await updateSession(peopleForPost);
+        const slots = {
+          slot1: rows[0]?.name && rows[0].name !== "-" ? rows[0].name : null,
+          slot2: rows[1]?.name && rows[1].name !== "-" ? rows[1].name : null,
+          slot3: rows[2]?.name && rows[2].name !== "-" ? rows[2].name : null,
+          slot4: rows[3]?.name && rows[3].name !== "-" ? rows[3].name : null,
+          slot5: rows[4]?.name && rows[4].name !== "-" ? rows[4].name : null,
+        };
+
+        const snapshotPayload = {
+          people: peopleForPost,
+          count,
+          greenCount: green,
+          redCount: red,
+          top5,
+          ...slots,
+        };
+
+        // fire-and-forget so we don't block FPS
+        updateSession(snapshotPayload).catch(() => {});
+      })();
     };
 
     raf = requestAnimationFrame(loop);
-    return () => { cancelAnimationFrame(raf); video?.removeEventListener("loadedmetadata", resize); };
+    return () => {
+      cancelAnimationFrame(raf);
+      video?.removeEventListener("loadedmetadata", resize);
+    };
   }, [ready]);
 
-  /* posting */
+  /* ------------------------------ posting ------------------------------ */
   const post = async (which, payload) => {
     const url = N8N[which];
     const nowStr = new Date().toLocaleTimeString();
@@ -345,20 +408,20 @@ export default function App(){
     }catch(e){ setLastHttp(h=>({ ...h, [which]: `ERR ${String(e)}` })); }
   };
 
-  /* session FSM */
-  async function updateSession(people){
+  /* ------------------------------ session FSM ------------------------------ */
+  async function updateSession(payload) {
     const now = Date.now();
-    const any = Array.isArray(people) && people.length > 0;
+    const any = payload && Array.isArray(payload.people) && payload.people.length > 0;
 
-    if (!S.current.id){
-      if (any){
+    if (!S.current.id) {
+      if (any) {
         S.current.seenFrames++;
-        if (S.current.seenFrames >= START_FRAMES){
+        if (S.current.seenFrames >= START_FRAMES) {
           S.current.id = uuid();
           S.current.lastFaceTs = now;
           S.current.lastSnapshotTs = 0;
           setSessionId(S.current.id); setSessionStatus("ACTIVE");
-          await post("start", { sessionId: S.current.id, ts: now });
+          post("start", { sessionId: S.current.id, ts: now }).catch(()=>{});
         }
       } else {
         S.current.seenFrames = 0;
@@ -366,22 +429,23 @@ export default function App(){
       return;
     }
 
-    if (any){
+    if (any) {
       S.current.lastFaceTs = now;
-      if (now - S.current.lastSnapshotTs >= SNAPSHOT_EVERY){
+      if (now - S.current.lastSnapshotTs >= SNAPSHOT_EVERY) {
         S.current.lastSnapshotTs = now;
-        await post("snapshot", { sessionId: S.current.id, ts: now, people });
+        post("snapshot", { sessionId: S.current.id, ts: now, ...payload }).catch(()=>{});
       }
     } else {
-      if (now - S.current.lastFaceTs >= END_AFTER_MS){
-        await post("stop", { sessionId: S.current.id, ts: now });
+      if (now - S.current.lastFaceTs >= END_AFTER_MS) {
+        post("stop", { sessionId: S.current.id, ts: now }).catch(()=>{});
         S.current.id = null; S.current.seenFrames = 0;
         setSessionId(null); setSessionStatus("IDLE");
+        recentMapRef.current = {}; // clear debounce cache when session ends
       }
     }
   }
 
-  /* UI */
+  /* ------------------------------ UI ------------------------------ */
   const statusDot = (s) => ({
     display:"inline-block", width:10, height:10, borderRadius:999, marginRight:6,
     background: s === "ACTIVE" ? "#22c55e" : "#fbbf24",

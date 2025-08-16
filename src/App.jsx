@@ -1,13 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import * as faceapi from "face-api.js";
 
-/* -------------------- CONFIG -------------------- */
+/* ====================== CONFIG ====================== */
 const MODEL_URL  = "/models";
 const LABELS_URL = "/labels/labels.json";
 
-const FACE_WIDTH_M = 0.15;
-let   FOCAL_PX     = 500;
-const GREEN_MAX_M  = 0.8;
+const FACE_WIDTH_M  = 0.15;
+let   FOCAL_PX      = 500;     // will be adjusted after video loads
+const GREEN_MAX_M   = 0.8;
 
 const TINY_OPTS = new faceapi.TinyFaceDetectorOptions({
   inputSize: 512,
@@ -15,13 +15,16 @@ const TINY_OPTS = new faceapi.TinyFaceDetectorOptions({
 });
 
 // recognition strictness
-const MATCH_THRESHOLD  = 0.5; // tighten if needed (0.48–0.55)
-const MATCH_MARGIN     = 0.08; // best must beat 2nd-best by this
-const STABILIZE_FRAMES = 5;    // frames required before switching label
+const MATCH_THRESHOLD  = 0.50; // tighten/loosen (0.48–0.55)
+const MATCH_MARGIN     = 0.03; // how much best must beat 2nd-best
+const STABILIZE_FRAMES = 5;    // frames before switching label
 
 // drawing
 const BOX_SHRINK     = 0.7;
-const BOX_LINE_WIDTH = 8;
+const BOX_LINE_WIDTH = 5;
+const LABEL_FONT     = "16px system-ui,-apple-system,Segoe UI,Roboto,sans-serif"; // readable
+const LABEL_PAD_X    = 8;
+const LABEL_PAD_Y    = 6; // bigger background
 
 // pacing
 const START_FRAMES   = 8;
@@ -31,24 +34,23 @@ const LOOP_STEP_MS   = 120;
 
 // n8n (Netlify proxy)
 const N8N = {
-  start:    "/api/n8n-test/camera/start",
-  snapshot: "/api/n8n-test/camera/snapshot",
-  stop:     "/api/n8n-test/camera/stop",
+  start:    "/api/n8n/camera/start",
+  snapshot: "/api/n8n/camera/snapshot",
+  stop:     "/api/n8n/camera/stop",
 };
 
 const DEBUG_FETCH = /[?&]debugPost=1\b/.test(window.location.search);
 
-/* -------------------- Guest ID memory (per page session) -------------------- */
-const guestSeqRef = { current: 1 };          // Guest01, Guest02, ...
-const guestMemRef = { current: [] };         // [{ id, desc: Float32Array }]
-const GUEST_TOL   = 0.60;                    // reuse a guest if <= this dist
+/* ====================== Guest ID memory ====================== */
+const guestSeqRef = { current: 1 };     // Guest01, Guest02, ...
+const guestMemRef = { current: [] };    // [{ id, desc: Float32Array }]
+const GUEST_TOL   = 0.60;
 
 function assignGuestIdFor(descriptor) {
   // handle rare null/empty descriptor frames
   if (!descriptor || !descriptor.length) {
     return `Guest${String(guestSeqRef.current++).padStart(2, "0")}`;
   }
-
   const mem = guestMemRef.current;
   let bestIdx = -1, bestDist = 1;
   for (let i = 0; i < mem.length; i++) {
@@ -62,7 +64,7 @@ function assignGuestIdFor(descriptor) {
   return id;
 }
 
-/* -------------------- helpers -------------------- */
+/* ====================== helpers ====================== */
 const uuid = () =>
   (crypto?.randomUUID ? crypto.randomUUID()
    : Math.random().toString(36).slice(2) + Date.now().toString(36));
@@ -91,7 +93,7 @@ function bestTwoMatches(matcher, queryDesc){
   return { best, second };
 }
 
-/* ------------------------------ App ------------------------------ */
+/* ====================== App ====================== */
 export default function App(){
   const videoRef  = useRef(null);
   const canvasRef = useRef(null);
@@ -119,15 +121,13 @@ export default function App(){
   // session state
   const S = useRef({ id:null, seenFrames:0, lastFaceTs:0, lastSnapshotTs:0 });
 
-  /* -------------------- init: backend, models, labels, camera -------------------- */
+  /* ---------- init: backend, models, labels, camera ---------- */
   useEffect(() => {
     (async () => {
-      // backend
       try { await faceapi.tf.setBackend("webgl"); await faceapi.tf.ready(); setBackend("webgl"); }
       catch { try { await faceapi.tf.setBackend("wasm"); await faceapi.tf.ready(); setBackend("wasm"); }
               catch { await faceapi.tf.setBackend("cpu"); await faceapi.tf.ready(); setBackend("cpu"); } }
 
-      // nets
       await Promise.all([
         faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
         faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
@@ -136,7 +136,7 @@ export default function App(){
         faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
       ]);
 
-      // known faces via labels.json
+      // known faces via labels.json (Tiny pipeline)
       try {
         let total = 0;
         const res = await fetch(LABELS_URL, { cache:"no-store" });
@@ -203,9 +203,9 @@ export default function App(){
   useEffect(() => {
     if (!ready) return;
 
-    const video = videoRef.current;
+    const video  = videoRef.current;
     const canvas = canvasRef.current;
-    const ctx = canvas.getContext("2d");
+    const ctx    = canvas.getContext("2d");
 
     const resize = () => {
       if (!video) return;
@@ -246,7 +246,6 @@ export default function App(){
         const peopleForPost = [];
         let total=0, green=0, red=0;
 
-        // per-index stabilizer store
         const tracks = recentMapRef.current; // { [i]: { name, count } }
 
         for (let i = 0; i < resized.length; i++) {
@@ -258,7 +257,7 @@ export default function App(){
           const gender = (det.gender || "").toLowerCase();
           const expr = topExpression(det.expressions);
 
-          // known face: strict threshold + small margin check
+          // known face with threshold + small margin check
           let name = null;
           if (matcher && det.descriptor) {
             const best = matcher.findBestMatch(det.descriptor);
@@ -266,7 +265,7 @@ export default function App(){
               name = best.label;
             } else if (best && best.label !== "unknown" && best.distance <= (MATCH_THRESHOLD + 0.03)) {
               const { best: b, second: s } = bestTwoMatches(matcher, det.descriptor);
-              if (b.label && b.label !== "unknown" && (s.dist - b.dist) >= 0.03) {
+              if (b.label && b.label !== "unknown" && (s.dist - b.dist) >= MATCH_MARGIN) {
                 name = b.label;
               }
             }
@@ -274,14 +273,11 @@ export default function App(){
 
           // stable GuestXX when not known
           let guestId = null;
-          if (!name) {
-            guestId = assignGuestIdFor(det.descriptor);
-          }
+          if (!name) guestId = assignGuestIdFor(det.descriptor);
 
           // per-index stabilizer (reduce flicker). Index is left→right i
           let displayName = name || guestId || "Guest";
           const t = tracks[i];
-
           if (t && t.name !== displayName) {
             if ((t.count || 0) < STABILIZE_FRAMES) {
               displayName = t.name;                 // hold old label until stable
@@ -300,14 +296,13 @@ export default function App(){
           ctx.strokeRect(dbox.x, dbox.y, dbox.width, dbox.height);
 
           const label = `${displayName} • ${zone} • ${Math.max(0,Math.round(det.age))} ${gender} • ${expr}`;
-          ctx.font = "24px system-ui,-apple-system,Segoe UI,Roboto,sans-serif";
-          const padX=6, padY=-4;
-          const tw = ctx.measureText(label).width + padX*2;
-          const th = 24 + padY*2;
+          ctx.font = LABEL_FONT;
+          const tw = ctx.measureText(label).width + LABEL_PAD_X * 2;
+          const th = 18 + LABEL_PAD_Y * 2; // taller background
           const lx = Math.max(0, Math.min(dbox.x, canvas.width - tw));
           const ly = Math.max(0, dbox.y - th - 4);
           ctx.fillStyle = color; ctx.fillRect(lx, ly, tw, th);
-          ctx.fillStyle = "#fff"; ctx.fillText(label, lx + padX, ly + 14);
+          ctx.fillStyle = "#fff"; ctx.fillText(label, lx + LABEL_PAD_X, ly + (th - LABEL_PAD_Y - 4));
 
           // table (first 5)
           if (rows.length < 5){
@@ -316,7 +311,7 @@ export default function App(){
               gender,
               ageGroup: ageGroupOf(det.age),
               zone,
-              name: name || null, // show known or GuestXX
+              name: displayName, // show GuestXX or known
               distance: dist ? dist.toFixed(2)+" m" : "-",
             });
           }
@@ -328,7 +323,7 @@ export default function App(){
             zone,
             name: name || null,     // known name if any
             gid: guestId || null,   // Guest01… when unknown
-            emotion: expr,        // <-- send emotion to n8n
+            emotion: expr,
           });
 
           total++; if (zone==="green") green++; else if (zone==="red") red++;
@@ -342,19 +337,13 @@ export default function App(){
         }
 
         // --- END OF LOOP: update UI + post (non-blocking) ---
-
-        // keep table at 5 rows for the UI
         while (rows.length < 5) {
           rows.push({ idx: rows.length + 1, gender: "-", ageGroup: "-", zone: "-", name: "-", distance: "-" });
         }
-
-        // update UI stats
         setTable(rows);
         setTotals({ all: total, green, red });
 
-        // build enriched snapshot payload for n8n
         const count = peopleForPost.length;
-
         const top5 = rows.slice(0, 5).map(r => ({
           idx: r.idx,
           name: r.name !== "-" ? r.name : null,
@@ -364,7 +353,6 @@ export default function App(){
           distance: r.distance !== "-" ? r.distance : null,
         }));
 
-        // easy access slots (null when empty)
         const slots = {
           slot1: rows[0]?.name && rows[0].name !== "-" ? rows[0].name : null,
           slot2: rows[1]?.name && rows[1].name !== "-" ? rows[1].name : null,
@@ -374,8 +362,8 @@ export default function App(){
         };
 
         const snapshotPayload = {
-          people: peopleForPost,   // your existing per-face objects (now can also include emotion if you added it)
-          count,                   // total faces this frame
+          people: peopleForPost,
+          count,
           greenCount: green,
           redCount: red,
           top5,
@@ -422,42 +410,40 @@ export default function App(){
 
   /* ------------------------------ session FSM ------------------------------ */
   async function updateSession(payload) {
-  const now = Date.now();
-  const any = payload && Array.isArray(payload.people) && payload.people.length > 0;
+    const now = Date.now();
+    const any = payload && Array.isArray(payload.people) && payload.people.length > 0;
 
-  if (!S.current.id) {
+    if (!S.current.id) {
+      if (any) {
+        S.current.seenFrames++;
+        if (S.current.seenFrames >= START_FRAMES) {
+          S.current.id = uuid();
+          S.current.lastFaceTs = now;
+          S.current.lastSnapshotTs = 0;
+          setSessionId(S.current.id); setSessionStatus("ACTIVE");
+          post("start", { sessionId: S.current.id, ts: now }).catch(()=>{});
+        }
+      } else {
+        S.current.seenFrames = 0;
+      }
+      return;
+    }
+
     if (any) {
-      S.current.seenFrames++;
-      if (S.current.seenFrames >= START_FRAMES) {
-        S.current.id = uuid();
-        S.current.lastFaceTs = now;
-        S.current.lastSnapshotTs = 0;
-        setSessionId(S.current.id); setSessionStatus("ACTIVE");
-        // start: minimal payload
-        post("start", { sessionId: S.current.id, ts: now }).catch(()=>{});
+      S.current.lastFaceTs = now;
+      if (now - S.current.lastSnapshotTs >= SNAPSHOT_EVERY) {
+        S.current.lastSnapshotTs = now;
+        post("snapshot", { sessionId: S.current.id, ts: now, ...payload }).catch(()=>{});
       }
     } else {
-      S.current.seenFrames = 0;
-    }
-    return;
-  }
-
-  if (any) {
-    S.current.lastFaceTs = now;
-    if (now - S.current.lastSnapshotTs >= SNAPSHOT_EVERY) {
-      S.current.lastSnapshotTs = now;
-      // snapshot: send the enriched payload
-      post("snapshot", { sessionId: S.current.id, ts: now, ...payload }).catch(()=>{});
-    }
-  } else {
-    if (now - S.current.lastFaceTs >= END_AFTER_MS) {
-      post("stop", { sessionId: S.current.id, ts: now }).catch(()=>{});
-      S.current.id = null; S.current.seenFrames = 0;
-      setSessionId(null); setSessionStatus("IDLE");
-      recentMapRef.current = {}; // optional: clear debounce cache when session ends
+      if (now - S.current.lastFaceTs >= END_AFTER_MS) {
+        post("stop", { sessionId: S.current.id, ts: now }).catch(()=>{});
+        S.current.id = null; S.current.seenFrames = 0;
+        setSessionId(null); setSessionStatus("IDLE");
+        recentMapRef.current = {}; // clear debounce cache when session ends
+      }
     }
   }
-}
 
   /* ------------------------------ UI ------------------------------ */
   const statusDot = (s) => ({

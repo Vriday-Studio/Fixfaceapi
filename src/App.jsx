@@ -29,7 +29,7 @@ const LABEL_PAD_Y    = 6; // bigger background
 // pacing
 const START_FRAMES   = 8;
 const END_AFTER_MS   = 8000;
-const SNAPSHOT_EVERY = 900;
+const SNAPSHOT_EVERY = 1500;
 const LOOP_STEP_MS   = 120;
 
 // n8n (Netlify proxy)

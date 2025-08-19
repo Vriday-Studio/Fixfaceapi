@@ -35,7 +35,7 @@ const LOOP_STEP_MS   = 120;
 // n8n (Netlify proxy)
 const N8N = {
   start:    "/api/n8n/camera/start",
-  snapshot: "/api/n8n/camera/snapshot",
+  snapshot: "/api/n8n/camera/ai/say",
   stop:     "/api/n8n/camera/stop",
 };
 

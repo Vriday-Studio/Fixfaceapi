@@ -2,18 +2,67 @@
   command = "npm run build"
   publish = "dist"
 
+# --- API proxy to n8n webhooks (no CORS needed because same-origin) ---
 [[redirects]]
-  from   = "/api/n8n/*"
-  to     = "https://n8n.srv954455.hstgr.cloud/webhook/:splat"
+  from = "/api/n8n/*"
+  to = "https://n8n.srv954455.hstgr.cloud/webhook/:splat"
   status = 200
-  force  = true
+  force = true
 
-  [[headers]]
+# --- SPA fallback (must come AFTER the API proxy) ---
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# --- Long-cache for face-api / TF model binaries (immutable) ---
+[[headers]]
   for = "/models/*"
   [headers.values]
     Cache-Control = "public, max-age=31536000, immutable"
 
+# --- Long-cache for TFJS WASM binaries you copy to /public/tfjs-backend-wasm ---
+[[headers]]
+  for = "/tfjs-backend-wasm/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+# --- Shorter cache for labels you might update often ---
 [[headers]]
   for = "/labels/*"
   [headers.values]
+    # Adjust to taste: 300 = 5 min, 3600 = 1 hour
     Cache-Control = "public, max-age=3600"
+
+# No cache for n8n proxy endpoints
+[[headers]]
+  for = "/api/n8n/*"
+  [headers.values]
+    Cache-Control = "no-store, no-cache, must-revalidate, max-age=0"
+    Pragma = "no-cache"
+
+# --- Baseline security + permissions (applies to all routes) ---
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    X-Frame-Options = "DENY"
+    # Allow mic/camera for the app origin (needed for getUserMedia)
+    Permissions-Policy = "microphone=(self), camera=(self), autoplay=(self), fullscreen=(self)"
+    # HSTS (only if you are fully HTTPS):
+    Strict-Transport-Security = "max-age=31536000; includeSubDomains; preload"
+
+    # --- Content Security Policy ---
+    # Allows TFJS WASM to initialize; keeps everything same-origin.
+    # 'unsafe-eval' is included to quiet bundler/worker shims if needed.
+    Content-Security-Policy = """
+      default-src 'self';
+      connect-src 'self' https://n8n.srv954455.hstgr.cloud;
+      img-src 'self' blob: data:;
+      media-src 'self' blob:;
+      style-src 'self' 'unsafe-inline';
+      script-src 'self' 'wasm-unsafe-eval';
+      worker-src 'self' blob:;
+      frame-ancestors 'none';
+    """

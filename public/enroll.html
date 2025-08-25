@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Face Enrollment (folder-per-person)</title>
+  <style>
+    :root { --border:#1e2734; --bg:#0b0b0c; --card:#0f151f; --muted:#9fb0c3; }
+    *{box-sizing:border-box}
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:#e9eef2;margin:0}
+    header{padding:16px 20px;border-bottom:1px solid #1e2530}
+    main{padding:20px;max-width:1100px;margin:0 auto}
+    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+    .btn{background:#111826;border:1px solid #2a3340;color:#e9eef2;border-radius:10px;padding:10px 14px;cursor:pointer}
+    .btn[disabled]{opacity:.5;cursor:default}
+    .ok{color:#22c55e}.warn{color:#f59e0b}.err{color:#ef4444}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px;margin:12px 0}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;background:#0b111a;border:1px solid #1a2230;border-radius:8px;padding:8px;white-space:pre-wrap}
+    .list{max-height:240px;overflow:auto;border:1px solid var(--border);border-radius:10px;padding:8px;background:#0e1420}
+    label.person{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:8px}
+    label.person:hover{background:#0b121c}
+    .badge{display:inline-block;border:1px solid #304155;border-radius:999px;padding:2px 8px;font-size:12px;opacity:.9}
+    .small{font-size:12px;opacity:.8}
+    /* Big drop zone */
+    #dropZone{
+      border:2px dashed #2a3340;border-radius:16px; text-align:center; padding:36px 12px;
+      background:#0c121d; user-select:none;
+    }
+    #dropZone.drag{
+      border-color:#3b82f6; background:#0d1626;
+    }
+    #dropZone h2{margin:0;letter-spacing:.05em;color:#b7c6d8}
+    #hint{color:var(--muted); margin-top:6px}
+    input[type="file"]{padding:8px;background:#121826;border:1px solid #2a3340;color:#dbe7f3;border-radius:10px}
+  </style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <h2 style="margin:0">Face Enrollment</h2>
+    <div class="small">Models: <span id="modelStatus">not loaded</span></div>
+    <div class="small">Existing labels: <span id="labelsStatus">none</span></div>
+  </div>
+</header>
+
+<main>
+  <!-- toolbar -->
+  <div class="card">
+    <div class="row">
+      <!-- keeps your original picker for Safari/Firefox single-folder choose -->
+      <input id="picker" type="file" accept="image/*" multiple webkitdirectory />
+      <button id="loadModels" class="btn">Load models (/models)</button>
+      <button id="scan" class="btn" disabled>Analyze selection</button>
+      <button id="build" class="btn" disabled>Build descriptors</button>
+      <button id="download" class="btn" disabled>Download merged labels.json</button>
+    </div>
+    <div class="small" id="hint">
+      Tip: Drag & drop a <b>parent folder</b> (containing subfolders per person) or drop several
+      person folders at once. You can still use “Choose Files” for a single folder.
+    </div>
+  </div>
+
+  <!-- BIG DROP ZONE -->
+  <div id="dropZone" class="card">
+    <h2>DROP IMAGE FOLDER</h2>
+    <div class="small" style="margin-top:4px">Parent folder (e.g., <code>enroll/</code>) or multiple person folders (<code>Alice/</code>, <code>Bob/</code>, …)</div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h3 style="margin:0 0 8px 0">People detected</h3>
+      <div id="peopleBox" class="list"></div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 8px 0">Progress</h3>
+      <div id="progress" class="mono" style="min-height:120px"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin:0 0 8px 0">Summary</h3>
+    <div id="summary" class="mono"></div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin:0 0 8px 0">Per-person results</h3>
+    <div id="perPerson" class="list"></div>
+  </div>
+</main>
+
+<!-- self-hosted libs (these paths match what you already deployed) -->
+<script src="/vendor/face-api/face-api.min.js" defer></script>
+<script src="/js/enroll.js" defer></script>
+</body>
+</html>

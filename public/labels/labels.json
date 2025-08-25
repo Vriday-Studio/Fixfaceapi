@@ -1,8 +1,32 @@
-{
-  "people": [
-    { "name": "Jokowi", "images": 4 },
-    { "name": "Raisa",  "images": 4 },
-    { "name": "JefriNichol",  "images": 4 },
-    { "name": "Vior",  "images": 4 }
-  ]
-}
+[
+  {
+    "label": "Jefri",
+    "descriptors_b64": [
+      "b5GChHSDe26ScKB/aG1/j3Jie3qEdn2MbVN3eoRzeX9len6RfISWe2CKg6eSiH16iGKKmpJ+g3B3jGiKhHR7c5SWcWyQZHeKdWFRibmYZ3+AhI2Mdn9uhJSFdpSBh4KNd35qf3t+g41wj4B+fZBxdYtdmJqCkJCGgHluc4B1joI=",
+      "dJKAhWx8eWyYb6GBam+GjGxjgHiFd36Oa1l/coRxg4lmdYGOfoaZd2GGfqWQiX52kWOLmox+hGV/h2aKjHeCdZ2NdG+KbXOQbGRThL2QaX59gYuKe3dxg5aFcZR+hYCGdYBte3p9f45pkX+EeI9ufI9dppWKkoiCfXtudIJ1kYM="
+    ]
+  },
+  {
+    "label": "Jokowi",
+    "descriptors_b64": [
+      "eJOUeX2AdG2TbaiAc3KCkWN1dXqAfYd8bE5zeIR4c4BgfXuIeX6Qg2mVeZ6kf4N2jGd/l4iHgHh/jXmFkXF9f5eOam+Den+EaWddiruIYH1phpKNfXl0iJt9fJ14inmGeYV1hX13eIxlmYSKioF5f41ZnaCCkI6He4Jpen9+hn0=",
+      "epSTf31/d22ReaR+cnB8kWt0cH+DfoN5dlV1eYR7d4Fjd32Ge36RgmOWep6igYN2iml6lYiFgnZ+kHiCjHB9e5aJcGyIfHqIa2xXi76EYIFsipGKfX5xfZp8eph5iXqBf4VugIB6e4xojYWLiIB6gZBbnZ2DiZOEfIJqeYSBhYA="
+    ]
+  },
+  {
+    "label": "Raisa",
+    "descriptors_b64": [
+      "cYl/enR5dm6XdZx4XIJ0mW1uc4GGhI2RfVR9dXh+dYRheYeTe2+afF5/h5yWg4NohGCPkoaAhWGBlWyBjHx+a6iYbGqQa3aMbl9agq6TZ4d5goiVfodwepuAdaB5doeGdH5jd358eoxogXN6gnZ1eJRfm42SmIyQgn1ifY5/koc=",
+      "coh+eG14dmmScZh5WYF2l3Nye3uHgYiYdlJ9em6BeYljeoOMeXeThGF7jZmYg4Zth1qJjI1+imN/k2iEgHx4caqYanKUaHOJd19UhqmWZoh5gYSTfYJ3eJKBe659fYeOan1qdIV6hIxdhm97h3x0dYxYkoyFmYuIhndqe490hYY="
+    ]
+  },
+  {
+    "label": "Vior",
+    "descriptors_b64": [
+      "bYSHeWp+eHaRcJJ3ZoZ5lm5pc3Z+jH+Lc151fIl2eoZmhIaSenKVgVt+jqCbgHl0kF2DnoqMiGiEj259g4OEcZiPcGqcZ3aObWVef7KUbIt9fH6PdIZ0gpt8hJqGfIePcnlmeH92gJNnnYF6dYZ9gZJkmJGBlIiSe3pycH93gIw=",
+      "eoqIcWyCdXeVaJtyaHt2omlqfYKGhn+FeVVzfn54fY1zf4aQgnSVf1aBj6CTgH5ti2qFjoaEiG6HknJ7jHqKcpuHdmKScW+NbW1YerWRa4mDd5GZgINxfJ95fJmBhoGBdotmd3x+fJRqj3+BfIl5e5Rpi5KNjZePgXVjgYh3jYo=",
+      "couMb2x3dXiQbJd0cX90omJwe32JfXqJc1V3d4J6f4JmgYCLeW2NgVqEjp+afodukF6Cj4KLhW+Mk2aFjn6Edp6Rb2eUanmDcGJYgK+ebIh2gJKahYF1gZx2g6CCeXWCaIhreHiEgJNolH1+eIF6eIpulpqQkZSGhnVqhYN3g4M=",
+      "eoqFb2x2dHGKZZlqbYF9mmhvfHyFhoCJdVhwe3x6eYlvfoiRhXSTgF2GkaCXfnlykWyDjYOIh3aOkmt7k3mGcp+LdGSMa2yGbXBafKuWao2BeJSVhYd1gZ17f598iIWCb4NnfH56epRklHiCeYR9f49ljZGKjJCHf3lie4Z5i4g="
+    ]
+  }
+]

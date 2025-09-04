@@ -213,7 +213,7 @@ function classifyWave(landmarks, now){
     waveHistRef.t = now;
     xs.push(x);
     if (xs.length > 14) xs.shift();
-    if (xs.length < 6) return {ok:false};
+    if (xs.length < 4) return {ok:false};
 
     // require any back-and-forth with small amplitude
     let flips = 0;
@@ -226,8 +226,19 @@ function classifyWave(landmarks, now){
       }
     }
     const amp = Math.max(...xs) - Math.min(...xs); // 0..1 normalized X span
-    if (flips >= 2 && amp > 0.02) {
-      return {ok:true, type:"wave", score: Math.min(1, 0.25 + 0.18 * flips + Math.min(0.35, amp * 3.5))};
+    const vel = recentLateralMotion();
+    // ...inside classifyWave, after `const amp = Math.max(...xs) - Math.min(...xs);`...
+    // fast-path A: medium swing with ≥1 flip → lock sooner
+    if (xs.length >= 6 && amp > 0.030 && flips >= 1) {
+      return { ok: true, type: "wave", score: Math.min(1, 0.50 + Math.min(0.35, amp * 4.0)) };
+    }
+    // fast-path B: small swing + noticeable lateral velocity (typical subtle wave)
+    if (flips >= 1 && amp > 0.018 && vel > 0.040) {
+      return { ok: true, type: "wave", score: Math.min(1, 0.44 + Math.min(0.30, amp * 3.2) + Math.min(0.12, (vel - 0.045) * 3.2)) };
+    }
+    // normal path: 2 flips with modest amplitude
+    if (flips >= 2 && amp > 0.010) {
+      return { ok:true, type:"wave", score: Math.min(1, 0.28 + 0.18 * flips + Math.min(0.35, amp * 3.8)) };
     }
     return {ok:false};
   } catch { return {ok:false}; }
@@ -376,12 +387,14 @@ function classifyRaiseHand(lm) {
     const tips = [MP.INDEX_TIP, MP.MIDDLE_TIP, MP.RING_TIP, MP.PINKY_TIP].map(i => lm[i]);
     const minY = Math.min(...tips.map(t => t?.y ?? 1));
 
+    const vel = recentLateralMotion();
+
     const wa = waveActivity();
     const isWaving = (wa.flips >= 2 && wa.amp > 0.025);
 
     // Variant A: open palm (stricter)
     const highA = minY <= 0.55;
-    const passOpenPalm = (opens >= 3) && (cosToVertical > 0.68) && !isWaving && highA;
+    const passOpenPalm = (opens >= 3) && (cosToVertical > 0.68) && !isWaving && highA && (vel <= 0.032);
 
     // Variant B: flat palm (fingers together), stricter
     const span = palmSpanLen(lm);
@@ -395,7 +408,7 @@ function classifyRaiseHand(lm) {
       .reduce((s, d) => s + d, 0) / (tipPairs.length || 1);
     const together = (meanAdj / Math.max(1e-3, span)) < 0.18;
     const highB = minY <= 0.60;
-    const passFlatPalm = (opens >= 2) && together && (cosToVertical > 0.65) && !isWaving && highB;
+    const passFlatPalm = (opens >= 2) && together && (cosToVertical > 0.65) && !isWaving && highB && (vel <= 0.032);
 
     if (passOpenPalm || passFlatPalm) {
       const openness = Math.max(0, (idx.margin + mid.margin + rng.margin + pky.margin) / 4);
@@ -550,13 +563,13 @@ const WAVE_GRACE_MS = 550;       // how long wave is allowed to win ties/near-ti
 const CHANGE_COOLDOWN_MS = 450;  // prevent rapid flip-flops after we lock something
 
 // Hoisted: gesture voting config (so pickStableGesture can see them)
-const GESTURE_PRIORITY   = ["raise_hand", "on_phone", "thumbs_up", "peace", "wave", "paper", "rock", "scissors"];
+const GESTURE_PRIORITY   = ["wave", "raise_hand", "on_phone", "thumbs_up", "peace", "paper", "rock", "scissors"];
 const VOTE_WINDOW        = 5;    // keep last ~6 frames
 const VOTE_MAX_AGE_MS    = 700;  // ignore old entries
 const REQUIRE_CONSISTENT = 2;    // ≥3 agreeing frames
 const CLEAR_IF_IDLE_MS   = 450;  // drop stale gesture after this
 const MIN_SCORE = {
-  wave: 0.50,
+  wave: 0.40,
   thumbs_up: 0.26,
   peace: 0.50,
   raise_hand: 0.50,
@@ -858,6 +871,7 @@ export default function App() {
   // Configurable server URL (empty = same-origin)
   const [serverUrl, setServerUrl] = useState(() => localStorage.getItem("ika:serverUrl") || "");
   const [serverUrlDraft, setServerUrlDraft] = useState(serverUrl);
+  const effectiveUrl = useMemo(() => normalizeServerUrl(serverUrl) ?? window.location.origin, [serverUrl]);
   useEffect(() => { setServerUrlDraft(serverUrl); }, [serverUrl]);
   useEffect(() => { try { localStorage.setItem("ika:serverUrl", serverUrl); } catch {} }, [serverUrl]);
 
@@ -932,6 +946,82 @@ export default function App() {
       return uuid();
     }
   });
+
+  // Settings backup helpers (export/import/reset)
+  const SETTINGS_KEYS = [
+    "ika:serverUrl",
+    "ika:systemInstruction","ika:model","ika:voice","ika:langCode","ika:temperature",
+    "ika:enableAffective","ika:proactiveAudio","ika:functionCalling","ika:autoFunctionResponse","ika:grounding",
+    "ika:ttsProvider","ika:11labs:voiceId","ika:11labs:key","ika:11labs:model",
+    "ika:captions","ika:locationLabel","ika:weatherLabel","ika:gemini:key",
+    "ika:videoId","ika:audioId",
+    "ika:fovHdeg","ika:fovVdeg","ika:panOffsetDeg","ika:tiltOffsetDeg",
+    "ika:wNear","ika:wCenter","ika:wMouth",
+    "ika:sos","ika:eos","ika:prefixPad","ika:silenceDur",
+    "ika:threshold","ika:listenMs","ika:silenceMs","ika:autoDetectOn",
+    "ika:greenMaxM", // base key (per-camera variants are also used)
+  ];
+
+  const exportSettings = async () => {
+    try {
+      // Collect all keys with "ika:" prefix (covers new settings automatically)
+      const bag = {};
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith("ika:")) {
+          bag[k] = localStorage.getItem(k);
+        }
+      }
+      const json = JSON.stringify(bag, null, 2);
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const ts = new Date();
+      const pad = (n) => String(n).padStart(2, "0");
+      const filename = `ika-settings-${ts.getFullYear()}${pad(ts.getMonth()+1)}${pad(ts.getDate())}-${pad(ts.getHours())}${pad(ts.getMinutes())}.json`;
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+    } catch (e) {
+      alert("Failed to export settings");
+    }
+  };
+
+  const importSettings = async () => {
+    // Open a file picker and read JSON
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "application/json";
+    input.style.display = "none";
+    document.body.appendChild(input);
+    input.addEventListener("change", async () => {
+      const file = input.files && input.files[0];
+      document.body.removeChild(input);
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const bag = JSON.parse(text);
+        Object.entries(bag).forEach(([k, v]) => {
+          try { localStorage.setItem(k, v ?? ""); } catch {}
+        });
+        window.location.reload();
+      } catch (e) {
+        alert("Invalid or unreadable settings file");
+      }
+    }, { once: true });
+    input.click();
+  };
+
+  const resetSettings = () => {
+    if (!confirm("Reset all saved settings?")) return;
+    for (const k of SETTINGS_KEYS) {
+      try { localStorage.removeItem(k); } catch {}
+    }
+    window.location.reload();
+  };
 
   // HANDS: detect with VIDEO first, fallback to IMAGE if needed ----
   const detectHandsOnce = useCallback(async (videoEl) => {
@@ -1077,9 +1167,17 @@ export default function App() {
     socket.on("connect", () => {
       console.log("[socket] connected", socket.id, "url:", url || "(same-origin)");
       try { socket.emit("hello", { deviceId, sessionId }); } catch {}
+      setServerInfo((s) => ({ ...s, connected: true }));
     });
-    socket.on("disconnect", () => console.log("[socket] disconnected"));
+    socket.on("disconnect", () => {
+      console.log("[socket] disconnected");
+      setServerInfo((s) => ({ ...s, connected: false }));
+    });
     socket.on("server_status", (m) => setServerInfo((prev) => ({ ...prev, ...m })));
+    // Remote control for game mode (ephemeral; no persistence)
+    socket.on("set_game_mode", (m) => setGameModeOn(!!m?.on));
+    socket.on("start_rps",   () => setGameModeOn(true));
+    socket.on("stop_rps",    () => setGameModeOn(false));
     socket.on("session_created", (m) => {
       setSessionStatus("ACTIVE");
       setSessionId(m?.sessionId || uuid());
@@ -3184,6 +3282,15 @@ export default function App() {
           prev.all === total && prev.green === green && prev.red === red ? prev : { all: total, green, red }
         );
 
+         // Game mode auto-exit on no-face stretch
+         if (gameModeRef.current) {
+           const now2 = performance.now();
+           if (green > 0) lastGameActivityRef.current = now2;
+           if (green === 0 && (now2 - (lastGameActivityRef.current || 0)) > GM_NO_FACE_TIMEOUT_MS) {
+             setGameModeOn(false);
+           }
+         }
+
         // Battery saver: slow the loop when no faces are present
         if (total === 0) {
           if (!loopIdleStateRef.current) {
@@ -3288,9 +3395,10 @@ export default function App() {
                     ) / Math.max(1e-3, palmSpanLen(lm));
                     const tips = [MP.INDEX_TIP, MP.MIDDLE_TIP, MP.RING_TIP, MP.PINKY_TIP].map(i => lm[i]);
                     const minY = Math.min(...tips.map(t => t?.y ?? 1));
+                    const vel = recentLateralMotion();
 
                     // Require: good score, upright-ish, decent finger splay, not too low
-                    if (op.score >= 0.62 && cosToVertical > 0.68 && splay > 0.28 && minY <= 0.60) {
+                    if (op.score >= 0.62 && cosToVertical > 0.68 && splay > 0.28 && minY <= 0.60 && vel <= 0.032) {
                       cand.push({ type: "raise_hand", score: op.score });
                     }
                   }
@@ -3331,7 +3439,9 @@ export default function App() {
                   // Emit: gesture_event (normal) or game_event (RPS) when changed and not speaking
                   if (changed && (now - (lastGestureSentRef.current || 0)) >= HANDS_SEND_MS && !speakingRef.current) {
                     try {
-                      if (gm && (out.type === "paper" || out.type === "rock" || out.type === "scissors")) {
+                       if (gm && (out.type === "paper" || out.type === "rock" || out.type === "scissors")) {
+                        // activity ping for game timers
+                        lastGameActivityRef.current = now;
                         socketRef.current?.emit?.("game_event", {
                           sessionId: sessionId || "web-" + deviceId,
                           deviceId,
@@ -3407,12 +3517,13 @@ export default function App() {
           const hasKid = allIdentities.some(p => p.ageGroup === "child");
 
           // transitions
+          const isOnPhone = (stableGestureRef.current?.type === "on_phone");
           for (const p of allIdentities) {
             const prevZ = prevZoneMapRef.current.get(p.key);
             prevZoneMapRef.current.set(p.key, p.zone);
 
             // green -> red => polite call-over (max 3, spaced)
-            if (prevZ === "green" && p.zone === "red") {
+            if (!isOnPhone && prevZ === "green" && p.zone === "red") {
               const s = callOverStateRef.current.get(p.key) || { tries: 0, last: 0 };
               if (s.tries < CALL_OVER_MAX_TRIES && (now - (s.last || 0)) >= CALL_OVER_COOLDOWN_MS) {
                 s.tries += 1;
@@ -3430,7 +3541,7 @@ export default function App() {
             }
 
             // red/unknown -> green => greet (reset tries)
-            if ((prevZ === "red" || prevZ == null) && p.zone === "green") {
+            if (!isOnPhone && (prevZ === "red" || prevZ == null) && p.zone === "green") {
               callOverStateRef.current.delete(p.key);
               const address =
                 p.name ? p.name
@@ -3703,6 +3814,14 @@ export default function App() {
   const gameModeRef = useRef(false);
   const [gameModeOn, setGameModeOn] = useState(false);
   useEffect(() => { gameModeRef.current = gameModeOn; }, [gameModeOn]);
+
+  // Game mode idle/visibility timeouts (ephemeral)
+  const GM_IDLE_TIMEOUT_MS = 90_000;     // 1.5 min without activity → exit RPS
+  const GM_NO_FACE_TIMEOUT_MS = 20_000;  // 20s with no faces → exit RPS
+  const lastGameActivityRef = useRef(0);
+  useEffect(() => {
+    if (gameModeOn) lastGameActivityRef.current = performance.now();
+  }, [gameModeOn]);
 
   // Focus shared across blocks (used by gesture events and crowd payload)
   const focusIndexRef = useRef(-1);
@@ -4342,6 +4461,18 @@ export default function App() {
 
         {/* ===== RIGHT COLUMN ===== */}
         <div className="rightcol" style={{ position: "sticky", top: 12, alignSelf: "start", zIndex: 1000 }}>
+          {/* Save/Export Settings */}
+        <section className="panel" style={{ pointerEvents: "auto", zIndex: 1001 }}>
+          <h3 className="section-title">settings backup</h3>
+          <div className="row" style={{ gap: 8 }}>
+            <button className="btn" onClick={exportSettings}>Export to file</button>
+            <button className="btn" onClick={importSettings}>Import from file</button>
+            <button className="btn" onClick={resetSettings}>Reset all</button>
+          </div>
+          <div className="help" style={{ marginTop: 6 }}>
+            Saves to localStorage; import/export helps migrate to another machine.
+          </div>
+        </section>
           {/* IP Address */}
         <section className="panel" style={{ pointerEvents: "auto", zIndex: 1001 }}>
           <h3 className="section-title">server connection</h3>
@@ -4355,15 +4486,23 @@ export default function App() {
               autoCapitalize="off"
               spellCheck={false}
             />
-            <button className="btn" onClick={() => setServerUrl(serverUrlDraft.trim())}>
+            <button
+              className="btn"
+              disabled={serverUrlDraft.trim() === (serverUrl || "")}
+              onClick={() => setServerUrl(serverUrlDraft.trim())}
+            >
               Apply & reconnect
             </button>
-            <button className="btn" onClick={() => { setServerUrlDraft(""); setServerUrl(""); }}>
+            <button
+              className="btn"
+              onClick={() => { setServerUrl(""); setServerUrlDraft(window.location.origin); }}
+            >
               Use same-origin
             </button>
           </div>
           <div className="help" style={{ marginTop: 6 }}>
-            Current: {serverUrl ? serverUrl : "(same-origin)"} · {serverInfo.connected ? "connected" : "disconnected"}
+            Config: {serverUrl && serverUrl.trim() ? serverUrl : "(same-origin)"} · Effective: {effectiveUrl}
+            <br />Status: {serverInfo.connected ? "connected" : "disconnected"}
           </div>
         </section>
           {/* System message */}

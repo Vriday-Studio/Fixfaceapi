@@ -1,0 +1,86 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+# ---------- API proxy to n8n ----------
+[[redirects]]
+  from = "/api/n8n/*"
+  to = "https://n8n.srv954455.hstgr.cloud/webhook/:splat"
+  status = 200
+  force = true
+
+# ---------- SPA fallback ----------
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# ---------- Face models ----------
+[[headers]]
+  for = "/models/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+# ---------- TFJS WASM backend (if you use it from /tfjs-backend-wasm) ----------
+[[headers]]
+  for = "/tfjs-backend-wasm/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+# ---------- Labels (change more often) ----------
+[[headers]]
+  for = "/labels/*"
+  [headers.values]
+    Cache-Control = "public, max-age=3600"
+
+# ---------- MediaPipe Tasks: model + WASM loaders ----------
+# Serve from /mp (place files in public/mp/)
+[[headers]]
+  for = "/mp/*"
+  [headers.values]
+    # long cache for heavy binaries (safe because filenames are content-addressed upstream)
+    Cache-Control = "public, max-age=31536000, immutable"
+    Access-Control-Allow-Origin = "*"
+    Cross-Origin-Resource-Policy = "cross-origin"
+
+# Correct MIME types so browsers load WASM/Task files
+[[headers]]
+  for = "/mp/*.wasm"
+  [headers.values]
+    Content-Type = "application/wasm"
+
+[[headers]]
+  for = "/mp/*.task"
+  [headers.values]
+    Content-Type = "application/octet-stream"
+
+# ---------- No cache for proxied APIs ----------
+[[headers]]
+  for = "/api/n8n/*"
+  [headers.values]
+    Cache-Control = "no-store, no-cache, must-revalidate, max-age=0"
+    Pragma = "no-cache"
+
+# ---------- Baseline security + permissions (all routes) ----------
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    X-Frame-Options = "DENY"
+    Permissions-Policy = "microphone=(self), camera=(self), autoplay=(self), fullscreen=(self)"
+    Strict-Transport-Security = "max-age=31536000; includeSubDomains; preload"
+    # CSP:
+    # - allow our own JS + WASM
+    # - allow WebSocket to same-origin (/socket.io)
+    # - allow calls to the n8n host
+    Content-Security-Policy = """
+      default-src 'self';
+      connect-src 'self' https://n8n.srv954455.hstgr.cloud ws: wss:;
+      img-src 'self' blob: data:;
+      media-src 'self' blob:;
+      style-src 'self' 'unsafe-inline';
+      script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval';
+      worker-src 'self' blob:;
+      frame-ancestors 'none';
+    """

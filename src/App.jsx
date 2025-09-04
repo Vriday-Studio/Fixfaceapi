@@ -1,446 +1,1761 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+// ==== App.jsx — streamlined (Live Preview + Native Audio), neat right sidebar ====
+// - TFJS + face-api + webcam detection
+// - Socket.IO bridge for Gemini/ElevenLabs audio + text
+// - Mic/VAD with auto-calibration + Live AAD knobs in Mic panel
+// - Right sidebar: system message, Gemini settings, ElevenLabs settings
+// - Status counters + green zone distance + device selectors
+
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import * as tf from "@tensorflow/tfjs";
 import "@tensorflow/tfjs-backend-webgl";
 import "@tensorflow/tfjs-backend-wasm";
 import { setWasmPaths } from "@tensorflow/tfjs-backend-wasm";
 import * as faceapi from "face-api.js";
-import './App.css';
+import io from "socket.io-client";
+import { FilesetResolver, HandLandmarker } from "@mediapipe/tasks-vision";
+import "./App.css";
 
-/* ====================== CONFIG ====================== */
-const MODEL_URL  = "/models";
+/* ====================== CONSTANTS / CONFIG ====================== */
+const MODEL_URL = "/models";
 const LABELS_URL = "/labels/labels.json";
 
-const FACE_WIDTH_M  = 0.15;
-let   FOCAL_PX      = 500;     // will be adjusted after video loads
-const DEFAULT_GREEN_MAX_M = 0.8;
+const uuid = () => (crypto?.randomUUID?.() || Math.random().toString(36).slice(2) + Date.now().toString(36));
 
-// recognition strictness
-const MATCH_THRESHOLD  = 0.50; // tighten/loosen (0.48–0.55)
-const MATCH_MARGIN     = 0.03; // how much best must beat 2nd-best
-const STABILIZE_FRAMES = 5;    // frames before switching label
+// geometry
+const FACE_WIDTH_M = 0.15;
+let FOCAL_PX = 500; // refined after camera opens
+
+// session heuristics
+const DEFAULT_GREEN_MAX_M = 0.8;
+const LOOP_STEP_ACTIVE_MS = 120;
+const LOOP_STEP_IDLE_MIN_MS = 180;
+const LOOP_STEP_IDLE_MAX_MS = 220;
+
+// recognition
+const MATCH_THRESHOLD = 0.5;
+const MATCH_MARGIN = 0.03;
+const STABILIZE_FRAMES = 5;
+
+const MIC_IDLE_MS = 5000;   // mic goes idle after 5s
+const CAM_IDLE_MS = 10000;  // cam fully idle after 10s
 
 // drawing
-const BOX_SHRINK     = 0.7;
+const BOX_SHRINK = 0.7;
 const BOX_LINE_WIDTH = 5;
-const LABEL_FONT     = "16px system-ui,-apple-system,Segoe UI,Roboto,sans-serif";
-const LABEL_PAD_X    = 8;
-const LABEL_PAD_Y    = 6;
+const LABEL_FONT =
+  "16px system-ui,-apple-system,Segoe UI,Roboto,'Helvetica Neue',Arial,sans-serif";
+const LABEL_PAD_X = 8;
+const LABEL_PAD_Y = 6;
 
-// pacing
-const START_FRAMES   = 8;      // ~5s @120ms/frame would be ~40 if you want to gate session start harder
-const END_AFTER_MS   = 10000;
-const SNAPSHOT_EVERY = 1500;
-const LOOP_STEP_MS   = 120;
+// sockets
+const SOCKET_URL = undefined; // same-origin
+const USE_SOCKET_SERVER = true;
 
-// n8n (Netlify proxy)
-const N8N = {
-  start:    "/api/n8n/camera/start",
-  snapshot: "/api/n8n/camera/snapshot",
-  stop:     "/api/n8n/camera/stop",
-  stt:      "/api/n8n/stt/utterance",
-  say:      "/api/n8n/ai/say",
-  speaking: "/api/n8n/speaking",
+// --- Attention / greeting policy ---
+const FACING_YAW_MAX_DEG = 9;   // how “straight on” horizontally
+const FACING_PITCH_MAX_DEG = 10; // how “straight on” vertically
+const ATTEND_MIN_FRAMES   = 5;   // require 3–5 consecutive frames
+const GREET_COOLDOWN_MS   = 35_000;
+
+// Hard cap per identity
+const MAX_INVITES_PER_PERSON = 3;
+
+// Optional: if someone disappears for a while, forgive past invites
+const NOT_SEEN_RESET_MS = 120_000;   // 2 min of not being seen resets their count
+
+// ===== Hand / Gesture config (tablet-safe) =====
+const HANDS_ENABLED = true;
+
+// runtime & cadence
+const HANDS_FAST_MS = 66;
+const HANDS_IDLE_MS = 180;
+const HANDS_CACHE_MS = 800;
+const HANDS_SEND_MS  = 600;
+
+// Game mode cadence (snappier)
+const GM_HANDS_FAST_MS = 40;
+const GM_HANDS_IDLE_MS = 120;
+
+// Hand constants
+const HANDS_MODEL_URL = "/mp/hand_landmarker.task";
+const HANDS_MAX_NUM = 1;
+const HANDS_IMAGE_SIDE = 256;
+
+// polite “call over” policy
+const CALL_OVER_MAX_TRIES = 3;
+const CALL_OVER_COOLDOWN_MS = 30_000; // >= 30s between tries
+
+// speaker focus gating
+const SPEAKER_STABLE_FRAMES = 3;
+const SPEAKER_STABLE_MS = 1200;
+
+// group ask cooldown
+const GROUP_ASK_COOLDOWN_MS = 20_000;
+
+/* ====================== SMALL UTILS ====================== */
+
+// Distance estimate from face box width (pixels) via pinhole camera
+const estimateDistanceM = (wPx) =>
+  (Number.isFinite(wPx) && wPx > 0) ? (FOCAL_PX * FACE_WIDTH_M) / wPx : null;
+
+// Coarse age binning
+const ageGroupOf = (age) => {
+  if (!Number.isFinite(age)) return "unknown";
+  const a = Math.round(age);
+  if (a >= 18) return "adult";
+  if (a >= 12) return "teen";
+  return "child";
 };
 
-const DEBUG_FETCH = /[?&]debugPost=1\b/.test(window.location.search);
+// Green/Red zone helper
+const zoneOf = (d, greenMaxM) =>
+  (Number.isFinite(d) && Number.isFinite(greenMaxM) && d <= greenMaxM) ? "green" : "red";
 
-/* ====================== Auto-calibrate policy (added) ====================== */
-const MAX_EMPTY_BEFORE_AUTOCAL = 3;     // consecutive empty transcripts before auto-cal
-const FAILED_STARTS_BEFORE_AUTOCAL = 4; // short voice bursts that fail to reach listenMs
-const AUTO_CAL_MIN_GAP_MS      = 30000; // min gap between auto-cals (cooldown)
-const MIN_NONEMPTY_CHARS       = 2;     // treat <2 chars as empty/no-op
-
-/* ====================== Guest ID memory ====================== */
-const guestSeqRef = { current: 1 };
-const guestMemRef = { current: [] };
-const GUEST_TOL   = 0.60;
-
-let guestSavePending = false;
-  function scheduleGuestSave() {
-    if (guestSavePending) return;
-    guestSavePending = true;
-    setTimeout(() => {
-      saveGuestMem({});
-      guestSavePending = false;
-    }, 750);
+// Best-scoring expression label
+const topExpression = (e) => {
+  if (!e || typeof e !== "object") return "neutral";
+  let bestKey = "neutral", bestVal = -Infinity;
+  for (const [k, v] of Object.entries(e)) {
+    const val = Number(v) || 0;
+    if (val > bestVal) { bestVal = val; bestKey = k; }
   }
+  return bestKey;
+};
 
-function assignGuestIdFor(descriptor) {
-  if (!descriptor || !descriptor.length) {
-    const id = `Guest${String(guestSeqRef.current++).padStart(2, "0")}`;
-    scheduleGuestSave();
-    return id;
+// Add the helper gestureLabelOf
+function gestureLabelOf(g) {
+  if (!g || !g.type) return null;
+  switch (g.type) {
+    case "wave": return "wave";
+    case "thumbs_up": return "thumbs_up";
+    case "peace": return "peace";
+    case "raise_hand": return "raise_hand";
+    case "on_phone": return "on_phone";
+    default: return String(g.type);
   }
-  const mem = guestMemRef.current;
-  let bestIdx = -1, bestDist = 1;
-  for (let i = 0; i < mem.length; i++) {
-    const d = faceapi.euclideanDistance(descriptor, mem[i].desc);
-    if (d < bestDist) { bestDist = d; bestIdx = i; }
-  }
-
-  if (bestIdx >= 0 && bestDist <= GUEST_TOL) {
-    mem[bestIdx].ts = Date.now();   // keep fresh for multi-day retention
-    scheduleGuestSave();
-    return mem[bestIdx].id;
-  }
-
-  const id = `Guest${String(guestSeqRef.current++).padStart(2, "0")}`;
-  mem.push({ id, ts: Date.now(), desc: Float32Array.from(descriptor) });
-  scheduleGuestSave();
-  return id;
 }
 
-/* ====================== Guest persistence ====================== */
-const GUEST_STORE_KEY = "ika:guestMem.v1";
-const GUEST_RETENTION_DAYS = 1; // set >1 if you want multi-day retention
+/* ---- Camera math (pixels <-> angles/positions) ---- */
+const DEG = Math.PI / 180;
+const RAD = 180 / Math.PI;
 
-const dayKey = (d = new Date()) =>
-  d.toLocaleDateString("en-CA", { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone }); // YYYY-MM-DD
+function focalFromFov(widthPx, fovDeg) {
+  // clamp FOV to avoid tan(0)/tan(π)
+  const fov = Math.max(1, Math.min(179, Number(fovDeg || 70)));
+  const w = Math.max(1, Number(widthPx) || 1);
+  return (w / 2) / Math.tan((fov * DEG) / 2);
+}
 
-const msToNextMidnight = () => {
-  const now = new Date();
-  const next = new Date(now);
-  next.setHours(24,0,0,0); // local midnight
-  return next - now;
+function anglesFromPixel(px, py, fx, fy, cx0, cy0) {
+  const x = (px - cx0);
+  const y = (py - cy0);
+  return {
+    yaw:   Math.atan2(x,  Math.max(1e-6, fx)),     // +yaw = right
+    pitch: Math.atan2(-y, Math.max(1e-6, fy)),     // +pitch = up
+  };
+}
+
+function posFromPixel(px, py, fx, fy, cx0, cy0, Z) {
+  const x = (px - cx0);
+  const y = (py - cy0);
+  const z = Number(Z);
+  if (!Number.isFinite(z)) return { x: null, y: null, z: null };
+  return {
+    x: (x / Math.max(1e-6, fx)) * z,
+    y: -(y / Math.max(1e-6, fy)) * z,
+    z,
+  };
+}
+
+// Landmarks indices (MediaPipe)
+const MP = {
+  WRIST: 0,
+  THUMB_MCP: 2,
+  THUMB_TIP: 4,
+  INDEX_MCP: 5,
+  INDEX_TIP: 8,
+  MIDDLE_MCP: 9,
+  MIDDLE_TIP: 12,
+  RING_MCP: 13,
+  RING_TIP: 16,
+  PINKY_MCP: 17,
+  PINKY_TIP: 20
 };
 
-// quantize [-1,1] float32 descriptor -> Uint8Array (0..255)
+// simple util
+function v2(x, y){ return {x, y}; }
+function dist(a, b){ return Math.hypot((a.x-b.x)||0, (a.y-b.y)||0); }
+
+// Keep micro history for wave velocity
+const waveHistRef = { t: 0, xs: [] }; // xs: recent x positions (screen-normalized)
+
+// classify a "wave": lateral wrist direction changes within short window
+function classifyWave(landmarks, now){
+  try {
+    const wrist = landmarks[MP.WRIST];
+    if (!wrist) return {ok:false};
+    const x = wrist.x;
+    const xs = waveHistRef.xs;
+
+    // keep ~1s of history
+    if (now - (waveHistRef.t||0) > 900) xs.length = 0;
+    waveHistRef.t = now;
+    xs.push(x);
+    if (xs.length > 14) xs.shift();
+    if (xs.length < 6) return {ok:false};
+
+    // require any back-and-forth with small amplitude
+    let flips = 0;
+    for (let i=2;i<xs.length;i++){
+      const dx1 = xs[i] - xs[i-1];
+      const dx0 = xs[i-1] - xs[i-2];
+      if (Math.sign(dx1) !== Math.sign(dx0) &&
+          Math.abs(dx1) > 0.008 && Math.abs(dx0) > 0.008) {
+        flips++;
+      }
+    }
+    const amp = Math.max(...xs) - Math.min(...xs); // 0..1 normalized X span
+    if (flips >= 2 && amp > 0.02) {
+      return {ok:true, type:"wave", score: Math.min(1, 0.25 + 0.18 * flips + Math.min(0.35, amp * 3.5))};
+    }
+    return {ok:false};
+  } catch { return {ok:false}; }
+}
+
+// helper: recent lateral motion magnitude (Σ|Δx| over last frames)
+function recentLateralMotion() {
+  const xs = waveHistRef.xs || [];
+  if (xs.length < 4) return 0;
+  let s = 0;
+  for (let i = 1; i < xs.length; i++) s += Math.abs(xs[i] - xs[i - 1]);
+  return s;
+}
+
+// Wave activity summary for anti-wave gating (count flips + amplitude)
+function waveActivity() {
+  const xs = waveHistRef.xs || [];
+  if (xs.length < 3) return { flips: 0, amp: 0 };
+  let flips = 0;
+  for (let i = 2; i < xs.length; i++) {
+    const dx1 = xs[i] - xs[i - 1];
+    const dx0 = xs[i - 1] - xs[i - 2];
+    if (Math.sign(dx1) !== Math.sign(dx0) && Math.abs(dx1) > 0.008 && Math.abs(dx0) > 0.008) {
+      flips++;
+    }
+  }
+  const amp = Math.max(...xs) - Math.min(...xs);
+  return { flips, amp };
+}
+
+// finger state helpers (normalized by palm width)
+function fingerClosed(lm, tipIdx, mcpIdx) {
+  try {
+    const w = lm[MP.WRIST], tip = lm[tipIdx], mcp = lm[mcpIdx];
+    const dTip = Math.hypot(tip.x - w.x, tip.y - w.y);
+    const dMcp = Math.hypot(mcp.x - w.x, mcp.y - w.y);
+    const span = palmSpanLen(lm);
+    const margin = (dTip - dMcp) / Math.max(1e-3, span);
+    return { closed: margin < 0.06, margin };
+  } catch { return { closed: true, margin: -1 }; }
+}
+
+// replace the old thumbs-up with this (keep the same name)
+function classifyThumbsUp(landmarks){
+  try {
+    const thumbTip = landmarks[MP.THUMB_TIP];
+    const indexMcp = landmarks[MP.INDEX_MCP];
+    const indexTip = landmarks[MP.INDEX_TIP];
+    const middleTip = landmarks[MP.MIDDLE_TIP];
+    const middleMcp = landmarks[MP.MIDDLE_MCP];
+    const ringTip = landmarks[MP.RING_TIP];
+    const ringMcp = landmarks[MP.RING_MCP];
+    const pinkyTip = landmarks[MP.PINKY_TIP];
+    const pinkyMcp = landmarks[MP.PINKY_MCP];
+    const wrist = landmarks[MP.WRIST];
+    if (!(thumbTip && indexMcp && indexTip && middleTip && middleMcp && ringTip && ringMcp && pinkyTip && pinkyMcp && wrist)) {
+      return { ok: false };
+    }
+
+    // Anti-wave gate: if hand is moving side-to-side, don't call 👍
+    const vel = recentLateralMotion();
+    if (vel > 0.06) return { ok: false };
+
+    // Hand axis (wrist → index MCP): want it roughly vertical for 👍
+    const vIdx = v2(indexMcp.x - wrist.x, indexMcp.y - wrist.y);
+    const axisLen = Math.hypot(vIdx.x, vIdx.y) || 1e-6;
+    const axisCosToVertical = Math.abs(vIdx.y) / axisLen; // 1 = vertical, 0 = horizontal
+
+    // Basic pose checks
+    const thumbAbove = thumbTip.y < indexMcp.y - 0.012;   // stronger than before
+    const open = dist(thumbTip, indexTip) > 0.030;        // small relaxed gap
+    const bigEnough = palmSpanLen(landmarks) > 0.035;
+    const orientedUp = axisCosToVertical > 0.86;
+
+    // Other fingers mostly closed
+    const idxClosed = fingerClosed(landmarks, MP.INDEX_TIP, MP.INDEX_MCP).closed;
+    const midClosed = fingerClosed(landmarks, MP.MIDDLE_TIP, MP.MIDDLE_MCP).closed;
+    const rngClosed = fingerClosed(landmarks, MP.RING_TIP, MP.RING_MCP).closed;
+    const pkyClosed = fingerClosed(landmarks, MP.PINKY_TIP, MP.PINKY_MCP).closed;
+    const closedCount = [idxClosed, midClosed, rngClosed, pkyClosed].filter(Boolean).length;
+
+    if (thumbAbove && open && bigEnough && orientedUp && closedCount >= 2) {
+      // Score: openness + orientation + stillness boost (faster lock when steady)
+      const openness = Math.max(0, Math.min(1, (dist(thumbTip, indexTip) - 0.03) / 0.12));
+      const orientBoost = Math.min(0.3, Math.max(0, (axisCosToVertical - 0.82) * 1.6));
+      const stillBoost = Math.min(0.2, Math.max(0, (0.06 - vel) * 3.0)); // vel small → boost
+      const s = Math.max(0, Math.min(1, 0.7 * openness + orientBoost + stillBoost));
+      return { ok: true, type: "thumbs_up", score: s };
+    }
+    return { ok: false };
+  } catch { return { ok: false }; }
+}
+
+// --- RPS helpers ---
+function palmSpanLen(lm) {
+  try {
+    const a = lm[MP.INDEX_MCP], b = lm[MP.PINKY_MCP];
+    return Math.hypot(a.x - b.x, a.y - b.y) || 1e-3;
+  } catch { return 1e-3; }
+}
+function fingerOpen(lm, tipIdx, mcpIdx) {
+  try {
+    const w = lm[MP.WRIST], tip = lm[tipIdx], mcp = lm[mcpIdx];
+    const dTip = Math.hypot(tip.x - w.x, tip.y - w.y);
+    const dMcp = Math.hypot(mcp.x - w.x, mcp.y - w.y);
+    const span = palmSpanLen(lm);
+    const margin = (dTip - dMcp) / Math.max(1e-3, span); // normalize by palm width
+    return { open: margin > 0.09, margin }; // ~0.12 tuned empirically
+  } catch { return { open: false, margin: -1 }; }
+}
+
+// Peace sign (same pose as scissors, but used outside game mode)
+function classifyPeace(lm) {
+  try {
+    const idx = fingerOpen(lm, MP.INDEX_TIP, MP.INDEX_MCP);
+    const mid = fingerOpen(lm, MP.MIDDLE_TIP, MP.MIDDLE_MCP);
+    const rng = fingerOpen(lm, MP.RING_TIP, MP.RING_MCP);
+    const pky = fingerOpen(lm, MP.PINKY_TIP, MP.PINKY_MCP);
+    if (idx.open && mid.open && !rng.open && !pky.open) {
+      const margin = Math.max(0, idx.margin) + Math.max(0, mid.margin);
+      const clamp = Math.max(0, 0.12 - Math.max(0, rng.margin)) + Math.max(0, 0.12 - Math.max(0, pky.margin));
+      const score = Math.min(1, 0.45 + 0.35 * margin + 0.25 * clamp);
+      return { ok: true, type: "peace", score };
+    }
+    return { ok: false };
+  } catch { return { ok: false }; }
+}
+
+// Raise hand: open or flat palm, upright-ish, optionally high in frame.
+// Now supports two variants:
+//   A) Open palm (>=3 fingers open), upright, modest height
+//   B) Flat palm with fingers together (index..pinky tips close), upright
+function classifyRaiseHand(lm) {
+  try {
+    const idx = fingerOpen(lm, MP.INDEX_TIP, MP.INDEX_MCP);
+    const mid = fingerOpen(lm, MP.MIDDLE_TIP, MP.MIDDLE_MCP);
+    const rng = fingerOpen(lm, MP.RING_TIP, MP.RING_MCP);
+    const pky = fingerOpen(lm, MP.PINKY_TIP, MP.PINKY_MCP);
+    const opens = [idx, mid, rng, pky].filter(f => f.open).length;
+
+    const wrist = lm[MP.WRIST], iMcp = lm[MP.INDEX_MCP];
+    const vx = (iMcp.x - wrist.x), vy = (iMcp.y - wrist.y);
+    const vlen = Math.hypot(vx, vy) || 1e-6;
+    const cosToVertical = Math.abs(vy) / vlen;
+
+    const tips = [MP.INDEX_TIP, MP.MIDDLE_TIP, MP.RING_TIP, MP.PINKY_TIP].map(i => lm[i]);
+    const minY = Math.min(...tips.map(t => t?.y ?? 1));
+
+    const wa = waveActivity();
+    const isWaving = (wa.flips >= 2 && wa.amp > 0.025);
+
+    // Variant A: open palm (stricter)
+    const highA = minY <= 0.55;
+    const passOpenPalm = (opens >= 3) && (cosToVertical > 0.68) && !isWaving && highA;
+
+    // Variant B: flat palm (fingers together), stricter
+    const span = palmSpanLen(lm);
+    const tipPairs = [
+      [MP.INDEX_TIP, MP.MIDDLE_TIP],
+      [MP.MIDDLE_TIP, MP.RING_TIP],
+      [MP.RING_TIP, MP.PINKY_TIP],
+    ];
+    const meanAdj = tipPairs
+      .map(([a, b]) => Math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y))
+      .reduce((s, d) => s + d, 0) / (tipPairs.length || 1);
+    const together = (meanAdj / Math.max(1e-3, span)) < 0.18;
+    const highB = minY <= 0.60;
+    const passFlatPalm = (opens >= 2) && together && (cosToVertical > 0.65) && !isWaving && highB;
+
+    if (passOpenPalm || passFlatPalm) {
+      const openness = Math.max(0, (idx.margin + mid.margin + rng.margin + pky.margin) / 4);
+      const orientBoost = Math.max(0, (cosToVertical - 0.65) * 0.9);
+      const heightBoost = Math.max(0, (0.60 - minY) * 0.8);
+      const togetherBoost = passFlatPalm ? Math.min(0.22, Math.max(0, (0.18 - (meanAdj / Math.max(1e-3, span))) * 2.0)) : 0;
+      const score = Math.min(1, 0.30 + 0.28 * openness + orientBoost + heightBoost + togetherBoost);
+      return { ok: true, type: "raise_hand", score };
+    }
+    return { ok: false };
+  } catch { return { ok: false }; }
+}
+
+/**
+ * On phone: wrist or thumb tip near cheek/ear, hand upright-ish, few fingers open,
+ * and not actively waving.
+ */
+function classifyOnPhone(lm, faces, canvasW, canvasH) {
+  try {
+    if (!lm || lm.length < 21 || !Array.isArray(faces) || !faces.length) return { ok: false };
+    const wrist = lm[MP.WRIST], iMcp = lm[MP.INDEX_MCP];
+    const thumbTip = lm[MP.THUMB_TIP];
+    if (!wrist || !iMcp || !thumbTip) return { ok: false };
+
+    // nearest face to (wrist or thumb)
+    const pickNear = (px, py) => {
+      let best = null, bestD2 = Infinity;
+      for (const f of faces) {
+        const fx = (f.cx || 0) / Math.max(1, canvasW);
+        const fy = (f.cy || 0) / Math.max(1, canvasH);
+        const dx = px - fx, dy = py - fy, d2 = dx*dx + dy*dy;
+        if (d2 < bestD2) { bestD2 = d2; best = f; }
+      }
+      return best;
+    };
+    const fW = pickNear(wrist.x, wrist.y) || faces[0];
+
+    const fx = (fW.cx || 0) / Math.max(1, canvasW);
+    const fy = (fW.cy || 0) / Math.max(1, canvasH);
+    const hw = Math.max(0.02, (fW.w || 120) / Math.max(1, canvasW) * 0.5);
+    const hh = Math.max(0.03, (fW.h || 160) / Math.max(1, canvasH) * 0.5);
+
+    // side targets for cheek/ear
+    const sideSignW = wrist.x >= fx ? +1 : -1;
+    const sideXW = fx + sideSignW * hw * 0.95;
+    const closenessSideW = Math.max(0, Math.min(1, 1 - Math.abs(wrist.x - sideXW) / (hw * 0.9)));
+    const closenessYW = Math.max(0, Math.min(1, 1 - Math.abs(wrist.y - fy) / (hh * 0.7)));
+
+    // Alternate: thumb tip near cheek (some hold phone with thumb near ear)
+    const sideSignT = thumbTip.x >= fx ? +1 : -1;
+    const sideXT = fx + sideSignT * hw * 0.95;
+    const closenessSideT = Math.max(0, Math.min(1, 1 - Math.abs(thumbTip.x - sideXT) / (hw * 0.9)));
+    const closenessYT = Math.max(0, Math.min(1, 1 - Math.abs(thumbTip.y - fy) / (hh * 0.7)));
+
+    // orientation: wrist->index MCP near vertical
+    const vx = iMcp.x - wrist.x, vy = iMcp.y - wrist.y;
+    const vlen = Math.hypot(vx, vy) || 1e-6;
+    const cosToVertical = Math.abs(vy) / vlen;
+
+    // few open fingers (holding phone)
+    const idx = fingerOpen(lm, MP.INDEX_TIP, MP.INDEX_MCP);
+    const mid = fingerOpen(lm, MP.MIDDLE_TIP, MP.MIDDLE_MCP);
+    const rng = fingerOpen(lm, MP.RING_TIP, MP.RING_MCP);
+    const pky = fingerOpen(lm, MP.PINKY_TIP, MP.PINKY_MCP);
+    const opens = [idx, mid, rng, pky].filter(f => f.open).length;
+
+    // anti-wave: allow small motion
+    const wa = waveActivity();
+    const isWaving = (wa.flips >= 2 && wa.amp > 0.025);
+
+    // Pass if either wrist-near-cheek OR thumb-near-cheek looks good
+    const passWrist = (closenessSideW > 0.18 && closenessYW > 0.15);
+    const passThumb = (closenessSideT > 0.22 && closenessYT > 0.15);
+    const fewFingers = opens <= 4;
+
+    const ok =
+      (passWrist || passThumb) &&
+      (cosToVertical > 0.55) &&
+      fewFingers &&
+      !isWaving;
+
+    if (!ok) return { ok: false };
+
+    const closenessSide = Math.max(closenessSideW, closenessSideT);
+    const closenessY = Math.max(closenessYW, closenessYT);
+    const score = Math.min(
+      1,
+      0.42 * closenessSide +
+      0.22 * closenessY +
+      0.22 * Math.max(0, (cosToVertical - 0.55) * 2.0) +
+      0.14 * Math.max(0, 0.22 - wa.amp) // stillness bonus
+    );
+    return { ok: true, type: "on_phone", score };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function classifyPaper(lm) {
+  try {
+    const idx = fingerOpen(lm, MP.INDEX_TIP, MP.INDEX_MCP);
+    const mid = fingerOpen(lm, MP.MIDDLE_TIP, MP.MIDDLE_MCP);
+    const rng = fingerOpen(lm, MP.RING_TIP, MP.RING_MCP);
+    const pky = fingerOpen(lm, MP.PINKY_TIP, MP.PINKY_MCP);
+    const opens = [idx, mid, rng, pky].filter(f => f.open).length;
+    if (opens >= 3) {
+      const avgMargin = (idx.margin + mid.margin + rng.margin + pky.margin) / 4;
+      const score = Math.min(1, 0.25 * opens + Math.max(0, avgMargin)); // favor 4-finger open + margins
+      return { ok: true, type: "paper", score };
+    }
+    return { ok: false };
+  } catch { return { ok: false }; }
+}
+
+function classifyRock(lm) {
+  try {
+    const idx = fingerOpen(lm, MP.INDEX_TIP, MP.INDEX_MCP);
+    const mid = fingerOpen(lm, MP.MIDDLE_TIP, MP.MIDDLE_MCP);
+    const rng = fingerOpen(lm, MP.RING_TIP, MP.RING_MCP);
+    const pky = fingerOpen(lm, MP.PINKY_TIP, MP.PINKY_MCP);
+    const opens = [idx, mid, rng, pky].filter(f => f.open).length;
+    if (opens <= 1) {
+      // stronger if all closed (negative margins)
+      const neg = [idx, mid, rng, pky].map(f => Math.max(0, 0.12 - Math.max(0, f.margin)));
+      const tight = neg.reduce((a, b) => a + b, 0) / 4;
+      const score = Math.min(1, 0.85 - 0.2 * opens + tight);
+      return { ok: true, type: "rock", score };
+    }
+    return { ok: false };
+  } catch { return { ok: false }; }
+}
+
+function classifyScissors(lm) {
+  try {
+    const idx = fingerOpen(lm, MP.INDEX_TIP, MP.INDEX_MCP);
+    const mid = fingerOpen(lm, MP.MIDDLE_TIP, MP.MIDDLE_MCP);
+    const rng = fingerOpen(lm, MP.RING_TIP, MP.RING_MCP);
+    const pky = fingerOpen(lm, MP.PINKY_TIP, MP.PINKY_MCP);
+    if (idx.open && mid.open && !rng.open && !pky.open) {
+      const margin = Math.max(0, idx.margin) + Math.max(0, mid.margin);
+      const clamp = Math.max(0, 0.12 - Math.max(0, rng.margin)) + Math.max(0, 0.12 - Math.max(0, pky.margin));
+      const score = Math.min(1, 0.45 + 0.35 * margin + 0.25 * clamp);
+      return { ok: true, type: "scissors", score };
+    }
+    return { ok: false };
+  } catch { return { ok: false }; }
+}
+
+// --- Gesture stabilizer (wave-first, anti-flicker) ---
+const WAVE_BOOT_MS = 300;        // after startup/change, allow wave to “claim” quickly
+const WAVE_GRACE_MS = 550;       // how long wave is allowed to win ties/near-ties
+const CHANGE_COOLDOWN_MS = 450;  // prevent rapid flip-flops after we lock something
+
+// Hoisted: gesture voting config (so pickStableGesture can see them)
+const GESTURE_PRIORITY   = ["raise_hand", "on_phone", "thumbs_up", "peace", "wave", "paper", "rock", "scissors"];
+const VOTE_WINDOW        = 5;    // keep last ~6 frames
+const VOTE_MAX_AGE_MS    = 700;  // ignore old entries
+const REQUIRE_CONSISTENT = 2;    // ≥3 agreeing frames
+const CLEAR_IF_IDLE_MS   = 450;  // drop stale gesture after this
+const MIN_SCORE = {
+  wave: 0.50,
+  thumbs_up: 0.26,
+  peace: 0.50,
+  raise_hand: 0.50,
+  on_phone: 0.38,
+  paper: 0.45,
+  rock: 0.45,
+  scissors: 0.45,
+};
+
+function pickStableGesture(now, win, prevStable) {
+  // 1) Fresh window (trim by age and keep only the recent tail)
+  const fresh = (win || [])
+    .filter(e => e && (now - e.t) <= VOTE_MAX_AGE_MS)
+    .slice(-VOTE_WINDOW);
+
+  // Nothing new → keep previous a short while, then clear
+  if (!fresh.length) {
+    if (prevStable && (now - prevStable.t) < CLEAR_IF_IDLE_MS) return prevStable;
+    return null;
+  }
+
+  // 2) Aggregate per type with per-type min scores
+  const byType = new Map();
+  for (const e of fresh) {
+    const min = MIN_SCORE[e.type] ?? 0.4;
+    if ((e.score ?? 0) < min) continue;
+    const rec = byType.get(e.type) || { count: 0, sum: 0, best: 0, firstTs: e.t };
+    rec.count += 1;
+    rec.sum += (e.score ?? 0);
+    rec.best = Math.max(rec.best, e.score ?? 0);
+    if (e.t < rec.firstTs) rec.firstTs = e.t;
+    byType.set(e.type, rec);
+  }
+
+  // Still nothing above thresholds → maybe hold old one briefly
+  if (!byType.size) {
+    if (prevStable && (now - prevStable.t) < CLEAR_IF_IDLE_MS) return prevStable;
+    return null;
+  }
+
+  // 3) Pick best: highest count → priority (wave first) → avg score
+  let best = null;
+  for (const [type, stats] of byType.entries()) {
+    const cand = {
+      type,
+      count: stats.count,
+      avg: stats.sum / stats.count,
+      pri: GESTURE_PRIORITY.indexOf(type),
+      bestScore: stats.best,
+      firstTs: stats.firstTs,
+    };
+    if (
+      !best ||
+      cand.count > best.count ||
+      (cand.count === best.count && cand.pri < best.pri) ||
+      (cand.count === best.count && cand.pri === best.pri && cand.avg > best.avg)
+    ) {
+      best = cand;
+    }
+  }
+
+  // 4) Wave-first grace: if a wave appeared very recently, let it win near-ties
+  const waveStats = byType.get("wave");
+  if (waveStats) {
+    const waveFirstTs = waveStats.firstTs;
+    const waveRecent = (now - waveFirstTs) <= WAVE_GRACE_MS;
+    const prevIsWavey = !prevStable || prevStable.type === "wave" || (now - (prevStable?.t || 0)) <= WAVE_BOOT_MS;
+
+    if (waveRecent && prevIsWavey) {
+      // If current best isn't wave and wave isn't far behind, prefer wave
+      const waveCand = {
+        type: "wave",
+        count: waveStats.count,
+        avg: waveStats.sum / Math.max(1, waveStats.count),
+        pri: GESTURE_PRIORITY.indexOf("wave"),
+        bestScore: waveStats.best,
+        firstTs: waveStats.firstTs,
+      };
+      const nearTie = (best.type !== "wave") && (waveCand.count >= best.count - 1);
+      const notClearlyWorse = (waveCand.avg + 0.05) >= best.avg; // require near score
+      if (best.type !== "wave" && nearTie && notClearlyWorse && waveCand.bestScore >= MIN_SCORE.wave) {
+        best = waveCand;
+      }
+    }
+  }
+
+  // 5) Require some consistency (≥ N frames or ≥60% of fresh window)
+  const bestScoreVal = (byType.get(best.type)?.best ?? 0);
+  const strong =
+    (bestScoreVal >= 0.68 && best.count >= 2) ||
+    (best.type === "thumbs_up" && bestScoreVal >= 0.82) ||
+    (best.type === "raise_hand" && bestScoreVal >= 0.82) ||
+    (best.type === "on_phone" && bestScoreVal >= 0.72);
+  const consistent = strong || best.count >= REQUIRE_CONSISTENT || best.count >= Math.ceil(0.6 * fresh.length);
+  if (!consistent) {
+    return (prevStable && (now - prevStable.t) < CLEAR_IF_IDLE_MS) ? prevStable : null;
+  }
+
+  // 6) Anti-flicker: if we’d switch types too soon, keep the previous briefly
+  if (prevStable && prevStable.type !== best.type) {
+    if ((now - prevStable.t) < CHANGE_COOLDOWN_MS) {
+      return prevStable;
+    }
+  }
+
+  // 7) Emit stable using the best observed score for that type
+  const bestScore = byType.get(best.type)?.best ?? best.bestScore ?? 0.5;
+  return { type: best.type, score: bestScore, t: now };
+}
+
+/* ---- Mouth activity (inner mouth aspect ratio, MAR) ---- */
+function mouthMAR(landmarks68) {
+  try {
+    // face-api.js FaceLandmarks68 exposes .positions (and internally ._positions)
+    const pts = landmarks68?.positions || landmarks68?._positions || (Array.isArray(landmarks68) ? landmarks68 : null);
+    if (!pts) return 0;
+
+    const dist = (a, b) => {
+      const pa = pts[a], pb = pts[b];
+      return Math.hypot(pa.x - pb.x, pa.y - pb.y);
+    };
+
+    // Inner mouth: 60–67. Vertical = avg(61–67, 62–66, 63–65), Horizontal = 60–64
+    const V = (dist(61,67) + dist(62,66) + dist(63,65)) / 3;
+    const H = dist(60,64) || 1e-6;
+    const mar = V / H;
+
+    // Typical closed MAR ≈ 0.25–0.35. Map to 0..1 for UI.
+    // Shift + scale, then clamp.
+    const norm = Math.max(0, Math.min(1, (mar - 0.30) * 3.0)); // tweak 0.30 & 3.0 to taste
+    return norm;
+  } catch {
+    return 0;
+  }
+}
+
+/* ---- Box helper ---- */
+const shrinkBox = (b, f = BOX_SHRINK) => {
+  const w = b.width * f;
+  const h = b.height * f;
+  return {
+    x: b.x + (b.width  - w) / 2,
+    y: b.y + (b.height - h) / 2,
+    width:  w,
+    height: h,
+  };
+};
+
+// get number (or null) from localStorage safely
+function getStoredNumber(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw == null || raw === "") return null;
+    const num = Number(raw);
+    return Number.isFinite(num) ? num : null;
+  } catch {
+    return null;
+  }
+}
+
+/* ====================== GUEST MEMORY HELPERS ====================== */
 function encodeDescFloat32ToU8(descF32) {
   const out = new Uint8Array(descF32.length);
-  for (let i=0;i<descF32.length;i++){
+  for (let i = 0; i < descF32.length; i++) {
     const clamped = Math.max(-1, Math.min(1, descF32[i]));
-    out[i] = Math.round((clamped + 1) * 127.5); // -1 -> 0, 1 -> 255
+    out[i] = Math.round((clamped + 1) * 127.5);
   }
   return out;
 }
 function decodeDescU8ToFloat32(u8) {
   const out = new Float32Array(u8.length);
-  for (let i=0;i<u8.length;i++){
-    out[i] = (u8[i] / 127.5) - 1;
-  }
+  for (let i = 0; i < u8.length; i++) out[i] = u8[i] / 127.5 - 1;
   return out;
 }
-function u8ToB64(u8){ // compact-ish
+function u8ToB64(u8) {
   let bin = "";
   const CHUNK = 0x8000;
-  for (let i=0;i<u8.length;i+=CHUNK){
-    bin += String.fromCharCode.apply(null, u8.subarray(i, i+CHUNK));
+  for (let i = 0; i < u8.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK));
   }
   return btoa(bin);
 }
-function b64ToU8(b64){
+function b64ToU8(b64) {
   const bin = atob(b64);
   const out = new Uint8Array(bin.length);
-  for (let i=0;i<bin.length;i++) out[i] = bin.charCodeAt(i);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
 }
 
-const GUEST_MAX = 500; // tune for your venue
+/* ====================== AUDIO CHUNK PLAYER (server → client) ====================== */
+class ChunkAudioPlayer {
+  constructor({ onStart, onEnd } = {}) {
+    this.queue = [];
+    this.playing = false;
+    this.audio = new Audio();
+    this.audio.autoplay = false;
+    this.onStart = onStart;
+    this.onEnd = onEnd;
 
-function saveGuestMem({
-    day = dayKey(),
-    seq = guestSeqRef.current,
-    mem = guestMemRef.current
-  }) {
+    this.audio.addEventListener("ended", () => this._next());
+    this.audio.addEventListener("error", () => this._next());
+  }
+  enqueue(uint8, mime = "audio/mpeg") {
+    if (!(uint8 instanceof Uint8Array)) return;
+    this.queue.push({ uint8, mime });
+    if (!this.playing) this._next();
+  }
+  _next() {
+    const item = this.queue.shift();
+    if (!item) {
+      this.playing = false;
+      try {
+        this.onEnd && this.onEnd();
+      } catch {}
+      return;
+    }
+    const blob = new Blob([item.uint8], { type: item.mime });
+    const url = URL.createObjectURL(blob);
+    this.playing = true;
     try {
-      // defensive copy + prune to most-recent GUEST_MAX
-      const list = [...mem].sort((a,b)=>(b.ts||0) - (a.ts||0));
-      if (list.length > GUEST_MAX) list.length = GUEST_MAX;
-
-      const items = list.map(m => ({
-        id: m.id,
-        ts: m.ts || Date.now(),
-        desc: u8ToB64(encodeDescFloat32ToU8(m.desc))
-      }));
-
-      const payload = { day, seq, items, savedAt: Date.now() };
-      localStorage.setItem(GUEST_STORE_KEY, JSON.stringify(payload));
+      this.onStart && this.onStart();
     } catch {}
+    this.audio.src = url;
+    this.audio
+      .play()
+      .catch(() => {})
+      .finally(() => setTimeout(() => URL.revokeObjectURL(url), 10_000));
+  }
+  stop() {
+    try {
+      this.audio.pause();
+    } catch {}
+    this.queue = [];
+    this.playing = false;
+  }
+}
+
+  // ---- Standalone: ElevenLabsSettings (top-level, not inside App) ----
+  function ElevenLabsSettings() {
+    const [apiKey, setApiKey]   = useState(() => localStorage.getItem("ika:11labs:key") || "");
+    const [voiceId, setVoiceId] = useState(() => localStorage.getItem("ika:11labs:voiceId") || "");
+    const [model, setModel]     = useState(() => localStorage.getItem("ika:11labs:model") || "eleven_turbo_v2_5");
+
+    useEffect(() => { try { localStorage.setItem("ika:11labs:key", apiKey); } catch {} }, [apiKey]);
+    useEffect(() => { try { localStorage.setItem("ika:11labs:voiceId", voiceId); } catch {} }, [voiceId]);
+    useEffect(() => { try { localStorage.setItem("ika:11labs:model", model); } catch {} }, [model]);
+
+    return (
+      <div>
+        <label className="label" htmlFor="elevenlabs-api-key-input">API Key</label>
+        <input
+          id="elevenlabs-api-key-input"
+          className="input bigpad"
+          type="password"
+          placeholder="sk-…"
+          value={apiKey}
+          onChange={(e) => setApiKey(e.target.value)}
+          autoComplete="off"
+        />
+
+        <label className="label" htmlFor="elevenlabs-speech-model-select" style={{ marginTop: 8 }}>Speech model</label>
+        <select
+          id="elevenlabs-speech-model-select"
+          className="select big"
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
+        >
+          {[
+            "eleven_turbo_v2",
+            "eleven_multilingual_v2",
+            "eleven_turbo_v2_5",
+            "eleven_v3_alpha"
+          ].map((m) => <option key={m} value={m}>{m}</option>)}
+        </select>
+
+        <label className="label" htmlFor="elevenlabs-voice-id-input" style={{ marginTop: 8 }}>Voice ID</label>
+        <input
+          id="elevenlabs-voice-id-input"
+          className="input bigpad"
+          placeholder="e.g. Rachel / your-voice-id"
+          value={voiceId}
+          onChange={(e) => setVoiceId(e.target.value)}
+          autoComplete="off"
+        />
+
+        <div className="help" style={{ marginTop: 6 }}>
+          Saved locally. Uses ElevenLabs realtime speech models only.
+        </div>
+      </div>
+    );
   }
 
-function loadGuestMem() {
-  try {
-    const raw = localStorage.getItem(GUEST_STORE_KEY);
-    if (!raw) return null;
-    const data = JSON.parse(raw);
-    if (Array.isArray(data.items) && data.items.length > GUEST_MAX) {
-      data.items = data.items
-        .sort((a,b) => (b.ts||0) - (a.ts||0))
-        .slice(0, GUEST_MAX);
+/* ====================== MAIN APP ====================== */
+export default function App() {
+  /* ---------- Socket + audio playback ---------- */
+  const socketRef = useRef(null);
+  const ttsPlayerRef = useRef(null);
+
+  /* ---------- Global/session UI state ---------- */
+  const [sessionStatus, setSessionStatus] = useState("IDLE");
+  const [sessionId, setSessionId] = useState(null);
+  const [serverInfo, setServerInfo] = useState({ connected:false, model:null, tts:null, boundDeviceId:null, ai_speaking:false });
+
+  const [posts, setPosts] = useState({ start: 0, snapshot: 0, stop: 0 });
+  const [lastSent, setLastSent] = useState({ start: "-", snapshot: "-", stop: "-" });
+  const [lastHttp, setLastHttp] = useState({ start: "", snapshot: "", stop: "" });
+
+  const [captions, setCaptions] = useState(localStorage.getItem("ika:captions") === "true");
+  const [lastText, setLastText] = useState("");
+
+  // Per-identity attention counting & cooldown
+  const attentionMapRef = useRef(new Map());
+  // Map key: stable id (name || gid)
+  // value: { count: number, lastInviteTs: number }
+
+  // ===== HandLandmarker refs =====
+  const handLmRef = useRef(null);
+  const handsReadyRef = useRef(false);
+  const lastHandsRunTsRef = useRef(0);
+  const lastLmSeenTsRef = useRef(0);     // added: when we last saw landmarks
+  const handsFailRef = useRef(0);        // added: consecutive VIDEO misses
+
+  // downscale buffer for hands
+  const handsOffscreenRef = useRef(null);
+  const handsCtxRef = useRef(null);
+
+  // last gesture memory
+  // shape: { type: "wave" | "thumbs_up" | null, score: number, t: number }
+  const lastGestureRef = useRef(null);
+  const lastGestureSentRef = useRef(0); // last time we allowed sending to server
+
+  // Windowed voting to stabilize gestures
+  const gestureWindowRef = useRef([]); // array of { type, score, t }
+  const stableGestureRef = useRef(null); // { type, score, t }
+
+  const [locationLabel, setLocationLabel] = useState(
+    localStorage.getItem("ika:locationLabel") || "Jakarta (Bundaran HI)"
+  );
+  const [weatherLabel, setWeatherLabel] = useState(
+    localStorage.getItem("ika:weatherLabel") || "Clear 28°C"
+  );
+  const [clock, setClock] = useState(() => new Date());
+  useEffect(() => {
+    const t = setInterval(() => setClock(new Date()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  // device identity
+  const [deviceId] = useState(() => {
+    try {
+      const k = "ika:deviceId";
+      let v = localStorage.getItem(k);
+      if (!v) {
+        v = uuid();
+        localStorage.setItem(k, v);
+      }
+      return v;
+    } catch {
+      return uuid();
     }
-    return data;
-  } catch { return null; }
-}
-
-function pruneByRetention(data) {
-  if (!data) return null;
-  if (GUEST_RETENTION_DAYS <= 0) return null;
-
-  // daily reset mode
-  if (GUEST_RETENTION_DAYS === 1) {
-    if (data.day !== dayKey()) return null;  // new day => reset
-    return data;
-  }
-
-  // multi-day mode
-  const cutoff = Date.now() - GUEST_RETENTION_DAYS * 86400_000;
-  data.items = (data.items || []).filter(it => (it.ts || 0) >= cutoff);
-  return data;
-}
-
-/* ====================== helpers ====================== */
-const uuid = () =>
-  (crypto?.randomUUID ? crypto.randomUUID()
-   : Math.random().toString(36).slice(2) + Date.now().toString(36));
-
-const estimateDistanceM = (wPx) => (wPx ? (FOCAL_PX * FACE_WIDTH_M) / wPx : null);
-const ageGroupOf = (age) => (age == null ? "unknown"
-  : (Math.round(age) >= 18 ? "adult" : (Math.round(age) >= 12 ? "teen" : "child")));
-const zoneOf = (d, greenMaxM) => (d != null && d <= greenMaxM ? "green" : "red");
-const topExpression = (e) => {
-  if (!e) return "neutral";
-  const entries = Object.entries(e);
-  if (!entries.length) return "neutral";
-  return entries.reduce((a, b) => (a[1] > b[1] ? a : b))[0];
-};
-
-const shrinkBox = (b, f = BOX_SHRINK) => {
-  const w = b.width * f, h = b.height * f;
-  return { x: b.x + (b.width - w) / 2, y: b.y + (b.height - h) / 2, width: w, height: h };
-};
-
-function bestTwoMatches(matcher, queryDesc){
-  let best={label:null,dist:1}, second={label:null,dist:1};
-  for (const ld of matcher.labeledDescriptors){
-    for (const d of ld.descriptors){
-      const dist = faceapi.euclideanDistance(queryDesc, d);
-      if (dist < best.dist){ second = best; best = { label: ld.label, dist }; }
-      else if (dist < second.dist){ second = { label: ld.label, dist }; }
-    }
-  }
-  return { best, second };
-}
-
-// --- Safe base64 for large blobs (avoid "maximum call stack" on big arrays)
-function toBase64(uint8) {
-  let bin = "";
-  const CHUNK = 0x8000; // 32k
-  for (let i = 0; i < uint8.length; i += CHUNK) {
-    bin += String.fromCharCode.apply(null, uint8.subarray(i, i + CHUNK));
-  }
-  return btoa(bin);
-}
-
-// POST with timeout + safe JSON parsing (handles empty bodies)
-async function postJSON(url, payload, timeoutMs = 8000) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json", "accept": "application/json" },
-      body: JSON.stringify(payload),
-      cache: "no-store",
-      signal: ctrl.signal,
-    });
-    const txt = await res.text(); // ← handle empty bodies safely
-    let json = {};
-    try { json = txt ? JSON.parse(txt) : {}; } catch { /* keep {} */ }
-    return { ok: res.ok, status: res.status, text: txt, json };
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-function isCamLive() {
-  const s = camRef.current?.stream;
-  if (!s) return false;
-  const tracks = s.getVideoTracks?.() || [];
-  if (!tracks.length) return false;
-  return tracks.some(t => t.readyState === "live" && t.enabled !== false);
-}
-
-/* ====================== TTS hooks ====================== */
-async function notifyTTSStart(sessionId, meta = {}) {
-  try {
-    await fetch("/api/n8n/ai/tts/start", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sessionId, ...meta })
-    });
-  } catch {}
-}
-
-async function notifyTTSEnd(sessionId, meta = {}) {
-  try {
-    await fetch("/api/n8n/ai/tts/end", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sessionId, ...meta })
-    });
-  } catch {}
-}
-
-// Example: play an audio blob (from ElevenLabs or Gemini)
-export async function playTTS(sessionId, arrayBuffer, mime="audio/mpeg") {
-  const blob = new Blob([arrayBuffer], { type: mime });
-  const url  = URL.createObjectURL(blob);
-
-  // we likely don't have the reply text here, so just send meta without text
-  await notifyTTSStart(sessionId, { source: "client-audio" });
-
-  const audio = new Audio(url);
-  audio.play().catch(()=>{});
-
-  audio.addEventListener("ended", () => {
-    notifyTTSEnd(sessionId, { source: "client-audio" });
-    URL.revokeObjectURL(url);
   });
-}
 
-/* ====================== [AUDIO] tiny meter ====================== */
-function LevelMeter({ levelDbfs = -60, thresholdDbfs = -45, bars = 20, height = 18 }) {
-  const norm = (db, min=-60, max=-20) => {
-    const x = (db - min) / (max - min);
-    return Math.min(1, Math.max(0, x));
+  // HANDS: detect with VIDEO first, fallback to IMAGE if needed ----
+  const detectHandsOnce = useCallback(async (videoEl) => {
+    const landmarker = handLmRef.current;
+    if (!handsReadyRef.current || !landmarker || !videoEl?.videoWidth) return null;
+
+    const ts = performance.now();
+
+    // 1) Try VIDEO mode (cheap path)
+    try {
+      const res = landmarker.detectForVideo(videoEl, ts);
+      const hands = res?.landmarks || res?.handLandmarks || [];
+      if (hands.length) {
+        handsFailRef.current = 0;
+        lastLmSeenTsRef.current = ts;
+        return hands[0].map(pt => ({ x: pt.x, y: pt.y }));
+      }
+    } catch { /* ignore */ }
+
+    // No luck in VIDEO this frame
+    handsFailRef.current = (handsFailRef.current || 0) + 1;
+
+    // 2) Occasionally try IMAGE fallback (expensive: switch modes)
+    // Only every 4th miss to avoid mode-flip cost each frame
+    if ((handsFailRef.current % 4) !== 0) return null;
+
+    try {
+      await landmarker.setOptions?.({ runningMode: "IMAGE" });
+
+      const c = handsOffscreenRef.current, g = handsCtxRef.current;
+      if (!c || !g) return null;
+
+      const W = c.width, H = c.height;
+      const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
+      const scale = Math.min(W / vw, H / vh);
+      const dw = Math.round(vw * scale), dh = Math.round(vh * scale);
+      const dx = (W - dw) >> 1, dy = (H - dh) >> 1;
+      g.clearRect(0, 0, W, H);
+      g.drawImage(videoEl, 0, 0, vw, vh, dx, dy, dw, dh);
+
+      const res2 = await landmarker.detect(c);
+      const hands2 = res2?.landmarks || res2?.handLandmarks || [];
+
+      // Switch back to VIDEO mode for the next frames
+      await landmarker.setOptions?.({ runningMode: "VIDEO" });
+
+      if (hands2.length) {
+        handsFailRef.current = 0;
+        lastLmSeenTsRef.current = performance.now();
+        const pts = hands2[0].map(pt => ({
+          x: (dx + pt.x * dw) / W,
+          y: (dy + pt.y * dh) / H,
+        }));
+        return pts;
+      }
+    } catch {
+      try { await handLmRef.current?.setOptions?.({ runningMode: "VIDEO" }); } catch {}
+    }
+
+    return null;
+  }, []);
+
+  // --- TFJS backend gating (avoid detect while switching) ---
+  const backendReadyRef = useRef(Promise.resolve());
+  const backendSwitchingRef = useRef(false);
+  const backendNameRef = useRef(null);
+
+  // --- Session rotation on crowd change ---
+  const groupSigRef = useRef("");           // last stable group signature
+  const groupStableSinceRef = useRef(0);    // when current signature first appeared
+  const lastRotateRef = useRef(0);          // last time we rotated session
+  const SESSION_ROTATE_COOLDOWN_MS = 20_000; // rotate at most every 20s
+  const GROUP_STABLE_MS = 1_500;             // need ~1.5s stable group before rotate
+
+  function groupSignature(people) {
+    const ids = people
+      .map(p => (p.name || p.gid || "").trim())
+      .filter(Boolean)
+      .sort();
+    let s = ids.join("|");
+    let h = 0;
+    for (let i = 0; i < s.length; i++) { h = ((h << 5) - h) + s.charCodeAt(i); h |= 0; }
+    return ids.length ? String(h) : ""; // empty => no crowd
+  }
+
+  function maybeRotateSession(sig, people) {
+    const now = performance.now();
+    const prev = groupSigRef.current;
+
+    if (sig !== prev) {
+      groupSigRef.current = sig;
+      groupStableSinceRef.current = now;
+      return; // start stability window
+    }
+    if (!sig) return; // nothing in view
+
+    const stableFor = now - (groupStableSinceRef.current || 0);
+    const sinceLast = now - (lastRotateRef.current || 0);
+
+    if (stableFor >= GROUP_STABLE_MS && sinceLast >= SESSION_ROTATE_COOLDOWN_MS) {
+      const oldId = sessionId || ("web-" + deviceId);
+      const newId = uuid();
+
+      try {
+        socketRef.current?.emit?.("rotate_session", {
+          oldSessionId: oldId,
+          newSessionId: newId,
+          at: Date.now(),
+          people: people.map(p => ({ name: p.name || null, gid: p.gid || null }))
+        });
+        socketRef.current?.emit?.("close_session", { sessionId: oldId });
+      } catch {}
+
+      setSessionId(newId);
+      lastRotateRef.current = now;
+
+      // If you want a fresh LLM dialog immediately, you can also:
+      // server.createSession({
+      //   model: modelQuick, voice: geminiVoiceQuick,
+      //   language_code: languageCodeQuick,
+      //   system_instruction: systemInstruction,
+      //   tts_provider: ttsProviderQuick
+      // });
+    }
+  }
+
+  /* ---------- Socket lifecycle ---------- */
+  useEffect(() => {
+    if (!USE_SOCKET_SERVER) return;
+    const socket = io(SOCKET_URL ?? undefined, {
+      transports: ["websocket"],
+      path: "/socket.io",
+      autoConnect: true,
+      reconnection: true,
+      reconnectionDelay: 500,
+      reconnectionAttempts: Infinity,
+    });
+    socketRef.current = socket;
+
+    socket.on("connect", () => console.log("[socket] connected", socket.id));
+    // tell server who we are ASAP
+    try { socket.emit("hello", { deviceId, sessionId }); } catch {}
+    socket.on("disconnect", () => console.log("[socket] disconnected"));
+
+    // unified status from server (connection, tts, model, binding, etc.)
+    socket.on("server_status", (m) => {
+      console.log("[server_status]", m);
+      // optional: display in UI
+      setServerInfo((prev) => ({ ...prev, ...m }));
+    });
+
+    socket.on("session_created", (m) => {
+      console.log("[session_created]", m);
+      setSessionStatus("ACTIVE");
+      setSessionId(m?.sessionId || uuid());
+      bump("start");
+    });
+
+    socket.on("text_response", (t) => {
+      const text = typeof t === "string" ? t : t?.text || "";
+      if (text) setLastText(text);
+    });
+
+    socket.on("audio_chunk_received", (pkt) => {
+      try {
+        const b64 = pkt?.chunk;
+        if (!b64) return;
+        const bin = atob(b64);
+        const u8 = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        const mime = pkt?.mime || "audio/mpeg";
+        ttsPlayerRef.current.enqueue(u8, mime);
+      } catch (e) {
+        console.warn("[audio] chunk error:", e);
+      }
+    });
+
+    socket.on("server_message", (m) => console.log("[server]", m));
+    socket.on("on_connection_failed", () =>
+      console.warn("[socket] model connection failed on server")
+    );
+
+    return () => {
+      try {
+        socket.disconnect();
+      } catch {}
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const bump = (which) => {
+    const nowStr = new Date().toLocaleTimeString();
+    setPosts((p) => ({ ...p, [which]: (p[which] || 0) + 1 }));
+    setLastSent((s) => ({ ...s, [which]: nowStr }));
+    setLastHttp((h) => ({ ...h, [which]: "socket" }));
   };
-  const fill = norm(levelDbfs);
-  const tpos = norm(thresholdDbfs);
-  return (
-    <div style={{ position:'relative', background:'#0a0a0a', padding:'10px 12px', borderRadius:10 }}>
-      <div style={{ color:'#9ef99f', fontWeight:600, marginBottom:6 }}>Volume</div>
-      <div style={{ display:'grid', gridTemplateColumns:`repeat(${bars}, 1fr)`, gap:4 }}>
-        {Array.from({length:bars}).map((_,i) => {
-          const lit = i / (bars-1) <= fill;
-          return <div key={i} style={{ height, borderRadius:4, background: lit ? '#22c55e' : '#184a1d', transition:'background 80ms linear' }}/>;
-        })}
-      </div>
-      <div style={{ position:'absolute', left:`${tpos*100}%`, top:34, transform:'translateX(0%)', display:'flex', alignItems:'center', gap:6, pointerEvents:'none' }}>
-        <div style={{ width:6, height:height+10, background:'#9ef99f', borderRadius:2, opacity:.9 }}/>
-        <div style={{ color:'#9ef99f', fontSize:12, opacity:.9 }}>{Math.round(thresholdDbfs)} dB</div>
-      </div>
-    </div>
-  );
-}
 
-/* ====================== Small UI parts (added) ====================== */
-function ToggleSwitch({ checked, onChange, label }) {
-  const onClr = '#0ea5e9'; // blue
-  const offClr = '#475569'; // gray
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      onClick={()=>onChange(!checked)}
-      title={label}
-      style={{
-        display:'inline-flex', alignItems:'center', gap:8,
-        background:'transparent', border:'none', cursor:'pointer', padding:0
-      }}
-    >
-      <span style={{ color:'#ebebeb', fontSize:13 }}>{label}</span>
-      <span
-        aria-hidden
-        style={{
-          width:44, height:24, borderRadius:999,
-          background: checked ? onClr : offClr,
-          position:'relative', transition:'background .15s ease'
-        }}
-      >
-        <span style={{
-          position:'absolute', top:3, left: checked ? 24 : 3,
-          width:18, height:18, borderRadius:'50%', background:'#fff',
-          transition:'left .15s ease'
-        }}/>
-      </span>
-    </button>
-  );
-}
+  useEffect(() => {
+    const p = new ChunkAudioPlayer({
+      onStart: () => {
+        speakingRef.current = true;
+        setServerInfo(s => ({ ...s, ai_speaking: true }));
+      },
+      onEnd: () => {
+        speakingRef.current = false;
+        setServerInfo(s => ({ ...s, ai_speaking: false }));
+      }
+    });
+    ttsPlayerRef.current = p;
+    return () => p.stop();
+  }, []);
 
-/* ====================== App ====================== */
-export default function App(){
+  /* ---------- Server helpers (emit over socket) ---------- */
+  const createServerSession = useCallback(
+    (preset) => {
+      const s = socketRef.current;
+      if (!s) return;
+
+      const payload = {
+        model:
+          preset?.model ||
+          localStorage.getItem("ika:model") ||
+          "gemini-2.5-flash-live-preview",
+
+        // system + language + output modalities
+        system_instruction:
+          preset?.system_instruction ||
+          localStorage.getItem("ika:systemInstruction") ||
+          "You are a friendly, concise on-site concierge.",
+        language_code:
+          preset?.language_code || localStorage.getItem("ika:langCode") || "en-US",
+        response_modalities: Array.isArray(preset?.response_modalities)
+          ? preset.response_modalities
+          : ["AUDIO", "TEXT"],
+
+        // voice & style
+        voice: preset?.voice || localStorage.getItem("ika:voice") || "Puck",
+        temperature: Number.isFinite(preset?.temperature)
+          ? preset.temperature
+          : Number(localStorage.getItem("ika:temperature") ?? 0.6),
+
+        // Live AAD (from sliders in Mic panel)
+        start_of_speech_sensitivity:
+          preset?.start_of_speech_sensitivity ??
+          getStoredNumber("ika:sos") ??
+          0.5,
+        end_of_speech_sensitivity:
+          preset?.end_of_speech_sensitivity ??
+          getStoredNumber("ika:eos") ??
+          0.5,
+        prefix_padding_ms:
+          preset?.prefix_padding_ms ?? getStoredNumber("ika:prefixPad") ?? 150,
+        silence_duration_ms:
+          preset?.silence_duration_ms ?? getStoredNumber("ika:silenceDur") ?? 800,
+
+        // behaviors
+        enable_affective_dialog:
+          preset?.enable_affective_dialog ??
+          (localStorage.getItem("ika:enableAffective") === "true"),
+        proactive_audio:
+          preset?.proactive_audio ??
+          (localStorage.getItem("ika:proactiveAudio") === "true"),
+        function_calling:
+          preset?.function_calling ??
+          (localStorage.getItem("ika:functionCalling") === "true"),
+        auto_function_response:
+          preset?.auto_function_response ??
+          (localStorage.getItem("ika:autoFunctionResponse") === "true"),
+        grounding:
+          preset?.grounding ?? (localStorage.getItem("ika:grounding") === "true"),
+
+        // TTS routing
+        tts_provider:
+          (preset?.tts_provider ||
+            localStorage.getItem("ika:ttsProvider") ||
+            "gemini")?.toLowerCase(),
+        eleven_voice_id:
+          preset?.eleven_voice_id || localStorage.getItem("ika:11labs:voiceId"),
+        eleven_api_key:
+          preset?.eleven_api_key || localStorage.getItem("ika:11labs:key"),
+        eleven_model:
+          preset?.eleven_model || localStorage.getItem("ika:11labs:model") || "eleven_turbo_v2_5",
+
+        // UI toggles
+        captions:
+          preset?.captions ?? (localStorage.getItem("ika:captions") === "true"),
+
+        // locale/location hints
+        lat: preset?.lat ?? getStoredNumber("ika:lat"),
+        lon: preset?.lon ?? getStoredNumber("ika:lon"),
+        locale: preset?.locale || localStorage.getItem("ika:locale") || "en-US",
+
+        deviceId,
+      };
+
+      s.emit("create_session", {
+        ...payload,
+        gemini_api_key: (localStorage.getItem("ika:gemini:key") || undefined),
+      });
+      bump("start");
+      setSessionStatus("ACTIVE");
+      setSessionId((id) => id || uuid());
+    },
+    [deviceId]
+  );
+
+  const updateServerSettings = useCallback((fields) => {
+    const s = socketRef.current;
+    if (!s) return;
+    s.emit("update_settings", fields || {});
+  }, []);
+
+  const sendTextPrompt = useCallback((text) => {
+    const s = socketRef.current;
+    if (!s || !text) return;
+    s.emit("send_text_prompt", { text });
+  }, []);
+
+  const emitCrowdStatus = useCallback(
+    (payload) => {
+      const s = socketRef.current;
+      if (!s) return;
+      s.emit("crowd_status", {
+        sessionId: sessionId || "default",
+        ...payload,
+      });
+      bump("snapshot");
+    },
+    [sessionId]
+  );
+
+  const server = useMemo(
+    () => ({
+      createSession: createServerSession,
+      updateSettings: updateServerSettings,
+      sendText: sendTextPrompt,
+      crowdStatus: emitCrowdStatus,
+    }),
+    [createServerSession, updateServerSettings, sendTextPrompt, emitCrowdStatus]
+  );
+
+  /* ====================== MIC / CAMERA / DETECTION ====================== */
+  // === Camera alignment (FOV & pan/tilt offsets) ===
+  const [fovHdeg, setFovHdeg] = useState(() => Number(localStorage.getItem("ika:fovHdeg") ?? 70));
+  // === Calibration & overlay ===
+  const [calibDistanceM, setCalibDistanceM] = useState(
+    () => Number(localStorage.getItem("ika:calibDistM") ?? 1.0)
+  );
+  const [showAlign, setShowAlign] = useState(
+    localStorage.getItem("ika:showAlign") !== "false"
+  );
+  const calibMsgRef = useRef("");        // transient overlay message ("3…2…1", "Calibrating…")
+  const showAlignRef = useRef(true);
+  useEffect(() => { showAlignRef.current = showAlign; }, [showAlign]);
+  useEffect(() => {
+    try {
+      localStorage.setItem("ika:showAlign", String(showAlign));
+      localStorage.setItem("ika:calibDistM", String(calibDistanceM));
+    } catch {}
+  }, [showAlign, calibDistanceM]);
+
+  // small utility
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  const [fovVdeg, setFovVdeg] = useState(() => Number(localStorage.getItem("ika:fovVdeg") ?? 43));
+  const [panOffsetDeg, setPanOffsetDeg] = useState(() => Number(localStorage.getItem("ika:panOffsetDeg") ?? 0));
+  const [tiltOffsetDeg, setTiltOffsetDeg] = useState(() => Number(localStorage.getItem("ika:tiltOffsetDeg") ?? 0));
+  useEffect(() => { try {
+    localStorage.setItem("ika:fovHdeg", String(fovHdeg));
+    localStorage.setItem("ika:fovVdeg", String(fovVdeg));
+    localStorage.setItem("ika:panOffsetDeg", String(panOffsetDeg));
+    localStorage.setItem("ika:tiltOffsetDeg", String(tiltOffsetDeg));
+  } catch {} }, [fovHdeg, fovVdeg, panOffsetDeg, tiltOffsetDeg]);
+
+  const camFxRef = useRef(600);
+  const camFyRef = useRef(600);
+  const panOffRef  = useRef(0);
+  const tiltOffRef = useRef(0);
+  useEffect(() => { panOffRef.current = panOffsetDeg; }, [panOffsetDeg]);
+  useEffect(() => { tiltOffRef.current = tiltOffsetDeg; }, [tiltOffsetDeg]);
+
+  // === Focus selection weights ===
+  const [wNear,   setWNear]   = useState(() => Number(localStorage.getItem("ika:wNear")   ?? 0.45));
+  const [wCenter, setWCenter] = useState(() => Number(localStorage.getItem("ika:wCenter") ?? 0.35));
+  const [wMouth,  setWMouth]  = useState(() => Number(localStorage.getItem("ika:wMouth")  ?? 0.20));
+  useEffect(() => { try {
+    localStorage.setItem("ika:wNear",   String(wNear));
+    localStorage.setItem("ika:wCenter", String(wCenter));
+    localStorage.setItem("ika:wMouth",  String(wMouth));
+  } catch {} }, [wNear, wCenter, wMouth]);
+
+  // mouth activity smoothing + click-to-zero memory
+  const mouthMapRef = useRef(new Map());
+  const trackedFacesRef = useRef([]);
+  // All faces (green + red) for hand proximity heuristics
+  const allFacesRef = useRef([]);
+
   const speakingRef = useRef(false);
-  const videoRef  = useRef(null);
+
+  // ---- Policy + speaker state ----
+  const prevZoneMapRef = useRef(new Map());   // key -> "green" | "red"
+  const callOverStateRef = useRef(new Map()); // key -> { tries, last }
+  const lastGroupSetRef = useRef(new Set());  // Set(keys) of last frame
+  const lastGroupAskTsRef = useRef(0);
+  const speakerRef = useRef({ key: null, topKeyPrev: null, framesDominant: 0, topSince: 0 });
+
+  const prevCrowdRef = useRef({ json: "", t: 0 });
+  function emitCrowdThrottled(payload) {
+    const now = performance.now();
+
+    function sanitize(obj) {
+      if (obj == null) return obj;
+      if (typeof obj === "number") return Number.isFinite(obj) ? +obj.toFixed(4) : null;
+      if (Array.isArray(obj)) return obj.map(sanitize);
+      if (typeof obj === "object") {
+        const out = {};
+        for (const [k, v] of Object.entries(obj)) {
+          // ignore volatile in signature (but still send them in payload!)
+          if (k === "timeISO" || k === "localTime" || k === "aiSpeaking") continue;
+          if (k === "gesture" && v && typeof v === "object") {
+            out.gesture = { type: v.type || null, score: sanitize(v.score) };
+            continue;
+          }
+          out[k] = sanitize(v);
+        }
+        return out;
+      }
+      return obj;
+    }
+
+    const signature = JSON.stringify(sanitize(payload));
+
+    if (
+      signature !== (prevCrowdRef.current.json || "") &&
+      now - (prevCrowdRef.current.t || 0) > 1000
+    ) {
+      try { server.crowdStatus(payload); } catch {}
+      prevCrowdRef.current = { json: signature, t: now };
+    }
+  }
+
+  const videoRef = useRef(null);
   const canvasRef = useRef(null);
-  const lastSnapRef = useRef("");
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const onClick = (ev) => {
+      const rect = canvas.getBoundingClientRect();
+      const px = ev.clientX - rect.left;
+      const py = ev.clientY - rect.top;
+      const list = trackedFacesRef.current || [];
+      if (!list.length) return;
+      let best = null, bestD2 = Infinity;
+      for (const f of list) {
+        const dx = px - f.cx, dy = py - f.cy, d2 = dx*dx + dy*dy;
+        if (d2 < bestD2) { bestD2 = d2; best = f; }
+      }
+      if (best) {
+        setPanOffsetDeg(p => p - best.yawDeg);
+        setTiltOffsetDeg(t => t - best.pitchDeg);
+      }
+    };
+    canvas.addEventListener("click", onClick);
+    return () => canvas.removeEventListener("click", onClick);
+  }, []);
+
   const lastFrameTsRef = useRef(0);
+  // Frame cadence (battery saver)
+  const loopStepMsRef = useRef(LOOP_STEP_ACTIVE_MS);
+  const loopIdleStateRef = useRef(false);
 
-  const MIC_STOP_GRACE_MS = 5000; // 3–5 seconds
+  const micIdleToStandbyTimerRef = useRef(null);
+
+  const MIC_STOP_GRACE_MS = 5_000;
   const lastAllGreenRef = useRef(0);
-
   const userMicOffRef = useRef(false);
 
   const [ready, setReady] = useState(false);
   const [backend, setBackend] = useState("cpu");
 
-  // Green zone distance (meters) — persisted
+  // === Green Zone Distance ===
   const [greenMaxM, setGreenMaxM] = useState(DEFAULT_GREEN_MAX_M);
-  const [videoId, setVideoId] = useState("");
   const greenMaxMRef = useRef(greenMaxM);
-  useEffect(() => { greenMaxMRef.current = greenMaxM; }, [greenMaxM]);
+  useEffect(() => {
+    greenMaxMRef.current = greenMaxM;
+  }, [greenMaxM]);
 
-  // choose input size based on current video width
-  const pickInputSize = (w) => (w >= 1920 ? 512 : w >= 1280 ? 416 : 320);
+  // === Red Zone Cutoff (ignore faces beyond this) ===
+  const DEFAULT_RED_CUTOFF_M = 3.5;
+  const [redCutoffM, setRedCutoffM] = useState(() => {
+    const raw = localStorage.getItem("ika:redCutoffM");
+    const v = raw == null ? DEFAULT_RED_CUTOFF_M : parseFloat(raw);
+    return Number.isFinite(v) ? v : DEFAULT_RED_CUTOFF_M;
+  });
+  useEffect(() => {
+    try { localStorage.setItem("ika:redCutoffM", String(redCutoffM)); } catch {}
+  }, [redCutoffM]);
 
-  // detector options as a ref so we can tweak inputSize later
-  const tinyOptsRef = useRef(new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.3 }));
+  const [videoId, setVideoId] = useState("");
+  const [audioId, setAudioId] = useState("");
 
-  // one-time TFJS backend fallback flag
+  const pickInputSize = (w) => (w >= 1920 ? 416 : w >= 1280 ? 320 : 256);
+  const tinyOptsRef = useRef(
+    new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.4 })
+  );
   const triedFallbackRef = useRef(false);
 
-  /* === Auto-detect state & refs (moved up) === */
-  const [autoDetectOn, setAutoDetectOn] = useState(true);
+  // auto-calibrate policy
+  const MAX_EMPTY_BEFORE_AUTOCAL = 3;
+  const FAILED_STARTS_BEFORE_AUTOCAL = 4;
+  const AUTO_CAL_MIN_GAP_MS = 30_000;
+  const MIN_NONEMPTY_CHARS = 2;
+
+  const [autoDetectOn, setAutoDetectOn] = useState(
+    localStorage.getItem("ika:autoDetectOn") !== "false"
+  );
   const autoDetectOnRef = useRef(autoDetectOn);
-  useEffect(() => { autoDetectOnRef.current = autoDetectOn; }, [autoDetectOn]);
+  useEffect(() => {
+    autoDetectOnRef.current = autoDetectOn;
+    try {
+      localStorage.setItem("ika:autoDetectOn", String(autoDetectOn));
+    } catch {}
+  }, [autoDetectOn]);
 
   const [emptyTranscripts, setEmptyTranscripts] = useState(0);
   const lastAutoCalRef = useRef(0);
-  const [isPressed, setIsPressed] = useState(false); // press-blue for Calibrate
+  const [isPressed, setIsPressed] = useState(false);
 
+  // mic/VAD prefs
+  const [dbfs, setDbfs] = useState(-60);
+  const [threshold, setThreshold] = useState(
+    Number(localStorage.getItem("ika:threshold") ?? -45)
+  );
+  const [listenMs, setListenMs] = useState(
+    Number(localStorage.getItem("ika:listenMs") ?? 400)
+  );
+  const [silenceMs, setSilenceMs] = useState(
+    Number(localStorage.getItem("ika:silenceMs") ?? 500)
+  );
+
+  // Live AAD knobs (moved here)
+  const [sosQuick, setSosQuick] = useState(Number(localStorage.getItem("ika:sos") ?? 0.5));
+  const [eosQuick, setEosQuick] = useState(Number(localStorage.getItem("ika:eos") ?? 0.5));
+  const [prefixPadQuick, setPrefixPadQuick] = useState(
+    Number(localStorage.getItem("ika:prefixPad") ?? 150)
+  );
+  const [silenceDurQuick, setSilenceDurQuick] = useState(
+    Number(localStorage.getItem("ika:silenceDur") ?? 800)
+  );
+
+  // mirror into refs for VAD loop
+  const thresholdLiveRef = useRef(threshold);
+  const listenMsLiveRef = useRef(listenMs);
+  const silenceMsLiveRef = useRef(silenceMs);
+  useEffect(() => {
+    thresholdLiveRef.current = threshold;
+    try {
+      localStorage.setItem("ika:threshold", String(threshold));
+    } catch {}
+  }, [threshold]);
+  useEffect(() => {
+    listenMsLiveRef.current = listenMs;
+    try {
+      localStorage.setItem("ika:listenMs", String(listenMs));
+    } catch {}
+  }, [listenMs]);
+  useEffect(() => {
+    silenceMsLiveRef.current = silenceMs;
+    try {
+      localStorage.setItem("ika:silenceMs", String(silenceMs));
+    } catch {}
+  }, [silenceMs]);
+
+  // persist Live AAD too
+  useEffect(() => {
+    try {
+      localStorage.setItem("ika:sos", String(sosQuick));
+      localStorage.setItem("ika:eos", String(eosQuick));
+      localStorage.setItem("ika:prefixPad", String(prefixPadQuick));
+      localStorage.setItem("ika:silenceDur", String(silenceDurQuick));
+    } catch {}
+  }, [sosQuick, eosQuick, prefixPadQuick, silenceDurQuick]);
+
+  const [micOn, setMicOn] = useState(false);
+  const micOnRef = useRef(false);
+  useEffect(() => {
+    micOnRef.current = micOn;
+  }, [micOn]);
+
+  const [audioDevs, setAudioDevs] = useState([]);
+  const [videoDevs, setVideoDevs] = useState([]);
+
+  const audioRef = useRef({
+    ctx: null,
+    stream: null,
+    source: null,
+    analyser: null,
+    raf: 0,
+    deviceId: "",
+    vad: {
+      highSince: 0,
+      lowSince: 0,
+      recording: false,
+      recorder: null,
+      chunks: [],
+      startTs: 0,
+      failedStarts: 0,
+    },
+  });
+  const camRef = useRef({ stream: null });
+
+  // detection bookkeeping
+  const [table, setTable] = useState(
+    Array.from({ length: 5 }, (_, i) => ({
+      idx: i + 1,
+      gender: "-",
+      ageGroup: "-",
+      zone: "-",
+      name: "-",
+      distance: "-",
+    }))
+  );
+  const [totals, setTotals] = useState({ all: 0, green: 0, red: 0 });
+  const recentMapRef = useRef({});
+  const S = useRef({ id: null, seenFrames: 0, lastFaceTs: 0, lastSnapshotTs: 0 });
+
+  // labels & matcher
+  const faceMatcherRef = useRef(null);
+  const [knownCount, setKnownCount] = useState(0);
+
+  /* ---------- Guest memory ---------- */
+  const guestSeqRef = useRef(1);
+  const guestMemRef = useRef([]);
+  const GUEST_TOL = 0.6;
+  const guestSavePendingRef = useRef(false);
+  const GUEST_STORE_KEY = "ika:guestMem.v1";
+  const GUEST_RETENTION_DAYS = 1;
+  const dayKey = (d = new Date()) =>
+    d.toLocaleDateString("en-CA", {
+      timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    });
+  const msToNextMidnight = () => {
+    const now = new Date();
+    const next = new Date(now);
+    next.setHours(24, 0, 0, 0);
+    return next - now;
+  };
+  function scheduleGuestSave() {
+    if (guestSavePendingRef.current) return;
+    guestSavePendingRef.current = true;
+    setTimeout(() => {
+      saveGuestMem({});
+      guestSavePendingRef.current = false;
+    }, 750);
+  }
+  function assignGuestIdFor(descriptor) {
+    if (!descriptor || !descriptor.length) {
+      const id = `Guest${String(guestSeqRef.current++).padStart(2, "0")}`;
+      scheduleGuestSave();
+      return id;
+    }
+    const mem = guestMemRef.current;
+    let bestIdx = -1,
+      bestDist = 1;
+    for (let i = 0; i < mem.length; i++) {
+      const d = faceapi.euclideanDistance(descriptor, mem[i].desc);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx >= 0 && bestDist <= GUEST_TOL) {
+      mem[bestIdx].ts = Date.now();
+      scheduleGuestSave();
+      return mem[bestIdx].id;
+    }
+    const id = `Guest${String(guestSeqRef.current++).padStart(2, "0")}`;
+    mem.push({ id, ts: Date.now(), desc: Float32Array.from(descriptor) });
+    scheduleGuestSave();
+    return id;
+  }
+  function saveGuestMem({
+    day = dayKey(),
+    seq = guestSeqRef.current,
+    mem = guestMemRef.current,
+  }) {
+    try {
+      const list = [...mem].sort((a, b) => (b.ts || 0) - (a.ts || 0));
+      const items = list.map((m) => ({
+        id: m.id,
+        ts: m.ts || Date.now(),
+        desc: u8ToB64(encodeDescFloat32ToU8(m.desc)),
+      }));
+      const payload = { day, seq, items, savedAt: Date.now() };
+      localStorage.setItem(GUEST_STORE_KEY, JSON.stringify(payload));
+    } catch {}
+  }
+  function loadGuestMem() {
+    try {
+      const raw = localStorage.getItem(GUEST_STORE_KEY);
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  function pruneByRetention(data) {
+    if (!data) return null;
+    if (GUEST_RETENTION_DAYS <= 0) return null;
+    if (GUEST_RETENTION_DAYS === 1) {
+      if (data.day !== dayKey()) return null;
+      return data;
+    }
+    const cutoff = Date.now() - GUEST_RETENTION_DAYS * 86_400_000;
+    data.items = (data.items || []).filter((it) => (it.ts || 0) >= cutoff);
+    return data;
+  }
+
+  /* ---------- Tiny UI helpers ---------- */
+  function ToggleSwitch({ checked, onChange, label }) {
+    return (
+      <label style={{ display: "inline-flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 13, color: "#ebebeb" }}>
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={e => onChange(e.target.checked)}
+          style={{ accentColor: "#0ea5e9", width: 18, height: 18 }}
+        />
+        {label}
+      </label>
+    );
+  }
+
+  function LevelMeter({
+    levelDbfs = -60,
+    thresholdDbfs = -45,
+    bars = 20,
+    height = 18,
+  }) {
+    const norm = (db, min = -60, max = -20) => {
+      const x = (db - min) / (max - min);
+      return Math.min(1, Math.max(0, x));
+    };
+    const fill = norm(levelDbfs);
+    const tpos = norm(thresholdDbfs);
+    return (
+      <div
+        style={{
+          position: "relative",
+          background: "#0a0a0a",
+          padding: "10px 12px",
+          borderRadius: 10,
+        }}
+      >
+        <div style={{ color: "#9ef99f", fontWeight: 600, marginBottom: 6 }}>
+          Volume
+        </div>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: `repeat(${bars}, 1fr)`,
+            gap: 4,
+          }}
+        >
+          {Array.from({ length: bars }).map((_, i) => {
+            const lit = i / (bars - 1) <= fill;
+            return (
+              <div
+                key={i}
+                style={{
+                  height,
+                  borderRadius: 4,
+                  background: lit ? "#22c55e" : "#184a1d",
+                  transition: "background 80ms linear",
+                }}
+              />
+            );
+          })}
+        </div>
+        <div
+          style={{
+            position: "absolute",
+            left: `${tpos * 100}%`,
+            top: 34,
+            transform: "translateX(0%)",
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            pointerEvents: "none",
+          }}
+        >
+          <div
+            style={{
+              width: 6,
+              height: height + 10,
+              background: "#9ef99f",
+              borderRadius: 2,
+              opacity: 0.9,
+            }}
+          />
+          <div style={{ color: "#9ef99f", fontSize: 12, opacity: 0.9 }}>
+            {Math.round(thresholdDbfs)} dB
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  /* ---------- Camera sizing + intrinsics (fx/fy) updates ---------- */
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
 
-    const updateOpts = () => {
+    const updateIntrinsicsAndOpts = () => {
       const w = v.videoWidth || 1280;
+      const h = v.videoHeight || 720;
+
+      // TinyFaceDetector tuning based on current video width
       tinyOptsRef.current = new faceapi.TinyFaceDetectorOptions({
         inputSize: pickInputSize(w),
-        scoreThreshold: 0.3,
+        scoreThreshold: 0.4,
       });
+
+      // Update camera intrinsics from current FOVs
+      // (fovHdeg / fovVdeg come from the Camera Alignment sliders)
+      camFxRef.current = focalFromFov(w, fovHdeg);
+      camFyRef.current = focalFromFov(h, fovVdeg);
     };
 
-    v.addEventListener("loadedmetadata", updateOpts);
-    v.addEventListener("resize", updateOpts);
-    updateOpts();
+    // Run on metadata (dimensions become known) and on resize
+    v.addEventListener("loadedmetadata", updateIntrinsicsAndOpts);
+    v.addEventListener("resize", updateIntrinsicsAndOpts);
+
+    // Run once immediately (in case metadata already loaded)
+    updateIntrinsicsAndOpts();
 
     return () => {
-      v.removeEventListener("loadedmetadata", updateOpts);
-      v.removeEventListener("resize", updateOpts);
+      v.removeEventListener("loadedmetadata", updateIntrinsicsAndOpts);
+      v.removeEventListener("resize", updateIntrinsicsAndOpts);
     };
-  }, [ready, videoId]);
+    // Recompute if FOV knobs change, or when camera/ready state changes
+  }, [ready, videoId, fovHdeg, fovVdeg]);
 
-  // when camera changes, load that camera’s greenMaxM
-  useEffect(() => {
-    try {
-      const gm = localStorage.getItem(`ika:greenMaxM:${videoId || 'default'}`);
-      if (gm != null) {
-        const v = parseFloat(gm);
-        if (Number.isFinite(v)) setGreenMaxM(Math.min(2.0, Math.max(0.3, v)));
-      }
-    } catch {}
-  }, [videoId]);
-
-  // init: backend, models, camera
+  /* ---------- Init: TFJS backend, face models, camera ---------- */
   useEffect(() => {
     let cancelled = false;
-
     (async () => {
       try {
-        // 1) TFJS backend selection
-        //    Set paths BEFORE selecting the wasm backend
         setWasmPaths("/tfjs-backend-wasm/");
-
         const tryBackend = async (name) => {
           try {
             await tf.setBackend(name);
@@ -450,15 +1765,16 @@ export default function App(){
             return false;
           }
         };
-
-        // Prefer GPU → WASM → CPU
         let ok = await tryBackend("webgl");
         if (!ok) ok = await tryBackend("wasm");
         if (!ok) await tryBackend("cpu");
+        if (!cancelled) setBackend(tf.getBackend());
 
-        if (!cancelled) setBackend(tf.getBackend()); // "webgl" | "wasm" | "cpu"
+        // mark TFJS backend as ready for the frame loop
+        backendNameRef.current = tf.getBackend();
+        setBackend(backendNameRef.current);       // keep your UI/backend label in sync
+        backendReadyRef.current = Promise.resolve();
 
-        // 2) Load face-api models
         await Promise.all([
           faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
           faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
@@ -467,21 +1783,18 @@ export default function App(){
           faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
         ]);
 
-        // 3) Camera + ready
         await startCamera();
 
-        // warm-up: one tiny pass so first real frame isn't JIT-laggy
+        // warm-up pass
         try {
           const off = document.createElement("canvas");
-          off.width = 128; off.height = 128;
+          off.width = 128;
+          off.height = 128;
           await faceapi.detectAllFaces(
             off,
-            new faceapi.TinyFaceDetectorOptions({ inputSize: 128, scoreThreshold: 0.5 })
+            new faceapi.TinyFaceDetectorOptions({ inputSize: 128, scoreThreshold: 0.4 })
           );
         } catch {}
-
-        // kick an OPTIONS preflight early (non-fatal if it fails)
-        try { fetch(N8N.stt, { method: "OPTIONS" }).catch(() => {}); } catch {}
 
         if (!cancelled) setReady(true);
       } catch (e) {
@@ -490,111 +1803,296 @@ export default function App(){
       }
     })();
 
-    // cleanup
     return () => {
       cancelled = true;
       userMicOffRef.current = true;
-      stopAll({ reset: true, reason: "unmount" });
+      stopAll({ reason: "unmount" });
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // --- HandLandmarker (force CPU, IMAGE mode for smoke test) ---
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const fileset = await FilesetResolver.forVisionTasks("/mp"); // <-- local
+
+       // quick preflight to catch path/header issues in Netlify logs
+       try {
+         const head = await fetch("/mp/hand_landmarker.task", { method: "HEAD", cache: "no-store" });
+         console.log("[hands] model reachable:", head.ok, head.status, head.headers.get("content-type"));
+       } catch (e) { console.warn("[hands] model HEAD failed:", e); }
+
+       const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+        const lm = await HandLandmarker.createFromOptions(fileset, {
+          baseOptions: { modelAssetPath: HANDS_MODEL_URL, delegate: isSafari ? "CPU" : "GPU" },
+          runningMode: "VIDEO",
+          numHands: HANDS_MAX_NUM,
+          minHandDetectionConfidence: 0.03,
+          minHandPresenceConfidence: 0.03,
+          minTrackingConfidence: 0.03,
+        });
+        if (cancelled) { lm.close?.(); return; }
+
+        handLmRef.current = lm;
+        handsReadyRef.current = true;
+
+        const c = document.createElement("canvas");
+        c.width = HANDS_IMAGE_SIDE;
+        c.height = HANDS_IMAGE_SIDE;
+        handsOffscreenRef.current = c;
+        handsCtxRef.current = c.getContext("2d", { willReadFrequently: true });
+
+        console.log("[hands] ready (", isSafari ? "CPU" : "GPU", ", VIDEO)");
+      } catch (e) {
+        console.warn("[hands] init failed:", e);
+        handLmRef.current = null;
+        handsReadyRef.current = false;
+      }
+    })();
+    return () => {
+      cancelled = true;
+      try { handLmRef.current?.close?.(); } catch {}
+      handLmRef.current = null;
+      handsReadyRef.current = false;
     };
   }, []);
 
-  // Load labels and build FaceMatcher
+  /* ---------- Labels + matcher ---------- */
   useEffect(() => {
     if (!ready) return;
-
     let cancelled = false;
-
     (async () => {
       try {
         const res = await fetch(LABELS_URL, { cache: "no-store" });
         const data = await res.json();
 
-        // Accept a few common shapes:
-        // 1) [{ label, descriptors: [ [..128], [..128], ... ] }]
-        // 2) { "Alice": [ [..128], [..128] ], "Bob": [ [..128] ] }
-        // 3) [{ label, descriptors_b64: ["...","..."] }]  // Uint8 -> base64 (0..255) using your quantizer
-
         const entries = Array.isArray(data)
           ? data
-          : Object.entries(data).map(([label, descriptors]) => ({ label, descriptors }));
+          : Object.entries(data).map(([label, descriptors]) => ({
+              label,
+              descriptors,
+            }));
 
         const labeled = await Promise.all(
           entries.map(async (e) => {
             let descs = [];
-
             if (Array.isArray(e.descriptors_b64)) {
-              // quantized uint8 → Float32 using your helpers
-              descs = e.descriptors_b64.map((b64) => decodeDescU8ToFloat32(b64ToU8(b64)));
+              descs = e.descriptors_b64.map((b64) =>
+                decodeDescU8ToFloat32(b64ToU8(b64))
+              );
             } else if (Array.isArray(e.descriptors)) {
-              // arrays of numbers
               descs = e.descriptors.map((arr) =>
                 arr instanceof Float32Array ? arr : new Float32Array(arr)
               );
-            } else {
-              descs = [];
             }
-
-            // filter bad lengths; face-api expects 128
             descs = descs.filter((d) => d && d.length === 128);
-
             return new faceapi.LabeledFaceDescriptors(e.label, descs);
           })
         );
 
-        // Only keep labels that have at least one descriptor
         const usable = labeled.filter((l) => l.descriptors?.length);
         const matcher = new faceapi.FaceMatcher(usable, MATCH_THRESHOLD);
 
         if (!cancelled) {
           faceMatcherRef.current = matcher;
-          setKnownCount(usable.reduce((acc, l) => acc + l.descriptors.length, 0));
+                    setKnownCount(
+            usable.reduce((acc, l) => acc + l.descriptors.length, 0)
+          );
         }
       } catch (err) {
-        console.warn("[labels] failed to load/build matcher:", err);
+        console.warn("[labels] failed:", err);
         if (!cancelled) {
           faceMatcherRef.current = null;
           setKnownCount(0);
         }
       }
     })();
-
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [ready]);
 
-  // ------------------------------ STT result hook ------------------------------
+  /* ---------- Preferences & devices ---------- */
+  useEffect(() => {
+    (async () => {
+      try {
+        const vId = localStorage.getItem("ika:videoId") || "";
+        if (vId) setVideoId(vId);
+        const aId = localStorage.getItem("ika:audioId") || "";
+        if (aId) setAudioId(aId);
+        const gm =
+          localStorage.getItem(`ika:greenMaxM:${vId || "default"}`) ??
+          localStorage.getItem("ika:greenMaxM");
+        if (gm != null) {
+          const val = parseFloat(gm);
+          if (Number.isFinite(val))
+            setGreenMaxM(Math.min(2.0, Math.max(0.3, val)));
+        }
+      } catch {}
+      try {
+        const list = await navigator.mediaDevices.enumerateDevices();
+        setAudioDevs(list.filter((d) => d.kind === "audioinput"));
+        setVideoDevs(list.filter((d) => d.kind === "videoinput"));
+      } catch {}
+    })();
+  }, []);
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        `ika:greenMaxM:${videoId || "default"}`,
+        String(greenMaxM)
+      );
+    } catch {}
+  }, [greenMaxM, videoId]);
+
+  // restore guest memory
+  useEffect(() => {
+    const data = pruneByRetention(loadGuestMem());
+    if (data && Array.isArray(data.items)) {
+      guestSeqRef.current = Math.max(1, Number(data.seq) || 1);
+      guestMemRef.current = data.items.map((it) => ({
+        id: it.id,
+        ts: it.ts || Date.now(),
+        desc: decodeDescU8ToFloat32(b64ToU8(it.desc)),
+      }));
+    } else {
+      guestSeqRef.current = 1;
+      guestMemRef.current = [];
+      saveGuestMem({});
+    }
+
+    if (GUEST_RETENTION_DAYS === 1) {
+      const t = setTimeout(() => {
+        guestSeqRef.current = 1;
+        guestMemRef.current = [];
+        saveGuestMem({ day: dayKey(), seq: 1, mem: [] });
+      }, msToNextMidnight());
+      return () => clearTimeout(t);
+    }
+  }, []);
+
+  // unlock audio on first gesture (iOS/Safari)
+  const [audioUnlocked, setAudioUnlocked] = useState(false);
+  useEffect(() => {
+    if (audioUnlocked) return;
+    const unlock = async () => {
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)({
+          latencyHint: "interactive",
+        });
+        await ctx.resume();
+        await ctx.close();
+        setAudioUnlocked(true);
+        window.removeEventListener("touchend", unlock);
+        window.removeEventListener("click", unlock);
+      } catch {}
+    };
+    window.addEventListener("touchend", unlock, { once: true });
+    window.addEventListener("click", unlock, { once: true });
+    return () => {
+      window.removeEventListener("touchend", unlock);
+      window.removeEventListener("click", unlock);
+    };
+  }, [audioUnlocked]);
+
+  // load per-camera greenMaxM
+  useEffect(() => {
+    try {
+      const gm = localStorage.getItem(`ika:greenMaxM:${videoId || "default"}`);
+      if (gm != null) {
+        const v = parseFloat(gm);
+        if (Number.isFinite(v)) setGreenMaxM(Math.min(2.0, Math.max(0.3, v)));
+      }
+    } catch {}
+  }, [videoId]);
+
+  // hot-plug devices
+  useEffect(() => {
+    const onChange = async () => {
+      try {
+        const list = await navigator.mediaDevices.enumerateDevices();
+        setAudioDevs(list.filter((d) => d.kind === "audioinput"));
+        setVideoDevs(list.filter((d) => d.kind === "videoinput"));
+      } catch {}
+    };
+    navigator.mediaDevices?.addEventListener?.("devicechange", onChange);
+    return () => {
+      navigator.mediaDevices?.removeEventListener?.("devicechange", onChange);
+    };
+  }, []);
+
+  // keyboard nudges for green zone
+  useEffect(() => {
+    const onKey = (e) => {
+      const tag = (document.activeElement?.tagName || "").toUpperCase();
+      if (["INPUT", "TEXTAREA", "SELECT"].includes(tag)) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (e.key === "[")
+        setGreenMaxM((v) => Math.max(0.3, +(v - 0.05).toFixed(2)));
+      else if (e.key === "]")
+        setGreenMaxM((v) => Math.min(2.0, +(v + 0.05).toFixed(2)));
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // visibility → stop
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.hidden) {
+        userMicOffRef.current = true;
+        stopAll({ reason: "visibility" });
+      }
+    };
+    const onPageHide = () => {
+      userMicOffRef.current = true;
+      stopAll({ reason: "pagehide" });
+    };
+    const onBeforeUnload = () => {
+      try {
+        const rec = audioRef.current?.vad?.recorder;
+        if (rec && rec.state === "recording") rec.stop();
+      } catch {}
+      try {
+        if (audioRef.current.raf) cancelAnimationFrame(audioRef.current.raf);
+      } catch {}
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("beforeunload", onBeforeUnload);
+    };
+  }, []);
+
+  /* ---------- STT hook (called after utterance upload) ---------- */
   async function handleTranscriptResult(resp) {
     const txt = (resp?.text ?? "").trim();
     if (!txt || txt.length < MIN_NONEMPTY_CHARS) {
-      setEmptyTranscripts(c => {
+      setEmptyTranscripts((c) => {
         const next = c + 1;
         if (autoDetectOn && next >= MAX_EMPTY_BEFORE_AUTOCAL) {
           setTimeout(() => setEmptyTranscripts(0), 0);
-          maybeAutoCalibrate("consecutive-empty");
+          maybeAutoCalibrate();
         }
         return next;
       });
       return;
     }
-
     setEmptyTranscripts(0);
-
     try {
-      await fetch(N8N.say, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          sessionId: S.current.id || "default",
-          text: txt
-        })
-      });
+      server.sendText(txt);
     } catch {}
   }
 
-  // Stable autoCalibrate (unchanged)
+  /* ---------- Auto-calibrate ---------- */
   const autoCalibrate = useCallback(async () => {
     const a = audioRef.current;
     if (!a?.analyser || a.analyser.fftSize <= 0) return;
-
     const analyser = a.analyser;
     const origSmoothing = analyser.smoothingTimeConstant ?? 0;
     analyser.smoothingTimeConstant = 0;
@@ -624,33 +2122,7 @@ export default function App(){
 
     analyser.smoothingTimeConstant = origSmoothing;
   }, []);
-
-  // Track previous value so we only react to a true toggle (false -> true)
-  const prevAutoDetectOn = useRef(autoDetectOn);
-
-  // If user turns Auto-calibrate ON while mic is already running, run one calibration immediately
-  useEffect(() => {
-    const was = prevAutoDetectOn.current;
-    prevAutoDetectOn.current = autoDetectOn; // update for next run
-
-    // Only when toggled OFF -> ON (not on first mount)
-    if (!was && autoDetectOn && micOnRef.current && audioRef.current?.analyser && !speakingRef.current) {
-      // Also skip if we just auto-calibrated very recently (cooldown)
-      if (Date.now() - (lastAutoCalRef.current || 0) < 1000) return;
-
-      (async () => {
-        setIsPressed(true);
-        try {
-          await autoCalibrate();
-          lastAutoCalRef.current = Date.now();
-        } finally {
-          setTimeout(() => setIsPressed(false), 250);
-        }
-      })();
-    }
-  }, [autoDetectOn, autoCalibrate]);
-
-  async function maybeAutoCalibrate(reason = "auto"){
+  async function maybeAutoCalibrate() {
     if (!autoDetectOnRef.current) return;
     if (!micOnRef.current) return;
     const isRecording = !!audioRef.current?.vad?.recording;
@@ -659,261 +2131,56 @@ export default function App(){
     if (now - lastAutoCalRef.current < AUTO_CAL_MIN_GAP_MS) return;
     lastAutoCalRef.current = now;
     setIsPressed(true);
-    try { await autoCalibrate(); } finally { setTimeout(()=>setIsPressed(false), 250); }
-  }
-
-  const [sessionStatus, setSessionStatus] = useState("IDLE");
-  const [sessionId, setSessionId] = useState(null);
-  const [posts, setPosts] = useState({ start:0, snapshot:0, stop:0 });
-  const [lastSent, setLastSent] = useState({ start:"-", snapshot:"-", stop:"-" });
-  const [lastHttp, setLastHttp] = useState({ start:"", snapshot:"", stop:"" });
-  const [totals, setTotals] = useState({ all:0, green:0, red:0 });
-
-  /* ---------- Devices (audio + video) ---------- */
-  const [micOn, setMicOn] = useState(false);
-  const micOnRef = useRef(false);
-  useEffect(() => { micOnRef.current = micOn; }, [micOn]);
-
-  const [dbfs, setDbfs] = useState(-60);
-  const [threshold, setThreshold] = useState(-45);
-  const [listenMs, setListenMs]   = useState(400);
-  const [silenceMs, setSilenceMs] = useState(500);
-
-  const [audioDevs, setAudioDevs] = useState([]);
-  const [videoDevs, setVideoDevs] = useState([]);
-  const [audioId, setAudioId] = useState("");
-
-  const audioRef = useRef({
-    ctx:null, stream:null, source:null, analyser:null, raf:0,
-    vad: { highSince:0, lowSince:0, recording:false, recorder:null, chunks:[], startTs:0, failedStarts:0 }
-  });
-  const camRef   = useRef({ stream:null });
-
-  // Auto-control mic based on session status
-  useEffect(() => {
-    if (!ready) return;
-
-    if (sessionStatus === "ACTIVE") {
-      if (!micOn && !userMicOffRef.current) startMic().catch(() => {});
-    } else {
-      if (micOn)  stopMic().catch(() => {});
-    }
-  }, [sessionStatus, ready, micOn]);
-
-  const [table, setTable] = useState(
-    Array.from({length:5}, (_,i)=>({ idx:i+1, gender:"-", ageGroup:"-", zone:"-", name:"-", distance:"-" }))
-  );
-
-  const faceMatcherRef = useRef(null);
-  const [knownCount, setKnownCount] = useState(0);
-
-  const recentMapRef = useRef({});
-  // Session state (ID, frame counters, timers)
-  const S = useRef({ id: null, seenFrames: 0, lastFaceTs: 0, lastSnapshotTs: 0 });
-
-  // --- keyboard nudges for green zone distance ---
-    useEffect(() => {
-      const onKey = (e) => {
-        const tag = (document.activeElement?.tagName || "").toUpperCase();
-        if (["INPUT","TEXTAREA","SELECT"].includes(tag)) return;
-        if (e.ctrlKey || e.metaKey || e.altKey) return;
-
-        if (e.key === '[') {
-          setGreenMaxM(v => Math.max(0.3, +(v - 0.05).toFixed(2)));
-        } else if (e.key === ']') {
-          setGreenMaxM(v => Math.min(2.0, +(v + 0.05).toFixed(2)));
-        }
-      };
-      window.addEventListener('keydown', onKey);
-      return () => window.removeEventListener('keydown', onKey);
-    }, []);
-
-  // live refs so tick sees latest slider values (prevents stale closures in tick)
-  const thresholdRef = useRef(threshold);
-  const listenMsRef  = useRef(listenMs);
-  const silenceMsRef = useRef(silenceMs);
-
-  useEffect(() => { thresholdRef.current = threshold; }, [threshold]);
-  useEffect(() => { listenMsRef.current  = listenMs;  }, [listenMs]);
-  useEffect(() => { silenceMsRef.current = silenceMs; }, [silenceMs]);
-
-  useEffect(() => {
-    try { localStorage.setItem(`ika:greenMaxM:${videoId || 'default'}`, String(greenMaxM)); } catch {}
-  }, [greenMaxM, videoId]);
-
-  useEffect(() => {
-  // Restore guest memory
-  const data = pruneByRetention(loadGuestMem());
-  if (data && Array.isArray(data.items)) {
-    guestSeqRef.current = Math.max(1, Number(data.seq) || 1);
-    guestMemRef.current = data.items.map(it => ({
-      id: it.id,
-      ts: it.ts || Date.now(),
-      desc: decodeDescU8ToFloat32(b64ToU8(it.desc))
-    }));
-  } else {
-    guestSeqRef.current = 1;
-    guestMemRef.current = [];
-    saveGuestMem({}); // write fresh day
-  }
-
-  // Schedule automatic reset at local midnight if daily mode
-  if (GUEST_RETENTION_DAYS === 1) {
-    const t = setTimeout(() => {
-      guestSeqRef.current = 1;
-      guestMemRef.current = [];
-      saveGuestMem({ day: dayKey(), seq: 1, mem: [] });
-    }, msToNextMidnight());
-    return () => clearTimeout(t);
-  }
-}, []);
-
-  /* ====================== tap to enable audio ====================== */
-const [audioUnlocked, setAudioUnlocked] = useState(false);
-      useEffect(() => {
-        if (audioUnlocked) return;
-        const unlock = async () => {
-          try {
-            const ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
-            await ctx.resume();  // gesture-initiated
-            await ctx.close();
-            setAudioUnlocked(true);
-            window.removeEventListener("touchend", unlock);
-            window.removeEventListener("click", unlock);
-          } catch {}
-        };
-        window.addEventListener("touchend", unlock, { once:true });
-        window.addEventListener("click",    unlock, { once:true });
-        return () => {
-          window.removeEventListener("touchend", unlock);
-          window.removeEventListener("click", unlock);
-        };
-      }, [audioUnlocked]);
-
-  // init: load prefs once, using the *stored* videoId to pick per-camera greenMaxM
-  useEffect(() => {
-    (async () => {
-      try {
-        const t   = localStorage.getItem("ika:threshold");
-        const vId = localStorage.getItem("ika:videoId") || ""; // read first
-        const gm  = (
-          localStorage.getItem(`ika:greenMaxM:${vId || 'default'}`) ??
-          localStorage.getItem("ika:greenMaxM") // legacy fallback
-        );
-        const l   = localStorage.getItem("ika:listenMs");
-        const s   = localStorage.getItem("ika:silenceMs");
-        const a   = localStorage.getItem("ika:audioId");
-        const aut = localStorage.getItem("ika:autoDetectOn");
-
-        if (t !== null) setThreshold(Number(t));
-        if (gm !== null) {
-          const val = parseFloat(gm);
-          if (Number.isFinite(val)) setGreenMaxM(Math.min(2.0, Math.max(0.3, val)));
-        }
-        if (l !== null) setListenMs(Number(l));
-        if (s !== null) setSilenceMs(Number(s));
-        if (a) setAudioId(a);
-        // set videoId *after* we used vId to load per-camera greenMaxM
-        if (vId) setVideoId(vId);
-        if (aut != null) setAutoDetectOn(aut === "true");
-      } catch {}
-
-      try {
-        const list = await navigator.mediaDevices.enumerateDevices();
-        setAudioDevs(list.filter(d => d.kind === "audioinput"));
-        setVideoDevs(list.filter(d => d.kind === "videoinput"));
-      } catch {}
-    })();
-  }, []);
-
-  // React to device hot-plug
-  useEffect(() => {
-    const onChange = async () => {
-      try {
-        const list = await navigator.mediaDevices.enumerateDevices();
-        setAudioDevs(list.filter(d => d.kind === "audioinput"));
-        setVideoDevs(list.filter(d => d.kind === "videoinput"));
-      } catch {}
-    };
-
-    if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener === "function") {
-      navigator.mediaDevices.addEventListener("devicechange", onChange);
-    }
-
-    return () => {
-      if (navigator.mediaDevices && typeof navigator.mediaDevices.removeEventListener === "function") {
-        navigator.mediaDevices.removeEventListener("devicechange", onChange);
-      }
-    };
-  }, []);
-
-  // --- POLL IKA "speaking" (read-only; VAD uses this to pause) ---
-  useEffect(() => {
-  if (!sessionId) return;
-  let alive = true;
-  let timer = 0;
-
-  const INTERVAL_ON_MS  = 900;
-  const INTERVAL_OFF_MS = 2500;
-  const jitter = () => 40 + Math.floor(Math.random() * 120);
-
-  const tick = async () => {
-    if (!alive) return;
-    const everyMs = (micOn ? INTERVAL_ON_MS : INTERVAL_OFF_MS) + jitter();
-
     try {
-      const url = `${N8N.speaking}?sessionId=${encodeURIComponent(sessionId)}&t=${Date.now()}`;
-      const r = await fetch(url, { cache: "no-store" });
-      const j = await r.json().catch(() => ({}));
-      if (!alive) return;
-      speakingRef.current = !!j.speaking;
-    } catch {
-      speakingRef.current = false;
+      await autoCalibrate();
+    } finally {
+      setTimeout(() => setIsPressed(false), 250);
     }
+  }
 
-    if (alive) timer = window.setTimeout(tick, everyMs);
-  };
-
-  timer = window.setTimeout(tick, 100);
-  return () => { alive = false; window.clearTimeout(timer); };
-}, [sessionId, micOn]);
-
-  // Persist prefs
-  useEffect(()=>{ try{ localStorage.setItem("ika:threshold", String(threshold)); }catch{} },[threshold]);
-  useEffect(()=>{ try{ localStorage.setItem("ika:listenMs", String(listenMs)); }catch{} },[listenMs]);
-  useEffect(()=>{ try{ localStorage.setItem("ika:silenceMs", String(silenceMs)); }catch{} },[silenceMs]);
-  useEffect(()=>{ try{ localStorage.setItem("ika:audioId", audioId||""); }catch{} },[audioId]);
-  useEffect(()=>{ try{ localStorage.setItem("ika:videoId", videoId||""); }catch{} },[videoId]);
-  useEffect(()=>{ try{ localStorage.setItem("ika:autoDetectOn", String(autoDetectOn)); }catch{} },[autoDetectOn]);
-
+  /* ---------- Mic control & VAD ---------- */
   async function stopMic() {
-    // If we’re already stopped, just ensure UI is quiet and bail
-    if (!audioRef.current?.stream && !micOn) {
-      setMicOn(false);
-      setDbfs(-60);
-      return;
-    }
+  if (!audioRef.current?.stream && !micOn) {
+    setMicOn(false);
+    setDbfs(-60);
 
+    // schedule standby after MIC_IDLE_MS
+    if (micIdleToStandbyTimerRef.current) clearTimeout(micIdleToStandbyTimerRef.current);
+    micIdleToStandbyTimerRef.current = setTimeout(() => {
+      if (!micOnRef.current && isCamLive()) {
+        setSessionStatus("STANDBY");
+      }
+      micIdleToStandbyTimerRef.current = null;
+    }, MIC_IDLE_MS);
+
+    return;
+  }
     try {
       if (audioRef.current.raf) cancelAnimationFrame(audioRef.current.raf);
     } catch {}
-
     try {
       const rec = audioRef.current?.vad?.recorder;
       if (rec && rec.state === "recording") {
-        try { rec.requestData?.(); } catch {}
-        try { rec.stop(); } catch {}
+        try {
+          rec.requestData?.();
+        } catch {}
+        try {
+          rec.stop();
+        } catch {}
       }
     } catch {}
-
-    try { audioRef.current.stream?.getTracks()?.forEach(t => t.stop()); } catch {}
-    try { await audioRef.current.ctx?.close(); } catch {}
-    try { audioRef.current.source?.disconnect?.(); } catch {}
-    try { audioRef.current.analyser?.disconnect?.(); } catch {}
-
-    // Help GC + make sure the next cancelAnimationFrame wouldn't miss
-    audioRef.current.source   = null;
-    audioRef.current.analyser = null;
+    try {
+      audioRef.current.stream?.getTracks()?.forEach((t) => t.stop());
+    } catch {}
+    try {
+      await audioRef.current.ctx?.close();
+    } catch {}
+    try {
+      audioRef.current.source?.disconnect?.();
+    } catch {}
+    try {
+      audioRef.current.analyser?.disconnect?.();
+    } catch {}
 
     audioRef.current = {
       ctx: null,
@@ -922,380 +2189,326 @@ const [audioUnlocked, setAudioUnlocked] = useState(false);
       analyser: null,
       raf: 0,
       deviceId: "",
-      vad: { highSince:0, lowSince:0, recording:false, recorder:null, chunks:[], startTs:0, failedStarts:0 }
+      vad: {
+        highSince: 0,
+        lowSince: 0,
+        recording: false,
+        recorder: null,
+        chunks: [],
+        startTs: 0,
+        failedStarts: 0,
+      },
     };
-
     setMicOn(false);
     setDbfs(-60);
+    
+    // schedule standby after MIC_IDLE_MS
+    if (micIdleToStandbyTimerRef.current) clearTimeout(micIdleToStandbyTimerRef.current);
+    micIdleToStandbyTimerRef.current = setTimeout(() => {
+      if (!micOnRef.current && isCamLive()) {
+        setSessionStatus("STANDBY");
+      }
+      micIdleToStandbyTimerRef.current = null;
+    }, MIC_IDLE_MS);
   }
 
   async function startMic(id = audioId, { force = false } = {}) {
-  // if already running with same device, skip; otherwise restart
-  if (audioRef.current?.stream) {
-    const same = (id || "") === (audioRef.current.deviceId || "");
-    if (!force && same) {
-      console.log("[Mic] already running on selected device");
+    // 👉 if a standby timer was queued by stopMic, cancel it now
+    if (micIdleToStandbyTimerRef.current) {
+      clearTimeout(micIdleToStandbyTimerRef.current);
+      micIdleToStandbyTimerRef.current = null;
+    }
+
+    if (audioRef.current?.stream) {
+      const same = (id || "") === (audioRef.current.deviceId || "");
+      if (!force && same) {
+        console.log("[Mic] already running");
+        // ensure status reflects live mic
+        setSessionStatus(isCamLive() ? "ACTIVE" : "STANDBY");
+        return;
+      }
+      await stopMic();
+    }
+
+    // stream
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: id ? { exact: id } : undefined,
+          noiseSuppression: true,
+          echoCancellation: true,
+          autoGainControl: true,
+          channelCount: 1,
+          sampleRate: 48000,
+          sampleSize: 16,
+        },
+        video: false,
+      });
+    } catch (e) {
+      console.error("[Mic] permission/error:", e);
+      setMicOn(false);
       return;
     }
-    await stopMic();
-  }
 
-  // get mic
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        deviceId: id ? { exact: id } : undefined,
-        noiseSuppression: true,
-        echoCancellation: true,
-        autoGainControl: true,
-        channelCount: 1,
-        sampleRate: 48000,
-        sampleSize: 16,
-      },
-      video: false
+    // audio graph
+    const ctx = new (window.AudioContext || window.webkitAudioContext)({
+      sampleRate: 48000,
+      latencyHint: "interactive",
     });
-  } catch (e) {
-    console.error("[Mic] permission/error:", e);
-    setMicOn(false);
-    return; // bail if user blocks mic or no device
-  }
+    try {
+      await ctx.resume();
+    } catch {}
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    source.connect(analyser);
 
-  // wire up audio graph
-  const ctx = new (window.AudioContext || window.webkitAudioContext)({
-    sampleRate: 48000,
-    latencyHint: "interactive"
- });
-  try { await ctx.resume(); } catch {}
-  const source = ctx.createMediaStreamSource(stream);
-  const analyser = ctx.createAnalyser();
-  analyser.fftSize = 512; // still stable, half the work
-  source.connect(analyser);
+    audioRef.current = {
+      ctx,
+      stream,
+      source,
+      analyser,
+      raf: 0,
+      deviceId: id || "",
+      vad: {
+        highSince: 0,
+        lowSince: 0,
+        recording: false,
+        recorder: null,
+        chunks: [],
+        startTs: 0,
+        failedStarts: 0,
+      },
+    };
+    setMicOn(true);
+    setSessionStatus(isCamLive() ? "ACTIVE" : "STANDBY");
 
-  // store refs
-  audioRef.current = {
-    ctx,
-    stream,
-    source,
-    analyser,
-    raf: 0,
-    deviceId: id || "",
-    vad: {
-      highSince: 0, lowSince: 0, recording: false,
-      recorder: null, chunks: [], startTs: 0, failedStarts: 0
-    }
-  };
-  setMicOn(true);
-  // Auto-calibrate once on mic start if enabled
-  if (autoDetectOnRef.current && !speakingRef.current) {
-    setTimeout(async () => {
-      // double-check stream/analyser still exist
-      if (!audioRef.current?.stream || !audioRef.current?.analyser) return;
-      setIsPressed(true);
-      try {
-        await autoCalibrate();
-        lastAutoCalRef.current = Date.now();
-      } finally {
-        setTimeout(() => setIsPressed(false), 250);
-      }
-    }, 350);
-  }
-
-  // choose recorder MIME
-  let mimeType = "";
-  const ua = navigator.userAgent || "";
-  const isiOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-  const isSafari = /^((?!chrome|android).)*safari/i.test(ua);
-
-  if (typeof MediaRecorder !== "undefined") {
-    
-    if (!isiOS && MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) {
-      mimeType = "audio/webm;codecs=opus";
-    } else if (!isiOS && MediaRecorder.isTypeSupported("audio/webm")) {
-      mimeType = "audio/webm";
-    } else if (!isiOS && MediaRecorder.isTypeSupported("audio/ogg;codecs=opus")) {
-      mimeType = "audio/ogg;codecs=opus";
-    } else if ((isiOS || isSafari) && MediaRecorder.isTypeSupported("audio/mp4")) {
-      // iOS Safari tends to only allow MP4/AAC
-      mimeType = "audio/mp4";
-    } else if (MediaRecorder.isTypeSupported("audio/mp4")) {
-      mimeType = "audio/mp4";
-    } else {
-      // last resort: let the browser pick; it may still work
-      mimeType = "";
-    }
-  }
-
-  // VAD buffers and smoothing
-  const buf = new Float32Array(analyser.fftSize);
-  const EMA = 0.25;
-  let smooth = -60;
-
-  const tick = () => {
-    analyser.getFloatTimeDomainData(buf);
-    let sum = 0;
-    for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-    const rms = Math.sqrt(sum / buf.length) || 0.0000001;
-    let d = 20 * Math.log10(rms);
-    if (!isFinite(d)) d = -120;
-
-    // UI smoothing
-    smooth = smooth === -60 ? d : (EMA * d + (1 - EMA) * smooth);
-    setDbfs(smooth);
-
-    const vad   = audioRef.current.vad;
-    const nowTs = performance.now();
-
-    // live refs (avoid stale closure)
-    const thr        = thresholdRef.current;
-    const minKeepMs  = Math.max(400, listenMsRef.current);
-    const silenceDur = silenceMsRef.current;
-
-    // choose raw for edges; use 'smooth' if you prefer extra inertia
-    const edgeLevel = d;
-    const isLoud    = edgeLevel >= thr;
-
-    // pause VAD while bot is speaking
-    if (speakingRef.current) {
-      if (vad.recording) {
-        const rec = vad.recorder;
-        if (rec && rec.state === "recording") {
-          try { rec.requestData?.(); } catch {}
-          try { rec.stop(); } catch {}
+    // optional initial auto-cal
+    if (autoDetectOnRef.current && !speakingRef.current) {
+      setTimeout(async () => {
+        if (!audioRef.current?.stream || !audioRef.current?.analyser) return;
+        setIsPressed(true);
+        try {
+          await autoCalibrate();
+          lastAutoCalRef.current = Date.now();
+        } finally {
+          setTimeout(() => setIsPressed(false), 250);
         }
-        vad.recording = false;
-        vad.recorder  = null;
-        vad.chunks    = [];
-        vad.startTs   = 0;
-      }
-      audioRef.current.raf = requestAnimationFrame(tick);
-      return;
+      }, 350);
     }
 
-    // hysteresis
-    const HYSTERESIS_DB = 2;
-    const QUICK_STOP_DB = 8;      // stop if we fall this far below thr
-    const QUICK_STOP_MS = 220;    // ...for at least this long
-    const riseEdge = edgeLevel >=  thr;
-    const fallEdge = edgeLevel <  (thr - HYSTERESIS_DB);
-    if (isLoud && !vad.highSince) { vad.highSince = nowTs; vad.lowSince = 0; }
-
-    // START
-    if (riseEdge && !vad.recording) {
-      try {
-        if (typeof MediaRecorder !== "undefined") {
-          const rec = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-          vad.recorder  = rec;
-          vad.chunks    = [];
-          vad.startTs   = nowTs;
-          vad.recording = true;
-          vad.lowSince  = 0;
-
-          rec.ondataavailable = (e) => { if (e.data?.size) vad.chunks.push(e.data); };
-
-          rec.onstop = async () => {
-            try {
-              const blob = new Blob(vad.chunks, { type: rec.mimeType || mimeType || "audio/webm" });
-              const dur  = performance.now() - vad.startTs;
-
-              if (dur < minKeepMs) {
-                vad.failedStarts = (vad.failedStarts || 0) + 1;
-                if (autoDetectOnRef.current && vad.failedStarts >= FAILED_STARTS_BEFORE_AUTOCAL) {
-                  vad.failedStarts = 0;
-                  maybeAutoCalibrate("failed-starts");
-                }
-                return;
-              }
-              vad.failedStarts = 0;
-
-              const fd = new FormData();
-              fd.append("sessionId", S.current.id || "default");
-              fd.append("language", "en-US");
-              fd.append("thresholdDb", String(Math.round(thr)));
-              fd.append("listenMs", String(listenMsRef.current));
-              fd.append("silenceMs", String(silenceMsRef.current));
-              fd.append("audio", blob, `utterance.${blob.type.includes("webm") ? "webm" : "mp4"}`);
-              const res = await fetch(N8N.stt, { method: "POST", body: fd, keepalive: true, cache: "no-store" });
-              const json = await res.json().catch(()=> ({}));
-
-              if (json && typeof json === "object") await handleTranscriptResult(json);
-            } catch (e) {
-              console.error("[STT] onstop error:", e);
-            } finally {
-              vad.recording = false;
-              vad.recorder  = null;
-              vad.chunks    = [];
-              vad.startTs   = 0;
-            }
-          };
-
-          try { rec.start(250); } catch { rec.start(); }
-        } else {
-          // No recorder; treat as non-fatal and don't attempt to start
-          console.warn("[VAD] MediaRecorder not supported");
-          audioRef.current.raf = requestAnimationFrame(tick);
-          return;
-        }
-      } catch (e) {
-        console.error("[VAD] start failed:", e);
-      }
+    // choose MediaRecorder MIME
+    let mimeType = "";
+    if (typeof MediaRecorder !== "undefined") {
+      const prefs = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "audio/ogg;codecs=opus",
+        "audio/mp4"
+      ];
+      mimeType = prefs.find(t => MediaRecorder.isTypeSupported(t)) || "";
     }
 
-    // STOP
-    if (vad.recording) {
-      const utterMs = nowTs - vad.startTs;
+    // meter & VAD
+    const buf = new Float32Array(analyser.fftSize);
+    const EMA = 0.25;
+    let smooth = -60;
 
-      if (fallEdge) {
-       vad.lowSince = vad.lowSince || nowTs;
-       const lowDur = nowTs - vad.lowSince;
-       if (lowDur >= silenceDur || (edgeLevel < (thr - QUICK_STOP_DB) && lowDur >= QUICK_STOP_MS)) {
+    const tick = () => {
+      analyser.getFloatTimeDomainData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+      const rms = Math.sqrt(sum / buf.length) || 0.0000001;
+      let d = 20 * Math.log10(rms);
+      if (!isFinite(d)) d = -120;
+
+      smooth = smooth === -60 ? d : EMA * d + (1 - EMA) * smooth;
+      setDbfs(smooth);
+
+      const vad = audioRef.current.vad;
+      const nowTs = performance.now();
+
+      const thr = thresholdLiveRef.current;
+      const minKeepMs = Math.max(400, listenMsLiveRef.current);
+      const silenceDur = silenceMsLiveRef.current;
+
+      const edgeLevel = d;
+      const isLoud = edgeLevel >= thr;
+
+      // pause VAD when bot is talking
+      if (speakingRef.current) {
+        if (vad.recording) {
           const rec = vad.recorder;
           if (rec && rec.state === "recording") {
-            try { rec.requestData?.(); } catch {}
-            try { rec.stop(); } catch {}
+            try {
+              rec.requestData?.();
+            } catch {}
+            try {
+              rec.stop();
+            } catch {}
+          }
+          vad.recording = false;
+          vad.recorder = null;
+          vad.chunks = [];
+          vad.startTs = 0;
+        }
+        audioRef.current.raf = requestAnimationFrame(tick);
+        return;
+      }
+
+      const HYSTERESIS_DB = 2;
+      const QUICK_STOP_DB = 8;
+      const QUICK_STOP_MS = 220;
+      const riseEdge = edgeLevel >= thr;
+      const fallEdge = edgeLevel < thr - HYSTERESIS_DB;
+      if (isLoud && !vad.highSince) {
+        vad.highSince = nowTs;
+        vad.lowSince = 0;
+      }
+
+      // START
+      if (riseEdge && !vad.recording) {
+        try {
+          if (typeof MediaRecorder !== "undefined") {
+            const rec = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+            vad.recorder = rec;
+            vad.chunks = [];
+            vad.startTs = nowTs;
+            vad.recording = true;
+            vad.lowSince = 0;
+
+            rec.ondataavailable = (e) => {
+              if (e.data?.size) vad.chunks.push(e.data);
+            };
+            rec.onstop = async () => {
+              try {
+                const blob = new Blob(vad.chunks, {
+                  type: rec.mimeType || mimeType || "audio/webm",
+                });
+                const dur = performance.now() - vad.startTs;
+                if (dur < minKeepMs) {
+                  vad.failedStarts = (vad.failedStarts || 0) + 1;
+                  if (
+                    autoDetectOnRef.current &&
+                    vad.failedStarts >= FAILED_STARTS_BEFORE_AUTOCAL
+                  ) {
+                    vad.failedStarts = 0;
+                    maybeAutoCalibrate();
+                  }
+                  return;
+                }
+                vad.failedStarts = 0;
+
+                // TODO: Upload to your STT endpoint; for now simulate
+                handleTranscriptResult({ text: "(utterance)" });
+              } catch (e) {
+                console.error("[STT] onstop error:", e);
+              } finally {
+                vad.recording = false;
+                vad.recorder = null;
+                vad.chunks = [];
+                vad.startTs = 0;
+              }
+            };
+            try {
+              rec.start(250);
+            } catch {
+              rec.start();
+            }
+          }
+        } catch (e) {
+          console.error("[VAD] start failed:", e);
+        }
+      }
+
+      // STOP
+      if (vad.recording) {
+        const utterMs = nowTs - vad.startTs;
+        if (fallEdge) {
+          vad.lowSince = vad.lowSince || nowTs;
+          const lowDur = nowTs - vad.lowSince;
+          if (lowDur >= silenceDur || (edgeLevel < thr - 8 && lowDur >= 220)) {
+            const rec = vad.recorder;
+            if (rec && rec.state === "recording") {
+              try {
+                rec.requestData?.();
+              } catch {}
+              try {
+                rec.stop();
+              } catch {}
+            }
+          }
+        } else {
+          vad.lowSince = 0;
+        }
+        const MAX_UTTER_MS = 15_000;
+        if (utterMs >= MAX_UTTER_MS) {
+          const rec = vad.recorder;
+          if (rec && rec.state === "recording") {
+            try {
+              rec.requestData?.();
+            } catch {}
+            try {
+              rec.stop();
+            } catch {}
           }
         }
       } else {
-        vad.lowSince = 0;
-      }
-
-      const MAX_UTTER_MS = 15000;
-      if (utterMs >= MAX_UTTER_MS) {
-        const rec = vad.recorder;
-        if (rec && rec.state === "recording") {
-          try { rec.requestData?.(); } catch {}
-          try { rec.stop(); } catch {}
+        if (!isLoud) {
+          vad.lowSince = vad.lowSince || nowTs;
+          vad.highSince = 0;
+        } else {
+          if (!vad.highSince) vad.highSince = nowTs;
+          vad.lowSince = 0;
         }
       }
-    } else {
-      // keep edge timers tidy when idle
-      if (!isLoud) {
-        vad.lowSince  = vad.lowSince || nowTs;
-        vad.highSince = 0;
-      } else {
-        if (!vad.highSince) vad.highSince = nowTs;
-        vad.lowSince = 0;
-      }
-    }
 
-    // schedule next frame (only here)
+      audioRef.current.raf = requestAnimationFrame(tick);
+    };
+
     audioRef.current.raf = requestAnimationFrame(tick);
-  };
-
-  // kick the loop exactly once
-  audioRef.current.raf = requestAnimationFrame(tick);
   }
 
-  // Stop mic + camera + end session + reset UI and (optionally) POST /camera/stop
-  async function stopAll({ reset = true, reason = "nav", skipPost = false } = {}) {
-    // Freeze UI immediately even if stopMic throws or is delayed
-    setDbfs(-60);
-    try { await stopMic(); } catch {}
-    try { camRef.current.stream?.getTracks()?.forEach(t => t.stop()); } catch {}
-    
-    camRef.current.stream = null;
-
-    const active = !!S.current.id;
-    const sid = S.current.id;
-
-    if (active && !skipPost) {
-      try { await post("stop", { sessionId: sid, ts: Date.now(), reset, reason }); } catch {}
-    }
-
-    speakingRef.current = false;
-    S.current = { id:null, seenFrames:0, lastFaceTs:0, lastSnapshotTs:0 };
-    setSessionId(null);
-    setSessionStatus("IDLE");
-    recentMapRef.current = {};
-    lastSnapRef.current = "";
-  }
-
-  /* ------------------------------ Expose hooks for n8n / UE ------------------------------ */
-
-  // Effect that installs the global + listener
-  useEffect(() => {
-    window.ikaCalibrate = async () => {
-      setIsPressed(true);
-      try { await autoCalibrate(); }
-      finally { setTimeout(() => setIsPressed(false), 250); }
-    };
-
-    const onMsg = (e) => {
-      const m = e?.data;
-      if (!m) return;
-      if (m.type === "CALIBRATE") window.ikaCalibrate();
-      if (m.type === "SET_AUTODETECT") setAutoDetectOn(!!m.value);
-    };
-    window.addEventListener("message", onMsg);
-
-    return () => {
-      window.removeEventListener("message", onMsg);
-      try { delete window.ikaCalibrate; } catch {}
-    };
-  }, [autoCalibrate]);
-
-    useEffect(() => {
-      const onVisibility = () => {
-        if (document.hidden) {
-          userMicOffRef.current = true;
-          stopAll({ reset: true, reason: "visibility" });
-        }
-      };
-
-      const onPageHide = () => {
-        userMicOffRef.current = true;
-        stopAll({ reset: true, reason: "pagehide" });
-      };
-
-      const onBeforeUnload = () => {
-        try {
-          const rec = audioRef.current?.vad?.recorder;
-          if (rec && rec.state === "recording") rec.stop();
-        } catch {}
-        try {
-          if (audioRef.current.raf) cancelAnimationFrame(audioRef.current.raf);
-        } catch {}
-      };
-
-      document.addEventListener("visibilitychange", onVisibility);
-      window.addEventListener("pagehide", onPageHide);
-      window.addEventListener("beforeunload", onBeforeUnload);
-
-      return () => {
-        document.removeEventListener("visibilitychange", onVisibility);
-        window.removeEventListener("pagehide", onPageHide);
-        window.removeEventListener("beforeunload", onBeforeUnload);
-      };
-    }, []);
-
+  /* ---------- Camera ---------- */
   async function startCamera(id = videoId) {
-    // Stop previous cam tracks
-    try { camRef.current.stream?.getTracks()?.forEach(t => t.stop()); } catch {}
+    try {
+      camRef.current.stream?.getTracks()?.forEach((t) => t.stop());
+    } catch {}
 
     let stream = null;
-
-    // Try specific camera first
     if (id) {
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: { deviceId: { exact: id }, width:{ ideal:1920 }, height:{ ideal:1080 }, frameRate:{ ideal:30 } },
-          audio: false
+          video: {
+            deviceId: { exact: id },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            frameRate: { ideal: 30 },
+          },
+          audio: false,
         });
       } catch (e) {
-        console.warn("[Cam] chosen device failed; falling back to default:", e.name);
+        console.warn("[Cam] chosen device failed; fallback:", e.name);
         if (e.name === "OverconstrainedError" || e.name === "NotFoundError") {
           setVideoId("");
-          try { localStorage.setItem("ika:videoId", ""); } catch {}
+          try {
+            localStorage.setItem("ika:videoId", "");
+          } catch {}
         }
       }
     }
 
-    // Fallback to default camera
     if (!stream) {
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode:"user", width:{ ideal:1920 }, height:{ ideal:1080 }, frameRate:{ ideal:30 } },
-          audio: false
+          video: {
+            facingMode: "user",
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            frameRate: { ideal: 30 },
+          },
+          audio: false,
         });
       } catch (e) {
         console.error("[Cam] default device failed:", e);
@@ -1306,57 +2519,179 @@ const [audioUnlocked, setAudioUnlocked] = useState(false);
 
     camRef.current.stream = stream;
 
-    // Tie mic to camera lifecycle: if cam pauses/ends, kill the mic
     try {
       const onCamGone = () => {
-        userMicOffRef.current = true;            // behave like Stop
-        stopMic().catch(()=>{});
-      }; // ← CLOSE the function
-
+        userMicOffRef.current = true;
+        stopAll({ reset: true });
+      };
       const vTracks = stream.getVideoTracks();
-      vTracks.forEach(t => {
+      const handleMute = () => {
+        // Mute can fire briefly on startup; verify after a short delay.
+        setTimeout(() => {
+          const live = isCamLive();
+          const anyMuted = vTracks.some(tr => tr.muted);
+          if (!live && anyMuted) onCamGone();
+        }, 1200);
+      };
+      vTracks.forEach((t) => {
         t.addEventListener("ended", onCamGone);
-        t.addEventListener("mute", onCamGone);
         t.onended = onCamGone;
+        t.addEventListener("mute", handleMute);
+        t.addEventListener("unmute", () => {});
       });
-
       if (typeof stream.addEventListener === "function") {
         stream.addEventListener("inactive", onCamGone);
       }
-    } catch {} // ← CLOSE the try
+    } catch {}
 
     if (videoRef.current) {
       videoRef.current.srcObject = stream;
       videoRef.current.onloadedmetadata = () => {
         const w = videoRef.current.videoWidth || 1280;
         FOCAL_PX = w >= 1920 ? 1350 : 900;
-
+        camFxRef.current = focalFromFov(videoRef.current.videoWidth || 1280,  fovHdeg);
+        camFyRef.current = focalFromFov(videoRef.current.videoHeight || 720, fovVdeg);
         tinyOptsRef.current = new faceapi.TinyFaceDetectorOptions({
           inputSize: pickInputSize(w),
-          scoreThreshold: 0.3,
+          scoreThreshold: 0.4,
         });
       };
     }
 
-    // Refresh device lists after permission
+    if (videoRef.current) {
+      const v = videoRef.current;
+      v.srcObject = stream;
+
+      // make sure it’s allowed to autoplay on mobile/Safari
+      v.muted = true;
+      v.playsInline = true;
+      v.autoplay = true;
+
+      // actually start the video
+      try { await v.play(); } catch (e) {
+        console.warn("[Cam] video.play() blocked until user gesture:", e);
+      }
+
+      v.onloadedmetadata = () => {
+        const w = v.videoWidth || 1280;
+        FOCAL_PX = w >= 1920 ? 1350 : 900;
+        camFxRef.current = focalFromFov(v.videoWidth || 1280,  fovHdeg);
+        camFyRef.current = focalFromFov(v.videoHeight || 720,  fovVdeg);
+        tinyOptsRef.current = new faceapi.TinyFaceDetectorOptions({
+          inputSize: pickInputSize(w),
+          scoreThreshold: 0.4,
+        });
+      };
+    }
+
     try {
       const list = await navigator.mediaDevices.enumerateDevices();
-      setAudioDevs(list.filter(d => d.kind === "audioinput"));
-      setVideoDevs(list.filter(d => d.kind === "videoinput"));
+      setAudioDevs(list.filter((d) => d.kind === "audioinput"));
+      setVideoDevs(list.filter((d) => d.kind === "videoinput"));
     } catch {}
   }
 
-  /* ------------------------------ loop ------------------------------ */
+  /* ---------- Calibrate Camera ---------- */
+  async function calibrateCameraOneClick() {
+    // Assumes one person stands ~center at calibDistanceM
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas || !video.videoWidth) return;
+
+    calibMsgRef.current = "Stand still… Calibrating";
+    const W = canvas.width, H = canvas.height;
+    const samples = [];
+    const N = 8;
+
+    for (let i = 0; i < N; i++) {
+      await sleep(120);
+      const dets = await faceapi
+        .detectAllFaces(video, tinyOptsRef.current)
+        .withFaceLandmarks();
+
+      if (!dets?.length) continue;
+
+      const det = faceapi.resizeResults(dets[0], { width: W, height: H });
+      const box = det.detection.box;
+
+      // Estimate focal from known distance & observed face width
+      if (!box?.width) continue;
+      const fxEst = (box.width * calibDistanceM) / FACE_WIDTH_M;  // pinhole: Z = f*W_real / W_px => f = W_px*Z/W_real
+
+      // Center we measured at (slightly below mid-eye line helps)
+      const cx = box.x + box.width * 0.5;
+      const cy = box.y + box.height * 0.45;
+
+      const { yaw, pitch } = anglesFromPixel(
+        cx, cy,
+        camFxRef.current, camFyRef.current,
+        W * 0.5, H * 0.5
+      );
+
+      samples.push({
+        fx: fxEst,
+        yawDeg: yaw * RAD,
+        pitchDeg: pitch * RAD,
+      });
+    }
+    calibMsgRef.current = "";
+
+    if (!samples.length) return;
+
+    const median = (arr) => {
+      const a = [...arr].sort((x, y) => x - y);
+      return a[Math.floor(a.length / 2)];
+    };
+
+    const fxMed = median(samples.map(s => s.fx));
+    const yawMed = median(samples.map(s => s.yawDeg));
+    const pitchMed = median(samples.map(s => s.pitchDeg));
+
+    // Update intrinsics + FOV readouts
+    camFxRef.current = fxMed;
+    const fovH = 2 * Math.atan((W / 2) / fxMed) * RAD;
+    setFovHdeg(+fovH.toFixed(1));
+
+    // Approximate fy via square-pixel aspect (good enough for alignment UI)
+    const fy = fxMed * (H / W);
+    camFyRef.current = fy;
+    const fovV = 2 * Math.atan((H / 2) / fy) * RAD;
+    setFovVdeg(+fovV.toFixed(1));
+
+    // Zero offsets so centered person yields yaw≈0, pitch≈0
+    setPanOffsetDeg(p => p - yawMed);
+    setTiltOffsetDeg(t => t - pitchMed);
+  }
+
+  async function runCalCountdown() {
+    // Cute 3-2-1 banner in the overlay
+    for (const n of [3, 2, 1]) {
+      calibMsgRef.current = `Calibration in ${n}… Stand on the ${calibDistanceM.toFixed(2)} m mark`;
+      await sleep(500);
+    }
+    calibMsgRef.current = "Calibrating…";
+    await calibrateCameraOneClick();
+    calibMsgRef.current = "Done!";
+    await sleep(600);
+    calibMsgRef.current = "";
+  }
+
+  // Distance from face width (px) using current intrinsics
+  const estimateDistanceMpx = useCallback((wPx) => {
+    const fx = camFxRef.current || FOCAL_PX;
+    return (Number.isFinite(wPx) && wPx > 0) ? (fx * FACE_WIDTH_M) / wPx : null;
+  }, []);
+
+  /* ---------- Frame loop ---------- */
   useEffect(() => {
     if (!ready) return;
-
-    const video  = videoRef.current;
+    const video = videoRef.current;
     const canvas = canvasRef.current;
-    const ctx    = canvas.getContext("2d");
+    const ctx = canvas.getContext("2d");
 
     const resize = () => {
       if (!video) return;
-      canvas.width  = video.videoWidth  || 940;
+      canvas.width = video.videoWidth || 940;
       canvas.height = video.videoHeight || 650;
     };
     video.addEventListener("loadedmetadata", resize);
@@ -1365,23 +2700,33 @@ const [audioUnlocked, setAudioUnlocked] = useState(false);
 
     let raf = 0;
     let lastRun = 0;
-    let detecting = false; // <-- guard
-
+    let detecting = false;
     let frameCount = 0;
-    const loop = () => {
-      raf = requestAnimationFrame(loop);
 
+    const loop = async () => {
+      raf = requestAnimationFrame(loop);
       const now = performance.now();
-      if (now - lastRun < LOOP_STEP_MS || !video.videoWidth || detecting) return;
+      if (now - lastRun < loopStepMsRef.current || !video.videoWidth || video.readyState < 2 || detecting) return;
       frameCount++;
-      if (audioRef.current?.vad?.recording && (frameCount % 2 === 0)) return; // half-rate during speech
+      if (audioRef.current?.vad?.recording && frameCount % 2 === 0) return;
       lastRun = now;
 
       detecting = true;
-      (async () => {
-        lastFrameTsRef.current = performance.now();
+      try {
+        if (isCamLive()) {
+          lastFrameTsRef.current = performance.now();
+        } else {
+          // Bail early; no point running detections without a live track.
+          return;
+        }
 
-        // … then inside the loop:
+        // === Guard: don't detect while switching backends ===
+        if (backendSwitchingRef.current) {
+          return; // skip this frame; will resume when backend is ready
+        }
+        // Ensure backend is fully ready (awaits if mid-initialization)
+        await backendReadyRef.current;
+
         let dets = [];
         try {
           dets = await faceapi
@@ -1391,102 +2736,281 @@ const [audioUnlocked, setAudioUnlocked] = useState(false);
             .withAgeAndGender()
             .withFaceDescriptors();
         } catch (e) {
-          console.warn("faceapi detect error:", e);
-
-          // one-time fallback from webgl → wasm if webgl misbehaves
-          if (!triedFallbackRef.current && tf.getBackend?.() === "webgl") {
-            triedFallbackRef.current = true;
-            try {
-              await tf.setBackend("wasm");
-              await tf.ready();
-              setBackend(tf.getBackend()); // shows 'wasm' in your status panel
-              console.log("[tfjs] fell back to WASM backend");
-            } catch {}
-          }
-
-          detecting = false; // release and bail from this frame
-          return;
+          console.warn("faceapi detect chain failed:", e?.message || e);
+          dets = [];
         }
 
-        ctx.clearRect(0,0,canvas.width,canvas.height);
+        // ==== drawing + bookkeeping ====
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        // --- alignment overlay: crosshair and banner ---
+        if (showAlignRef.current) {
+          const cx0 = canvas.width * 0.5, cy0 = canvas.height * 0.5;
 
-        // set common font + baseline once per frame
+          // crosshair ticks
+          ctx.save();
+          ctx.strokeStyle = "#0ea5e9";
+          ctx.lineWidth = 1.5;
+          ctx.beginPath(); ctx.moveTo(cx0 - 22, cy0); ctx.lineTo(cx0 + 22, cy0); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(cx0, cy0 - 22); ctx.lineTo(cx0, cy0 + 22); ctx.stroke();
+          ctx.restore();
+
+          // transient banner (countdown / "Calibrating…")
+          if (calibMsgRef.current) {
+            const msg = calibMsgRef.current;
+            ctx.save();
+            ctx.font = "bold 18px system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif";
+            const tw = ctx.measureText(msg).width + 18;
+            const x = Math.max(10, (canvas.width - tw) / 2);
+            const y = 10;
+            ctx.fillStyle = "rgba(14,165,233,0.18)";
+            ctx.fillRect(x, y, tw, 34);
+            ctx.strokeStyle = "rgba(14,165,233,0.45)";
+            ctx.strokeRect(x, y, tw, 34);
+            ctx.fillStyle = "#e6f7ff";
+            ctx.textBaseline = "middle";
+            ctx.fillText(msg, x + 9, y + 17);
+            ctx.restore();
+          }
+        }
         ctx.font = LABEL_FONT;
         ctx.textBaseline = "top";
 
         const resized = faceapi
           .resizeResults(dets, { width: canvas.width, height: canvas.height })
-          .sort((a,b)=>a.detection.box.x - b.detection.box.x);
+          .sort((a, b) => a.detection.box.x - b.detection.box.x);
 
         const matcher = faceMatcherRef.current;
         const rows = [];
         const peopleForPost = [];
-        let total=0, green=0, red=0;
+        let total = 0, green = 0, red = 0;
 
-        const tracks = recentMapRef.current;
-
+        // build candidates (same as before)
+        const cutoff = Number.isFinite(redCutoffM) ? redCutoffM : Infinity;
+        const candidates = [];
         for (let i = 0; i < resized.length; i++) {
-          const det  = resized[i];
-          const box  = det.detection.box;
-          const dist = estimateDistanceM(box.width);
+          const det = resized[i];
+          const box = det.detection.box;
+          const dist = estimateDistanceMpx(box.width);
+          if (dist != null && dist > cutoff) continue; // skip way too far
           const zone = zoneOf(dist, greenMaxMRef.current);
-          const color = zone === "green" ? "#22c55e" : "#ef4444";
+          candidates.push({ i, det, box, dist, zone });
+        }
+
+        // Totals for status/mic policy (all visible faces within cutoff)
+        total = candidates.length;
+        green = candidates.filter(c => c.zone === "green").length;
+        red   = total - green;
+
+        // 2) Only TRACK up to 5 people in the GREEN zone, nearest first
+        const greenCandidates = candidates
+          .filter(c => c.zone === "green" && Number.isFinite(c.dist))
+          .sort((a, b) => a.dist - b.dist);
+        const tracked = greenCandidates.slice(0, 5);
+
+        if (tracked.length) {
+          ctx.save();
+          ctx.font = "bold 12px system-ui";
+          const msg = `tracked: ${tracked.length}`;
+          const w = ctx.measureText(msg).width + 10;
+          ctx.fillStyle = "rgba(34,197,94,0.85)";
+          ctx.fillRect(10, 10, w, 20);
+          ctx.fillStyle = "#fff";
+          ctx.fillText(msg, 15, 24);
+          ctx.restore();
+        }
+
+        // Snapshot current gesture once per frame (used by labels and HUD)
+        const gesturePayload = (() => {
+          const g = stableGestureRef.current || lastGestureRef.current;
+          if (!g) return null;
+          return (now - g.t) <= HANDS_CACHE_MS ? { type: g.type, score: g.score, t: g.t } : null;
+        })();
+
+        // 3) Draw + identify only the tracked subset (stable by name/gid)
+        const tracks = recentMapRef.current;
+        for (let k = 0; k < tracked.length; k++) {
+          const { i, det, box, dist, zone } = tracked[k];
+          const color = "#22c55e"; // green only
           const gender = (det.gender || "").toLowerCase();
           const expr = topExpression(det.expressions);
 
+          // Attach gesture to each GREEN face (text labels, not emoji)
+          const gestureLbl =
+            (zone === "green" && gesturePayload)
+              ? gestureLabelOf(gesturePayload)
+              : null;
+
+          // --- recognition (fast path + small margin check) ---
           let name = null;
           if (matcher && det.descriptor) {
             const best = matcher.findBestMatch(det.descriptor);
             if (best && best.label !== "unknown" && best.distance <= MATCH_THRESHOLD) {
               name = best.label;
-            } else if (best && best.label !== "unknown" && best.distance <= (MATCH_THRESHOLD + 0.03)) {
-              const { best: b, second: s } = bestTwoMatches(matcher, det.descriptor);
-              if (b.label && b.label !== "unknown" && (s.dist - b.dist) >= MATCH_MARGIN) {
-                name = b.label;
+            } else if (
+              best &&
+              best.label !== "unknown" &&
+              best.distance <= MATCH_THRESHOLD + 0.03
+            ) {
+              // Lightweight margin check vs next-best label
+              const bestLabel = best.label;
+              const bestDist = best.distance;
+              let second = 1;
+
+              for (const ld of matcher.labeledDescriptors) {
+                if (ld.label === bestLabel) continue;
+                for (const d of ld.descriptors) {
+                  const dd = faceapi.euclideanDistance(det.descriptor, d);
+                  if (dd < second) second = dd;
+                }
               }
+              if (second - bestDist >= MATCH_MARGIN) name = bestLabel;
             }
           }
 
+          // --- guest id & display name ---
           let guestId = null;
           if (!name) guestId = assignGuestIdFor(det.descriptor);
-
           let displayName = name || guestId || "Guest";
-          const t = tracks[i];
-          if (t && t.name !== displayName) {
-            if ((t.count || 0) < STABILIZE_FRAMES) {
-              displayName = t.name;
-              t.count = (t.count || 0) + 1;
+
+          // --- stabilization keyed by stable identity (name or gid), not by index ---
+          const stableKey = (name || guestId) ?? `tmp-${i}`;
+          const prev = tracks[stableKey];
+          if (prev && prev.name !== displayName) {
+            if ((prev.count || 0) < STABILIZE_FRAMES) {
+              displayName = prev.name;        // hold old label briefly
+              prev.count = (prev.count || 0) + 1;
             } else {
-              tracks[i] = { name: displayName, count: 0 };
+              tracks[stableKey] = { name: displayName, count: 0 };
             }
           } else {
-            tracks[i] = { name: displayName, count: 0 };
+            tracks[stableKey] = { name: displayName, count: 0 };
           }
 
+          // === angles / position / mouth activity / draw ===
           const dbox = shrinkBox(box);
+          const cx = dbox.x + dbox.width * 0.5;
+          const cy = dbox.y + dbox.height * 0.45;
+
+          const fx = camFxRef.current, fy = camFyRef.current;
+          const cx0 = canvas.width * 0.5, cy0 = canvas.height * 0.5;
+
+          const { yaw, pitch } = anglesFromPixel(cx, cy, fx, fy, cx0, cy0);
+          let yawDeg = yaw * RAD + panOffRef.current;
+          let pitchDeg = pitch * RAD + tiltOffRef.current;
+
+          const Z = Number.isFinite(dist) ? dist : null;
+          const pos = Z != null ? posFromPixel(cx, cy, fx, fy, cx0, cy0, Z) : { x:null, y:null, z:null };
+
+          const normX = Math.min(1, Math.abs((cx - cx0) / (canvas.width * 0.5)));
+          const normY = Math.min(1, Math.abs((cy - cy0) / (canvas.height * 0.5)));
+          const centerNorm = Math.min(1, Math.hypot(normX, normY));
+
+          let mouthActivity = 0;
+          try {
+            const lm = det.landmarks;
+            const level = mouthMAR(lm); // already 0..1
+            const key = (name || guestId) ?? `idx${i}`;
+            const rec = mouthMapRef.current.get(key) || { ema: level };
+            // EMA on the level itself (not on deltas)
+            rec.ema = rec.ema ? (0.7 * rec.ema + 0.3 * level) : level;
+            mouthMapRef.current.set(key, rec);
+            mouthActivity = Math.max(0, Math.min(1, rec.ema));
+          } catch {}
+
+          // draw box
           ctx.strokeStyle = color;
           ctx.lineWidth = BOX_LINE_WIDTH;
           ctx.strokeRect(dbox.x, dbox.y, dbox.width, dbox.height);
 
-          const label = `${displayName} • ${zone} • ${Math.max(0,Math.round(det.age))} ${gender} • ${expr}`;
+          // labels (+ optional gesture glyph for green faces)
+          const freshGesture = gesturePayload; // already time-validated above
+          const gestureIcon =
+            freshGesture && zone === "green"
+              ? ({
+                  wave: "👋",
+                  thumbs_up: "👍",
+                  on_phone: "📞",
+                  peace: "✌️",
+                  raise_hand: "✋",
+                  paper: "✋",
+                  rock: "✊",
+                  scissors: "✌️",
+                }[freshGesture.type] || "🤟")
+              : "";
 
-          const tw = ctx.measureText(label).width + LABEL_PAD_X * 2;
-          const th = 18 + LABEL_PAD_Y * 2;
+          const ageTxt = Number.isFinite(det.age) ? Math.max(0, Math.round(det.age)) : "-";
+          const l1 = `${displayName}${gestureLbl ? " • " + gestureLbl : ""} • ${zone} • ${ageTxt} ${gender} • ${expr}`;
+          const l2 = `yaw ${yawDeg.toFixed(1)}° · pitch ${pitchDeg.toFixed(1)}° · mouth ${mouthActivity.toFixed(2)}`;
+
+          const lineH = 18;
+          const lines = showAlignRef.current ? 2 : 1;
+          const tw = Math.max(ctx.measureText(l1).width, showAlignRef.current ? ctx.measureText(l2).width : 0) + LABEL_PAD_X * 2;
+          const th = lineH * lines + LABEL_PAD_Y * 2;
+
           const lx = Math.max(0, Math.min(dbox.x, canvas.width - tw));
           const ly = Math.max(0, dbox.y - th - 4);
-          ctx.fillStyle = color; ctx.fillRect(lx, ly, tw, th);
-          ctx.fillStyle = "#fff"; ctx.fillText(label, lx + LABEL_PAD_X, ly + LABEL_PAD_Y);
 
-          if (rows.length < 5){
-            rows.push({
-              idx: rows.length+1,
-              gender,
-              ageGroup: ageGroupOf(det.age),
-              zone,
-              name: displayName,
-              distance: dist ? dist.toFixed(2)+" m" : "-",
-            });
+          // pill background
+          ctx.fillStyle = color;
+          ctx.fillRect(lx, ly, tw, th);
+
+          // text
+          ctx.fillStyle = "#fff";
+          ctx.fillText(l1, lx + LABEL_PAD_X, ly + LABEL_PAD_Y);
+          if (showAlignRef.current) {
+            ctx.fillStyle = "#e9ffef";
+            ctx.fillText(l2, lx + LABEL_PAD_X, ly + LABEL_PAD_Y + lineH);
           }
+
+          // Gesture text badge (no emoji) for GREEN faces
+          if (freshGesture && zone === "green") {
+            const gtxt = gestureLabelOf(freshGesture);
+            if (gtxt) {
+              ctx.save();
+              ctx.font = "bold 14px system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif";
+              const padX = 6, padY = 4;
+              const tw2 = ctx.measureText(gtxt).width + padX * 2;
+              const th2 = 18 + padY * 2;
+              // top-right inside the box, clamped
+              const gx = Math.max(0, Math.min(dbox.x + dbox.width - tw2 - 4, canvas.width - tw2));
+              const gy = Math.max(0, dbox.y + 4);
+              ctx.fillStyle = "rgba(34,197,94,0.9)";
+              ctx.fillRect(gx, gy, tw2, th2);
+              ctx.fillStyle = "#fff";
+              ctx.fillText(gtxt, gx + padX, gy + padY);
+              ctx.restore();
+            }
+          }
+
+          // tiny mouth bar
+          if (showAlignRef.current) {
+            const barW = 64, barH = 5, gap = 3;
+            const bx = lx, by = ly + th + gap;
+            ctx.fillStyle = "rgba(255,255,255,0.15)";
+            ctx.fillRect(bx, by, barW, barH);
+            ctx.fillStyle = "#22c55e";
+            ctx.fillRect(bx, by, barW * Math.min(1, Math.max(0, mouthActivity)), barH);
+          }
+
+          // optional direction tick
+          try {
+            const len = 24;
+            const ex = cx + Math.sin(yawDeg * DEG) * len;
+            const ey = cy - Math.sin(pitchDeg * DEG) * len;
+            ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(ex, ey); ctx.stroke();
+          } catch {}
+
+          // table + server payload
+          rows.push({
+            idx: rows.length + 1,
+            name: displayName,
+            gesture: gestureLbl || "-",
+            emotion: expr || "-",
+            zone,
+            ageGroup: ageGroupOf(det.age),
+            gender,
+            distance: dist ? dist.toFixed(2) + " m" : "-",
+          });
 
           peopleForPost.push({
             gender,
@@ -1495,490 +3019,1427 @@ const [audioUnlocked, setAudioUnlocked] = useState(false);
             name: name || null,
             gid: guestId || null,
             emotion: expr,
+            yawDeg,
+            pitchDeg,
+            posCam: pos,
+            centerNorm,
+            mouthActivity,
+            _cx: cx, _cy: cy, // for click-to-zero
+            _w: dbox.width, _h: dbox.height, // for hand proximity heuristics
           });
-
-          total++; if (zone==="green") green++; else if (zone==="red") red++;
         }
 
-        // -------------- MIC POLICY (with grace; session stays ACTIVE) --------------
-        const shouldListen = total > 0 && green === total;
+          // --- ALSO draw non-tracked faces so RED is visible ---
+          try {
+            // Build a fast lookup of indices we already drew
+            const drawn = new Set(tracked.map(t => t.i));
+
+            for (const c of candidates) {
+              if (drawn.has(c.i)) continue; // skip tracked (already drawn)
+
+              const { box, dist, zone } = c;
+              const dbox = shrinkBox(box);
+
+              // Choose color: RED for red-zone, grey for others we didn't track
+              const stroke = zone === "red" ? "#ef4444" : "#999999";
+              const fill   = zone === "red" ? "#ef4444" : "#666666";
+
+              // Outline
+              ctx.save();
+              ctx.strokeStyle = stroke;
+              ctx.lineWidth = 3;
+              ctx.strokeRect(dbox.x, dbox.y, dbox.width, dbox.height);
+
+              // Minimal label: zone + distance
+              const l1 = `${zone} · ${dist ? dist.toFixed(2) + " m" : "-"}`;
+              const lineH = 18;
+              const tw = ctx.measureText(l1).width + LABEL_PAD_X * 2;
+              const th = lineH + LABEL_PAD_Y * 2;
+
+              const lx = Math.max(0, Math.min(dbox.x, canvas.width - tw));
+              const ly = Math.max(0, dbox.y - th - 4);
+
+              ctx.fillStyle = fill;
+              ctx.fillRect(lx, ly, tw, th);
+              ctx.fillStyle = "#ffffff";
+              ctx.fillText(l1, lx + LABEL_PAD_X, ly + LABEL_PAD_Y);
+              ctx.restore();
+            }
+          } catch {}
+
+        // prune unused track slots (use stable keys: name or gid)
+        {
+          const seen = new Set(peopleForPost.map(p => (p.name || p.gid) ?? ""));
+          for (const k of Object.keys(recentMapRef.current)) {
+            if (k && !seen.has(k)) delete recentMapRef.current[k];
+          }
+        }
+
+        // remember face centers for click-to-zero
+        trackedFacesRef.current = peopleForPost.map(p => ({
+          cx: p._cx, cy: p._cy, w: p._w, h: p._h, yawDeg: p.yawDeg, pitchDeg: p.pitchDeg
+        }));
+        // Also expose ALL faces (GREEN + RED) for hand proximity (on_phone)
+        allFacesRef.current = candidates.map(c => {
+          const d = shrinkBox(c.box);
+          return {
+            cx: d.x + d.width * 0.5,
+            cy: d.y + d.height * 0.45,
+            w: d.width,
+            h: d.height,
+          };
+        });
+
+        // === Focus selection (prefer GREEN, fallback to any tracked) ===
+        const pool = peopleForPost.filter(p => p.zone === "green");
+        const cand = pool.length ? pool : peopleForPost;
+
+        let focusIndex = (cand.length ? 0 : -1);
+        let focusScore = -1, focusMeta = null;
+
+        for (let idx = 0; idx < cand.length; idx++) {
+          const p = cand[idx];
+          let sNear = 0;
+          const z = p?.posCam?.z;
+          if (Number.isFinite(z) && z > 0) {
+            sNear = Math.max(0, Math.min(1, (2.0 - Math.min(2.0, Math.max(0.3, z))) / (2.0 - 0.3)));
+          }
+          const sCenter = 1 - Math.max(0, Math.min(1, p.centerNorm ?? 1));
+          const sMouth = Math.max(0, Math.min(1, p.mouthActivity ?? 0));
+          const score = wNear * sNear + wCenter * sCenter + wMouth * sMouth;
+          if (score > focusScore) {
+            focusScore = score;
+            focusIndex = idx;
+            focusMeta = { sNear:+sNear.toFixed(3), sCenter:+sCenter.toFixed(3), sMouth:+sMouth.toFixed(3), score:+score.toFixed(3) };
+          }
+        }
+
+        // Save focus so other blocks (hands/policy) can include it
+        if (focusIndex >= 0) {
+          const p = cand[focusIndex];
+          focusIndexRef.current = peopleForPost.indexOf(p);
+          focusTargetRef.current = { name: p.name || null, gid: p.gid || null };
+        } else {
+          focusIndexRef.current = -1;
+          focusTargetRef.current = null;
+        }
+
+        // Mic policy with grace
+        const shouldListen = total > 0 && green === total; // unchanged: all visible faces must be green
         const nowMs = performance.now();
-
         if (shouldListen) {
-          // We are all-green → refresh timer and ensure mic is ON
           lastAllGreenRef.current = nowMs;
-
           if (!micOnRef.current) {
             userMicOffRef.current = false;
-            startMic().catch(()=>{});
+            startMic().catch(() => {});
+            setSessionStatus("ACTIVE");
+            if (!sessionId) setSessionId(uuid());
           }
         } else {
-          // Not all green → only stop mic if we've been non-green for long enough
           const sinceAllGreen = nowMs - (lastAllGreenRef.current || 0);
           if (micOnRef.current && sinceAllGreen >= MIC_STOP_GRACE_MS) {
-            userMicOffRef.current = true;  // behave like user pressed Stop
-            stopMic().catch(()=>{});
+            userMicOffRef.current = true;
+            stopMic().catch(() => {});
           }
         }
-        // -------------- end MIC POLICY --------------
 
-        const keys = Object.keys(tracks);
-        for (const k of keys) {
-          const idx = Number(k);
-          if (idx >= resized.length) delete tracks[idx];
-        }
-
+        // Always render 5 rows max; pad if fewer tracked
         while (rows.length < 5) {
-          rows.push({ idx: rows.length + 1, gender: "-", ageGroup: "-", zone: "-", name: "-", distance: "-" });
+          rows.push({
+            idx: rows.length + 1,
+            gender: "-",
+            ageGroup: "-",
+            zone: "-",
+            name: "-",
+            gesture: "-",
+            emotion: "-",
+            distance: "-"
+          });
         }
-        setTable(prev => {
+
+        setTable((prev) => {
           const same =
             prev.length === rows.length &&
-            prev.every((r,i)=> JSON.stringify(r) === JSON.stringify(rows[i]));
+            prev.every((r, i) => JSON.stringify(r) === JSON.stringify(rows[i]));
           return same ? prev : rows;
         });
-        setTotals(prev => (prev.all===total && prev.green===green && prev.red===red)
-          ? prev : { all: total, green, red });
+        setTotals((prev) =>
+          prev.all === total && prev.green === green && prev.red === red ? prev : { all: total, green, red }
+        );
 
-        const count = peopleForPost.length;
-        const top5 = rows.slice(0, 5).map(r => ({
-          idx: r.idx,
-          name: r.name !== "-" ? r.name : null,
-          zone: r.zone !== "-" ? r.zone : null,
-          gender: r.gender !== "-" ? r.gender : null,
-          ageGroup: r.ageGroup !== "-" ? r.ageGroup : null,
-          distance: r.distance !== "-" ? r.distance : null,
-        }));
+        // Battery saver: slow the loop when no faces are present
+        if (total === 0) {
+          if (!loopIdleStateRef.current) {
+            loopIdleStateRef.current = true;
+            // pick a stable jittered idle step once per idle stretch
+            const jitter =
+              LOOP_STEP_IDLE_MIN_MS +
+              Math.floor(Math.random() * (LOOP_STEP_IDLE_MAX_MS - LOOP_STEP_IDLE_MIN_MS + 1));
+            loopStepMsRef.current = jitter;
+          }
+        } else if (loopIdleStateRef.current) {
+          loopIdleStateRef.current = false;
+          loopStepMsRef.current = LOOP_STEP_ACTIVE_MS;
+        }
 
-        const slots = {
-          slot1: rows[0]?.name && rows[0].name !== "-" ? rows[0].name : null,
-          slot2: rows[1]?.name && rows[1].name !== "-" ? rows[1].name : null,
-          slot3: rows[2]?.name && rows[2].name !== "-" ? rows[2].name : null,
-          slot4: rows[3]?.name && rows[3].name !== "-" ? rows[3].name : null,
-          slot5: rows[4]?.name && rows[4].name !== "-" ? rows[4].name : null,
-        };
+        // Send structured snapshot to server (throttled)
+        emitCrowdThrottled({
+          deviceId,
+          sessionId: sessionId || ("web-" + deviceId),
+          timeISO: new Date().toISOString(),
+          aiSpeaking: !!serverInfo.ai_speaking,
+          backend,
+          totals: { all: total, green, red },
+          gesture: gesturePayload ? { type: gesturePayload.type, score: gesturePayload.score } : null,
+          focusIndex: focusIndexRef.current,
+          focusTarget: focusTargetRef.current,
+          people: peopleForPost.map(p => ({
+            name: p.name || null,
+            gid: p.gid || null,
+            gender: p.gender || null,
+            ageGroup: p.ageGroup || null,
+            zone: p.zone,
+            yawDeg: Number.isFinite(p.yawDeg) ? +p.yawDeg.toFixed(1) : null,
+            pitchDeg: Number.isFinite(p.pitchDeg) ? +p.pitchDeg.toFixed(1) : null,
+            mouthActivity: +((p.mouthActivity ?? 0).toFixed(3)),
+            posCam: p.posCam,
+          })),
+        });
 
-        const snapshotPayload = {
-          people: peopleForPost,
-          count,
-          greenCount: green,
-          redCount: red,
-          top5,
-          greenMaxM: greenMaxMRef.current,
-          ...slots,
-        };
+        // ---- HANDS: run only when it matters ----
+        const handsEligible = HANDS_ENABLED && handsReadyRef.current;
+        const gm = !!gameModeRef.current;
+        // Adaptive cadence: fast after landmarks seen; slower otherwise; faster in game mode
+        const handsDesiredStep =
+          (now - (lastLmSeenTsRef.current || 0) <= 800)
+            ? (gm ? GM_HANDS_FAST_MS : HANDS_FAST_MS)
+            : (gm ? GM_HANDS_IDLE_MS : HANDS_IDLE_MS);
 
-        updateSession(snapshotPayload).catch(() => {});
-        detecting = false; // release guard at the end
-      })();
+        if (handsEligible && (now - (lastHandsRunTsRef.current || 0) >= handsDesiredStep)) {
+          lastHandsRunTsRef.current = now;
+          try {
+            const lm = await detectHandsOnce(video);
+
+            // HUD + wrist dot
+            if (lm && lm.length >= 21) {
+              // HUD
+              (function drawHandsHud(){
+                const msg = "hands: seen";
+                ctx.save();
+                ctx.font = "bold 14px system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif";
+                const w = ctx.measureText(msg).width + 12;
+                ctx.fillStyle = "rgba(14,165,233,0.85)";
+                ctx.fillRect(10, canvas.height - 62, w, 22);
+                ctx.fillStyle = "#fff";
+                ctx.fillText(msg, 16, canvas.height - 46);
+                ctx.restore();
+              })();
+              // wrist dot
+              const wrist = lm[0];
+              const px = wrist.x * canvas.width;
+              const py = wrist.y * canvas.height;
+              ctx.save();
+              ctx.beginPath();
+              ctx.arc(px, py, 6, 0, Math.PI * 2);
+              ctx.fillStyle = "rgba(255,255,0,0.8)";
+              ctx.fill();
+              ctx.restore();
+            }
+
+            if (lm && lm.length >= 21) {
+              // classify
+              const cand = [];
+              // Always check wave (used as fallback → paper in game mode)
+              try { const w = classifyWave(lm, now); if (w.ok) cand.push({ type: "wave", score: w.score }); } catch {}
+              if (gm) {
+                try { const r = classifyRock(lm);     if (r.ok) cand.push({ type: "rock",     score: r.score }); } catch {}
+                try { const s = classifyScissors(lm); if (s.ok) cand.push({ type: "scissors", score: s.score }); } catch {}
+                try { const p = classifyPaper(lm);    if (p.ok) cand.push({ type: "paper",    score: p.score }); } catch {}
+              } else {
+                // Non-game gestures
+                try { const p = classifyPeace(lm); if (p.ok) cand.push({ type: "peace", score: p.score }); } catch {}
+                try {
+                  const op = classifyPaper(lm);
+                  if (op.ok) {
+                    const wrist = lm[MP.WRIST], iMcp = lm[MP.INDEX_MCP];
+                    const vx = (iMcp.x - wrist.x), vy = (iMcp.y - wrist.y);
+                    const vlen = Math.hypot(vx, vy) || 1e-6;
+                    const cosToVertical = Math.abs(vy) / vlen;
+                    const splay = Math.hypot(
+                      lm[MP.PINKY_TIP].x - lm[MP.INDEX_TIP].x,
+                      lm[MP.PINKY_TIP].y - lm[MP.INDEX_TIP].y
+                    ) / Math.max(1e-3, palmSpanLen(lm));
+                    const tips = [MP.INDEX_TIP, MP.MIDDLE_TIP, MP.RING_TIP, MP.PINKY_TIP].map(i => lm[i]);
+                    const minY = Math.min(...tips.map(t => t?.y ?? 1));
+
+                    // Require: good score, upright-ish, decent finger splay, not too low
+                    if (op.score >= 0.62 && cosToVertical > 0.68 && splay > 0.28 && minY <= 0.60) {
+                      cand.push({ type: "raise_hand", score: op.score });
+                    }
+                  }
+                } catch {}
+                try { const ph = classifyOnPhone(lm, allFacesRef.current || [], canvas.width, canvas.height); if (ph.ok) cand.push({ type: "on_phone", score: ph.score }); } catch {}
+                try { const t = classifyThumbsUp(lm); if (t.ok) cand.push({ type: "thumbs_up", score: t.score }); } catch {}
+              }
+
+              if (cand.length) {
+                const bestFrame = cand.reduce((a, b) => (b.score > a.score ? b : a));
+                gestureWindowRef.current.push({ ...bestFrame, t: now });
+                const maxLen = VOTE_WINDOW * 2;
+                if (gestureWindowRef.current.length > maxLen) {
+                  gestureWindowRef.current.splice(0, gestureWindowRef.current.length - maxLen);
+                }
+              }
+
+              // stabilize
+              let stable = null;
+              try {
+                stable = pickStableGesture(now, gestureWindowRef.current, stableGestureRef.current);
+              } catch {}
+
+              if (stable) {
+                // Game mode mapping: wave→paper, ignore thumbs_up
+                let out = stable;
+                if (gm) {
+                  if (stable.type === "wave") out = { ...stable, type: "paper" };
+                  if (stable.type === "thumbs_up") out = null;
+                }
+
+                if (out) {
+                  const prev = stableGestureRef.current;
+                  const changed = !prev || prev.type !== out.type;
+                  stableGestureRef.current = out;
+                  lastGestureRef.current = { ...out };
+
+                  // Emit: gesture_event (normal) or game_event (RPS) when changed and not speaking
+                  if (changed && (now - (lastGestureSentRef.current || 0)) >= HANDS_SEND_MS && !speakingRef.current) {
+                    try {
+                      if (gm && (out.type === "paper" || out.type === "rock" || out.type === "scissors")) {
+                        socketRef.current?.emit?.("game_event", {
+                          sessionId: sessionId || "web-" + deviceId,
+                          deviceId,
+                          rps: out.type,
+                          at: Date.now(),
+                          focusIndex: focusIndexRef.current,
+                          focusTarget: focusTargetRef.current,
+                        });
+                      } else {
+                        socketRef.current?.emit?.("gesture_event", {
+                          sessionId: sessionId || "web-" + deviceId,
+                          deviceId,
+                          gesture: { type: out.type, score: out.score },
+                          at: Date.now(),
+                          focusIndex: focusIndexRef.current,
+                          focusTarget: focusTargetRef.current,
+                        });
+                      }
+                    } catch {}
+                    lastGestureSentRef.current = now;
+                  }
+                }
+              } else {
+                if (lastGestureRef.current && (now - lastGestureRef.current.t) > HANDS_CACHE_MS) {
+                  lastGestureRef.current = null;
+                }
+              }
+            }
+          } catch {}
+        } else {
+          if (lastGestureRef.current && (now - lastGestureRef.current.t) > HANDS_CACHE_MS) {
+            lastGestureRef.current = null;
+          }
+        }
+
+        // ---- Policy: zone transitions -> call-over / greet (candidates include red) ----
+        try {
+          const matcher = faceMatcherRef.current;
+
+          const allIdentities = candidates.map((c) => {
+            const det = c.det;
+            // minimal recognition (same logic as tracked, compact)
+            let name = null;
+            if (matcher && det.descriptor) {
+              const best = matcher.findBestMatch(det.descriptor);
+              if (best && best.label !== "unknown" && best.distance <= MATCH_THRESHOLD) {
+                name = best.label;
+              } else if (best && best.label !== "unknown" && best.distance <= MATCH_THRESHOLD + 0.03) {
+                const bestLabel = best.label;
+                const bestDist = best.distance;
+                let second = 1;
+                for (const ld of matcher.labeledDescriptors) {
+                  if (ld.label === bestLabel) continue;
+                  for (const d of ld.descriptors) {
+                    const dd = faceapi.euclideanDistance(det.descriptor, d);
+                    if (dd < second) second = dd;
+                  }
+                }
+                if (second - bestDist >= MATCH_MARGIN) name = bestLabel;
+              }
+            }
+            let gid = null;
+            if (!name) gid = assignGuestIdFor(det.descriptor);
+            const key = (name || gid) ?? `tmp-${c.i}`;
+            const gender = (det.gender || "").toLowerCase();
+            const age = Number(det.age);
+            const ageGroup = ageGroupOf(age);
+            return { key, name, gid, gender, age, ageGroup, zone: c.zone };
+          });
+
+          // group context
+          const groupSize = allIdentities.length;
+          const hasKid = allIdentities.some(p => p.ageGroup === "child");
+
+          // transitions
+          for (const p of allIdentities) {
+            const prevZ = prevZoneMapRef.current.get(p.key);
+            prevZoneMapRef.current.set(p.key, p.zone);
+
+            // green -> red => polite call-over (max 3, spaced)
+            if (prevZ === "green" && p.zone === "red") {
+              const s = callOverStateRef.current.get(p.key) || { tries: 0, last: 0 };
+              if (s.tries < CALL_OVER_MAX_TRIES && (now - (s.last || 0)) >= CALL_OVER_COOLDOWN_MS) {
+                s.tries += 1;
+                s.last = now;
+                callOverStateRef.current.set(p.key, s);
+                socketRef.current?.emit?.("policy_event", {
+                  type: "call_over",
+                  attempt: s.tries,
+                  target: { name: p.name || null, gid: p.gid || null, gender: p.gender || null },
+                  group: { size: groupSize, hasKid },
+                  reason: "left_green_zone",
+                  at: Date.now(),
+                });
+              }
+            }
+
+            // red/unknown -> green => greet (reset tries)
+            if ((prevZ === "red" || prevZ == null) && p.zone === "green") {
+              callOverStateRef.current.delete(p.key);
+              const address =
+                p.name ? p.name
+                : (groupSize > 1 ? (hasKid ? "family" : "everyone")
+                   : (p.gender === "male" ? "sir" : p.gender === "female" ? "ma’am" : "there"));
+              socketRef.current?.emit?.("policy_event", {
+                type: "greet",
+                address,
+                target: { name: p.name || null, gid: p.gid || null, gender: p.gender || null },
+                group: { size: groupSize, hasKid },
+                at: Date.now(),
+              });
+            }
+          }
+
+          // group change detection (>50% different) -> ask softly
+          const curSet = new Set(allIdentities.map(p => p.key));
+          const prevSet = lastGroupSetRef.current || new Set();
+          const inter = new Set([...curSet].filter(k => prevSet.has(k)));
+          const overlap = (inter.size / Math.max(1, Math.max(prevSet.size, curSet.size)));
+          if (prevSet.size && curSet.size && overlap < 0.5) {
+            if ((now - (lastGroupAskTsRef.current || 0)) >= GROUP_ASK_COOLDOWN_MS) {
+              lastGroupAskTsRef.current = now;
+              socketRef.current?.emit?.("policy_event", {
+                type: "ask_group_change",
+                prevSize: prevSet.size,
+                currSize: curSet.size,
+                overlap,
+                at: Date.now(),
+              });
+            }
+          }
+          // update last group
+          lastGroupSetRef.current = curSet;
+        } catch {}
+
+        // ---- Speaker focus (1–2s or 3 frames dominance among green tracked) ----
+        try {
+          const list = peopleForPost || [];
+          if (list.length) {
+            // Prefer GREEN; else use all
+            const greens = list.filter(p => p.zone === "green");
+            const pool = greens.length ? greens : list;
+
+            // Pick dominant by mouthActivity
+            let topIdx = -1, topScore = -1, topKey = null;
+            for (let i = 0; i < pool.length; i++) {
+              const s = Number(pool[i].mouthActivity) || 0;
+              if (s > topScore) {
+                topScore = s;
+                topIdx = i;
+                topKey = (pool[i].name || pool[i].gid) ?? null;
+              }
+            }
+
+            const sp = speakerRef.current;
+            if (topKey && topKey === sp.topKeyPrev) {
+              sp.framesDominant += 1;
+            } else {
+              sp.topKeyPrev = topKey;
+              sp.framesDominant = 1;
+              sp.topSince = now;
+            }
+
+            const stableByFrames = sp.framesDominant >= SPEAKER_STABLE_FRAMES;
+            const stableByTime = (now - (sp.topSince || 0)) >= SPEAKER_STABLE_MS;
+
+            if (topKey && sp.key !== topKey && (stableByFrames || stableByTime)) {
+              // Map pool index back to absolute index in peopleForPost
+              const absIdx = list.indexOf(pool[topIdx]);
+              sp.key = topKey;
+
+              const p = list[absIdx];
+              socketRef.current?.emit?.("policy_event", {
+                type: "speaker_focus",
+                target: {
+                  name: p.name || null,
+                  gid: p.gid || null,
+                  gender: p.gender || null,
+                  index: absIdx,
+                },
+                at: Date.now(),
+              });
+            }
+          }
+        } catch (e) {
+          console.warn("[speaker] error:", e);
+        }
+      } catch (e) {
+        console.warn("[frame] error:", e);
+      } finally {
+        detecting = false;
+      }
     };
 
+    // start the frame loop
     raf = requestAnimationFrame(loop);
     return () => {
       cancelAnimationFrame(raf);
       video?.removeEventListener("loadedmetadata", resize);
       video?.removeEventListener("resize", resize);
     };
-  }, [ready, videoId]);
+  }, [ready, videoId, deviceId, server, sessionId]);
 
+  // idle watcher
   useEffect(() => {
     if (!ready) return;
     const CHECK_MS = 1000;
-    const MAX_IDLE_MS = 10000;
-
     const timer = setInterval(() => {
+      if (!isCamLive()) {
+      stopAll({ reset: true });
+      return;
+    }
       const ago = performance.now() - lastFrameTsRef.current;
 
-      // If camera truly died (track not live), just stop the mic; try to keep video element intact
-      if (!isCamLive() && micOnRef.current) {
+      // Mic idle: stop listening
+      if (ago > MIC_IDLE_MS && micOnRef.current) {
         userMicOffRef.current = true;
         stopMic().catch(() => {});
       }
 
-      // If frames stall, DO NOT stop camera; just ensure mic is off.
-      if (ago > MAX_IDLE_MS && micOnRef.current) {
-        userMicOffRef.current = true;
-        stopMic().catch(() => {});
+      // Camera idle: stop everything, including LLM
+      if (ago > CAM_IDLE_MS) {
+        stopAll({ reset: true }); // now this is the ONLY place that flips session to IDLE
       }
     }, CHECK_MS);
-
     return () => clearInterval(timer);
   }, [ready]);
 
-  /* ------------------------------ posting ------------------------------ */
-  const post = async (which, payload) => {
-    const url = N8N[which];
-    const nowStr = new Date().toLocaleTimeString();
-
-    // If not in debug mode, try sendBeacon first (no response body available)
-    if (!DEBUG_FETCH) {
-      try {
-        const ok = navigator.sendBeacon(
-          url,
-          new Blob([JSON.stringify(payload)], { type: "application/json; charset=UTF-8" })
-        );
-        setPosts(p => ({ ...p, [which]: p[which] + 1 }));
-        setLastSent(s => ({ ...s, [which]: nowStr }));
-        setLastHttp(h => ({ ...h, [which]: ok ? "sent (beacon)" : "beacon failed" }));
-        return null; // no body to parse from beacon
-      } catch (e) {
-        setLastHttp(h => ({ ...h, [which]: `ERR beacon ${String(e)}` }));
-        // fall through to fetch below
-      }
-    }
-
-    // Fallback or debug: use fetch and parse JSON
-    try {
-      const r = await fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(payload),
-        keepalive: true,
-      });
-
-      let data = null;
-      try { data = await r.json(); } catch { /* ok if empty */ }
-
-      setPosts(p => ({ ...p, [which]: p[which] + 1 }));
-      setLastSent(s => ({ ...s, [which]: nowStr }));
-      setLastHttp(h => ({ ...h, [which]: r.ok ? "OK (fetch)" : `HTTP ${r.status}` }));
-
-      return data; // <= parsed response JSON (or null if none)
-    } catch (e) {
-      setLastHttp(h => ({ ...h, [which]: `ERR ${String(e)}` }));
-      return null;
-    }
-  };
-
-  /* ------------------------------ session FSM ------------------------------ */
-  async function updateSession(payload) {
-    const now = Date.now();
-    const any = payload && Array.isArray(payload.people) && payload.people.length > 0;
-
-    // make a compact signature of what we care about
-    const sig = any ? JSON.stringify({
-      c: payload.count,
-      g: payload.greenCount,
-      r: payload.redCount,
-      s1: payload.top5?.[0]?.name ?? null,
-      s2: payload.top5?.[1]?.name ?? null,
-      s3: payload.top5?.[2]?.name ?? null,
-      s4: payload.top5?.[3]?.name ?? null,
-      s5: payload.top5?.[4]?.name ?? null,
-      gm: greenMaxMRef.current
-    }) : "";
-
-    const changedSinceLast = sig !== lastSnapRef.current;
-
-    // ── SESSION NOT STARTED YET ─────────────────────────────────────────────
-    if (!S.current.id) {
-      if (any) {
-        S.current.seenFrames++;
-        if (S.current.seenFrames >= START_FRAMES) {
-          S.current.id = uuid();
-          S.current.lastFaceTs = now;
-          S.current.lastSnapshotTs = 0;
-          lastSnapRef.current = "";           // <— reset here
-          userMicOffRef.current = false;
-
-          setSessionId(S.current.id);
-          setSessionStatus("ACTIVE");
-
-          post("start", { sessionId: S.current.id, ts: now }).catch(() => {});
-        }
-      } else {
-        S.current.seenFrames = 0;
-      }
-      return;
-    }
-
-    // ── SESSION ACTIVE ──────────────────────────────────────────────────────
-    if (any) {
-      S.current.lastFaceTs = now;
-      if (changedSinceLast && (now - S.current.lastSnapshotTs >= SNAPSHOT_EVERY)) {
-        S.current.lastSnapshotTs = now;
-        post("snapshot", { sessionId: S.current.id, ts: now, ...payload }).catch(()=>{});
-        lastSnapRef.current = sig;  // <-- update here
-      }
-      return;
-    }
-
-    // ── NO FACES; CHECK FOR TIMEOUT / END ───────────────────────────────────
-    if (now - S.current.lastFaceTs >= END_AFTER_MS) {
-      userMicOffRef.current = true;
-      if (micOnRef.current) await stopMic();
-      // optionally mark session as IDLE without tearing camera down
-      if (S.current.id) {
-        setSessionStatus("IDLE");
-        setSessionId(null);
-        S.current = { id:null, seenFrames:0, lastFaceTs:0, lastSnapshotTs:0 };
-      }
-      return;
-    }
+  function isCamLive() {
+    const s = camRef.current?.stream;
+    if (!s) return false;
+    const tracks = s.getVideoTracks?.() || [];
+    if (!tracks.length) return false;
+    return tracks.some((t) => t.readyState === "live" && t.enabled !== false);
   }
 
-  /* ------------------------------ UI ------------------------------ */
-  return (
+  // hard stop everything
+  async function stopAll({ reset = true } = {}) {
+    setDbfs(-60);
+
+    // 👉 kill any pending “mic→standby” transition
+    if (micIdleToStandbyTimerRef.current) {
+      clearTimeout(micIdleToStandbyTimerRef.current);
+      micIdleToStandbyTimerRef.current = null;
+    }
+
+    try { await stopMic(); } catch {}
+    try { camRef.current.stream?.getTracks()?.forEach((t) => t.stop()); } catch {}
+    camRef.current.stream = null;
+
+    speakingRef.current = false;
+    S.current = { id: null, seenFrames: 0, lastFaceTs: 0, lastSnapshotTs: 0 };
+
+    try { socketRef.current?.emit?.("close_session", { sessionId }); } catch {}
+    setSessionId(null);
+    setSessionStatus("IDLE");   // full idle immediately
+    recentMapRef.current = {};
+
+    if (reset) bump("stop");
+  }
+
+  /* ====================== RIGHT-PANEL STATE (Gemini / ElevenLabs) ====================== */
+  const MODEL_OPTIONS = [
+    {
+      value: "gemini-2.5-flash-live-preview",
+      label: "Gemini 2.5 Flash Live Preview (realtime)",
+      kind: "live",
+    },
+    {
+      value: "gemini-2.5-flash-preview-native-audio",
+      label: "Gemini 2.5 Flash Preview Native Audio (dialog)",
+      kind: "native",
+    },
+  ];
+
+  // Live Preview voices (as requested)
+  const LIVE_VOICES = ["Puck", "Charon", "Kore", "Fenrir", "Aoede", "Leda", "Orus", "Zephyr"];
+  // Native Audio dialog voices (list you gave)
+  const NATIVE_VOICES = [
+    "Zephyr","Puck","Charon","Kore","Fenrir","Leda","Orus","Aoede","Callirrhoe","Autonoe",
+    "Enceladus","Iapetus","Umbriel","Algieba","Despina","Erinome","Algenib","Rasalgethi",
+    "Laomedia","Achernar","Alnilam","Schedar","Gacrux","Pulcherrima","Achird","Zubenelgenubi",
+    "Vindemiatrix","Sadachbia","Sadaltager"
+  ];
+
+  const GEMINI_VOICES = { live: LIVE_VOICES, native: NATIVE_VOICES };
+
+  // Language options (label → code)
+  const LANGS = [
+    ["English (US)", "en-US"],
+    ["English (UK)", "en-GB"],
+    ["English (Australia)", "en-AU"],
+    ["English (India)", "en-IN"],
+    ["German", "de-DE"],
+    ["Spanish (US)", "es-US"],
+    ["Spanish (Spain)", "es-ES"],
+    ["French", "fr-FR"],
+    ["French (Canada)", "fr-CA"],
+    ["Hindi", "hi-IN"],
+    ["Portuguese (Brazil)", "pt-BR"],
+    ["Arabic", "ar-SA"],
+    ["Indonesian", "id-ID"],
+    ["Italian", "it-IT"],
+    ["Japanese", "ja-JP"],
+    ["Turkish", "tr-TR"],
+    ["Vietnamese", "vi-VN"],
+    ["Bengali", "bn-BD"],
+    ["Gujarati", "gu-IN"],
+    ["Kannada", "kn-IN"],
+    ["Malayalam", "ml-IN"],
+    ["Marathi", "mr-IN"],
+    ["Tamil", "ta-IN"],
+    ["Telugu", "te-IN"],
+    ["Dutch", "nl-NL"],
+    ["Korean", "ko-KR"],
+    ["Mandarin Chinese", "zh-CN"],
+    ["Polish", "pl-PL"],
+    ["Russian", "ru-RU"],
+    ["Thai", "th-TH"],
+  ];
+
+  const [systemInstruction, setSystemInstruction] = useState(
+    () => localStorage.getItem("ika:systemInstruction") || "You are a friendly, concise on-site concierge."
+  );
+  const [modelQuick, setModelQuick] = useState(
+    () => localStorage.getItem("ika:model") || "gemini-2.5-flash-live-preview"
+  );
+  const modelKind = useMemo(
+    () => MODEL_OPTIONS.find((m) => m.value === modelQuick)?.kind || "live",
+    [modelQuick]
+  );
+  const voicesForKind = GEMINI_VOICES[modelKind] || LIVE_VOICES;
+
+  const [geminiVoiceQuick, setGeminiVoiceQuick] = useState(
+    () => localStorage.getItem("ika:voice") || "Puck"
+  );
+  const [languageCodeQuick, setLanguageCodeQuick] = useState(
+    () => localStorage.getItem("ika:langCode") || "en-US"
+  );
+  const [temperatureQuick, setTemperatureQuick] = useState(
+    () => Number(localStorage.getItem("ika:temperature") ?? 0.6)
+  );
+
+  // Behavior toggles
+  const [enableAffectiveQuick, setEnableAffectiveQuick] = useState(
+    () => localStorage.getItem("ika:enableAffective") === "true"
+  );
+  const [proactiveAudioQuick, setProactiveAudioQuick] = useState(
+    () => localStorage.getItem("ika:proactiveAudio") === "true"
+  );
+  const [functionCallingQuick, setFunctionCallingQuick] = useState(
+    () => localStorage.getItem("ika:functionCalling") === "true"
+  );
+  const [autoFunctionResponseQuick, setAutoFunctionResponseQuick] = useState(
+    () => localStorage.getItem("ika:autoFunctionResponse") === "true"
+  );
+  const [groundingQuick, setGroundingQuick] = useState(
+    () => localStorage.getItem("ika:grounding") === "true"
+  );
+
+  const [ttsProviderQuick, setTtsProviderQuick] = useState(
+    () => (localStorage.getItem("ika:ttsProvider") || "gemini").toLowerCase()
+  );
+  const [elevenVoiceIdQuick, setElevenVoiceIdQuick] = useState(
+    () => localStorage.getItem("ika:11labs:voiceId") || ""
+  );
+
+  // optional UI toggle elsewhere can flip this; default false
+  const gameModeRef = useRef(false);
+  const [gameModeOn, setGameModeOn] = useState(false);
+  useEffect(() => { gameModeRef.current = gameModeOn; }, [gameModeOn]);
+
+  // Focus shared across blocks (used by gesture events and crowd payload)
+  const focusIndexRef = useRef(-1);
+  const focusTargetRef = useRef(null);
+
+  // API keys (stored locally; server may read)
+  const [geminiApiKey, setGeminiApiKey] = useState(
+    () => localStorage.getItem("ika:gemini:key") || ""
+  );
+
+  // persist knobs
+  useEffect(() => {
+    try {
+      localStorage.setItem("ika:systemInstruction", systemInstruction);
+      localStorage.setItem("ika:model", modelQuick);
+      localStorage.setItem("ika:voice", geminiVoiceQuick);
+      localStorage.setItem("ika:langCode", languageCodeQuick);
+      localStorage.setItem("ika:temperature", String(temperatureQuick));
+
+      localStorage.setItem("ika:enableAffective", String(enableAffectiveQuick));
+      localStorage.setItem("ika:proactiveAudio", String(proactiveAudioQuick));
+      localStorage.setItem("ika:functionCalling", String(functionCallingQuick));
+      localStorage.setItem(
+        "ika:autoFunctionResponse",
+        String(autoFunctionResponseQuick)
+      );
+      localStorage.setItem("ika:grounding", String(groundingQuick));
+
+      localStorage.setItem("ika:ttsProvider", ttsProviderQuick);
+      localStorage.setItem("ika:11labs:voiceId", elevenVoiceIdQuick);
+
+      localStorage.setItem("ika:captions", String(captions));
+      localStorage.setItem("ika:locationLabel", locationLabel);
+      localStorage.setItem("ika:weatherLabel", weatherLabel);
+
+      localStorage.setItem("ika:gemini:key", geminiApiKey);
+    } catch {}
+  }, [
+    systemInstruction,
+    modelQuick,
+    geminiVoiceQuick,
+    languageCodeQuick,
+    temperatureQuick,
+    enableAffectiveQuick,
+    proactiveAudioQuick,
+    functionCallingQuick,
+    autoFunctionResponseQuick,
+    groundingQuick,
+    ttsProviderQuick,
+    elevenVoiceIdQuick,
+    captions,
+    locationLabel,
+    weatherLabel,
+    geminiApiKey,
+  ]);
+
+  useEffect(() => {
+    if (!voicesForKind.includes(geminiVoiceQuick)) {
+      setGeminiVoiceQuick(voicesForKind[0] || "Puck");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modelKind]);
+
+  // apply quick settings → create (or recreate) session
+  const onCreateSession = useCallback(() => {
+    server.createSession({
+      model: modelQuick,
+      voice: geminiVoiceQuick,
+      language_code: languageCodeQuick,
+      system_instruction: systemInstruction,
+
+      // route audio: Gemini (AUDIO+TEXT) vs ElevenLabs (TEXT only)
+      tts_provider: ttsProviderQuick, // "gemini" | "elevenlabs"
+      response_modalities: (ttsProviderQuick === "elevenlabs" ? ["TEXT"] : ["AUDIO", "TEXT"]),
+
+      mic_input: true,
+      enable_affective_dialog: enableAffectiveQuick,
+      disable_mic_during_response: false,
+
+      // Live AAD knobs
+      start_of_speech_sensitivity: sosQuick,
+      end_of_speech_sensitivity: eosQuick,
+      prefix_padding_ms: prefixPadQuick,
+      silence_duration_ms: silenceDurQuick,
+
+      temperature: temperatureQuick,
+      proactive_audio: proactiveAudioQuick,
+      transcribe_user_audio: true,
+      files_to_upload: null,
+
+      // ✅ ElevenLabs-only fields (used iff tts_provider === "elevenlabs")
+      eleven_model: localStorage.getItem("ika:11labs:model") || "eleven_turbo_v2_5",
+      eleven_voice_id: localStorage.getItem("ika:11labs:voiceId") || "",
+      eleven_api_key: localStorage.getItem("ika:11labs:key") || undefined,
+    });
+  }, [
+    server,
+    modelQuick,
+    geminiVoiceQuick,
+    languageCodeQuick,
+    systemInstruction,
+    ttsProviderQuick,
+    enableAffectiveQuick,
+    sosQuick,
+    eosQuick,
+    prefixPadQuick,
+    silenceDurQuick,
+    temperatureQuick,
+    proactiveAudioQuick
+  ]);
+
+  // hot update (also sends current Live AAD values from Mic panel)
+  const onHotUpdate = useCallback(() => {
+    server.updateSettings({
+      temperature: temperatureQuick,
+      captions,
+
+      enable_affective_dialog: enableAffectiveQuick,
+      proactive_audio: proactiveAudioQuick,
+      function_calling: functionCallingQuick,
+      auto_function_response: autoFunctionResponseQuick,
+      grounding: groundingQuick,
+
+      start_of_speech_sensitivity: sosQuick,
+      end_of_speech_sensitivity: eosQuick,
+      prefix_padding_ms: prefixPadQuick,
+      silence_duration_ms: silenceDurQuick,
+    });
+  }, [
+    server,
+    temperatureQuick,
+    captions,
+    enableAffectiveQuick,
+    proactiveAudioQuick,
+    functionCallingQuick,
+    autoFunctionResponseQuick,
+    groundingQuick,
+    sosQuick,
+    eosQuick,
+    prefixPadQuick,
+    silenceDurQuick,
+  ]);
+
+  /* ====================== UI ====================== */
+    return (
     <main className="app">
-      {/* TOP ROW: STATUS (left) + MIC (right) */}
-      <div className="grid">
-        {/* STATUS PANEL */}
-        <div className="panel">
-          <div className="statrow">
-            <div className="kv"><b>Backend:</b> {backend}</div>
-            <div className="kv"><b>Models:</b> {ready ? "loaded" : "loading…"}</div>
-            <div className="kv">
-              <span className={`dot ${sessionStatus === "ACTIVE" ? "ok" : "warn"}`} />
-              <b>Session:</b>&nbsp;{sessionStatus}{sessionId ? ` (${sessionId.slice(0,8)})` : ""}
+      <div className="page2">
+        {/* ===== LEFT COLUMN ===== */}
+        <div className="leftcol">
+          {/* Row 1: CAMERA/STATUS | MIC */}
+          <div className="left-top2">
+            {/* CAMERA / STATUS (compact, grouped) */}
+            <div className="panel compact">
+              <div className="statgrid">
+                {/* ——— Section: Environment ——— */}
+                <div className="block">
+                  <div className="block-title">Environment</div>
+                  <div className="kv"><b>Location:</b> {locationLabel}</div>
+                  <div className="kv"><b>Time:</b> {clock.toLocaleTimeString()}</div>
+                  <div className="kv"><b>Weather:</b> {weatherLabel}</div>
+                  <div className="kv"><b>Backend:</b> {backend}</div>
+                  <div className="kv"><b>Models:</b> {ready ? "loaded" : "loading…"}</div>
+                </div>
+
+                {/* ——— Section: Live status ——— */}
+                <div className="block">
+                  <div className="block-title">Live status</div>
+
+                  {/* CAM */}
+                  <div className="kv">
+                    {(() => {
+                      const live = isCamLive();
+                      return (
+                        <>
+                          <span className={`dot ${live ? "ok" : "err"}`} />
+                          <b>Cam:</b>&nbsp;{live ? "LIVE" : "IDLE"}
+                        </>
+                      );
+                    })()}
+                  </div>
+
+                  {/* Server */}
+                  <div className="kv">
+                    <span className={`dot ${serverInfo.connected ? "ok" : "err"}`} />
+                    <b>Server:</b>&nbsp;{serverInfo.connected ? "connected" : "disconnected"}
+                  </div>
+                  {serverInfo.model || serverInfo.tts ? (
+                    <div className="kv muted small">
+                      {serverInfo.model ? <>Model: {serverInfo.model}</> : null}
+                      {serverInfo.model && serverInfo.tts ? " · " : null}
+                      {serverInfo.tts ? <>TTS: {serverInfo.tts}</> : null}
+                    </div>
+                  ) : null}
+
+                  {/* Device binding */}
+
+                  {/* Device binding */}
+                  <div className="kv">
+                    <b>Device:</b>&nbsp;{deviceId.slice(0,8)}…
+                    <span className="muted">
+                      &nbsp;{serverInfo.boundDeviceId
+                        ? `(bound ${String(serverInfo.boundDeviceId).slice(0,8)}…)`
+                        : `(not bound)`}
+                    </span>
+                  </div>
+                </div>
+
+                {/* ——— Section: Traffic ——— */}
+                <div className="block">
+                  <div className="block-title">Traffic</div>
+
+                  <div className="kv chiprow">
+                    <b>Last:</b>
+                    <span className="chip">start {lastSent.start}</span>
+                    <span className="chip">snap {lastSent.snapshot}</span>
+                    <span className="chip">stop {lastSent.stop}</span>
+                  </div>
+
+                  <div className="kv chiprow">
+                    <b>HTTP:</b>
+                    <span className="chip">start {lastHttp.start || "-"}</span>
+                    <span className="chip">snap {lastHttp.snapshot || "-"}</span>
+                    <span className="chip">stop {lastHttp.stop || "-"}</span>
+                    <span className="muted">{USE_SOCKET_SERVER ? " (socket)" : ""}</span>
+                  </div>
+
+                  <div className="kv chiprow">
+                    <b>Faces:</b>
+                    <span className="chip">total {totals.all}</span>
+                    <span className="chip">green {totals.green}</span>
+                    <span className="chip">red {totals.red}</span>
+                  </div>
+
+                  <div className="kv">
+                    <button
+                      className="btn small full"
+                      title="Clear in-browser guest memory"
+                      onClick={() => {
+                        guestSeqRef.current = 1;
+                        guestMemRef.current = [];
+                        saveGuestMem({ day: dayKey(), seq: 1, mem: [] });
+                      }}
+                    >
+                      clear guests
+                    </button>
+                  </div>
+                </div>
+              </div>
             </div>
-            <div className="kv"><b>Known faces loaded:</b> {knownCount}</div>
-            <div className="kv"><b>Posts:</b> start {posts.start} · snap {posts.snapshot} · stop {posts.stop}</div>
+
+            {/* MIC */}
+            <div className="panel">
+              <div className="row" style={{ gap: 12 }}>
+                <span className={`dot ${micOn ? "ok" : "err"}`} />
+                <b>Mic:</b>&nbsp;{micOn ? "listening" : "idle"}
+
+                <label className="checkbox" style={{ marginLeft: "auto" }}>
+                  <input
+                    type="checkbox"
+                    checked={autoDetectOn}
+                    onChange={(e) => setAutoDetectOn(e.target.checked)}
+                  />
+                  <span>Auto-calibrate</span>
+                </label>
+
+                <button
+                  className="btn"
+                  data-active={micOn ? "true" : "false"}
+                  onClick={async () => { userMicOffRef.current = false; await startMic(); }}
+                >
+                  Start
+                </button>
+                <button
+                  className="btn"
+                  data-active={!micOn ? "true" : "false"}
+                  onClick={async () => { userMicOffRef.current = true; await stopMic(); }}
+                >
+                  Stop
+                </button>
+                <button
+                  className="btn"
+                  data-active={isPressed ? "true" : "false"}
+                  disabled={!micOn}
+                  title="Sample 2s room noise and set threshold"
+                  onClick={autoCalibrate}
+                  onMouseDown={() => setIsPressed(true)}
+                  onMouseUp={() => setIsPressed(false)}
+                  onMouseLeave={() => setIsPressed(false)}
+                  onTouchStart={() => setIsPressed(true)}
+                  onTouchEnd={() => setIsPressed(false)}
+                >
+                  Calibrate
+                </button>
+              </div>
+
+              <LevelMeter levelDbfs={dbfs} thresholdDbfs={threshold} />
+
+              <div>
+                <label className="label">Noise Threshold (dBFS)</label>
+                <input
+                  className="range"
+                  type="range"
+                  min="-60"
+                  max="-20"
+                  step="1"
+                  value={threshold}
+                  onChange={(e) => setThreshold(Number(e.target.value))}
+                />
+              </div>
+
+              <div className="row" style={{ gap: 16 }}>
+                <div className="flex1">
+                  <label className="label">Listen</label>
+                  <input
+                    className="range"
+                    type="range"
+                    min="0"
+                    max="5000"
+                    step="100"
+                    value={listenMs}
+                    onChange={(e) => setListenMs(Number(e.target.value))}
+                  />
+                  <div className="help">{(Math.round(listenMs / 100) / 10)}s</div>
+                </div>
+                <div className="flex1">
+                  <label className="label">Silence</label>
+                  <input
+                    className="range"
+                    type="range"
+                    min="0"
+                    max="5000"
+                    step="100"
+                    value={silenceMs}
+                    onChange={(e) => setSilenceMs(Number(e.target.value))}
+                  />
+                  <div className="help">{(Math.round(silenceMs / 100) / 10)}s</div>
+                </div>
+              </div>
+
+              {/* Gemini AAD knobs */}
+              <div className="row" style={{ gap: 16 }}>
+                <div className="flex1">
+                  <label className="label">Start of speech sensitivity</label>
+                  <input
+                    className="range"
+                    type="range"
+                    min="0" max="1" step="0.05"
+                    value={sosQuick}
+                    onChange={(e) => setSosQuick(Number(e.target.value))}
+                  />
+                  <div className="help">{sosQuick.toFixed(2)}</div>
+                </div>
+                <div className="flex1">
+                  <label className="label">End of speech sensitivity</label>
+                  <input
+                    className="range"
+                    type="range"
+                    min="0" max="1" step="0.05"
+                    value={eosQuick}
+                    onChange={(e) => setEosQuick(Number(e.target.value))}
+                  />
+                  <div className="help">{eosQuick.toFixed(2)}</div>
+                </div>
+              </div>
+
+              <div className="row" style={{ gap: 16 }}>
+                <div className="flex1">
+                  <label className="label">Prefix padding (ms)</label>
+                  <input
+                    className="range"
+                    type="range"
+                    min="0" max="400" step="10"
+                    value={prefixPadQuick}
+                    onChange={(e) => setPrefixPadQuick(Number(e.target.value))}
+                  />
+                  <div className="help">{prefixPadQuick} ms</div>
+                </div>
+                <div className="flex1">
+                  <label className="label">Silence duration (ms)</label>
+                  <input
+                    className="range"
+                    type="range"
+                    min="200" max="2000" step="50"
+                    value={silenceDurQuick}
+                    onChange={(e) => setSilenceDurQuick(Number(e.target.value))}
+                  />
+                  <div className="help">{silenceDurQuick} ms</div>
+                </div>
+              </div>
+
+              {/* Devices */}
+              <div className="row" style={{ gap: 12 }}>
+                <div className="flex1">
+                  <label className="label">Microphone</label>
+                  <select
+                    className="select big"
+                    value={audioId}
+                    onChange={async (e) => {
+                      const next = e.target.value;
+                      setAudioId(next);
+                      try { localStorage.setItem("ika:audioId", next); } catch {}
+                      await startMic(next, { force: true });
+                    }}
+                  >
+                    <option value="">(Default)</option>
+                    {audioDevs.map((d) => (
+                      <option key={d.deviceId} value={d.deviceId}>{d.label || "Microphone"}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="flex1">
+                  <label className="label">Camera</label>
+                  <select
+                    className="select big"
+                    value={videoId}
+                    onChange={async (e) => {
+                      const next = e.target.value;
+                      setVideoId(next);
+                      try { localStorage.setItem("ika:videoId", next); } catch {}
+                      await startCamera(next);
+                    }}
+                  >
+                    <option value="">(Default)</option>
+                    {videoDevs.map((d) => (
+                      <option key={d.deviceId} value={d.deviceId}>{d.label || "Camera"}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            </div>
           </div>
 
-          {/* under-panel: Last Sent / HTTP / Faces */}
-          <div className="subpanel">
-            <div className="subline">
-              <b>Last Sent:</b>
-              <span className="badge">
-                <span className="chip">start {lastSent.start}</span>
-                <span className="chip">snap {lastSent.snapshot}</span>
-                <span className="chip">stop {lastSent.stop}</span>
-              </span>
-            </div>
-            <div className="subline">
-              <b>HTTP:</b>
-              <span className="badge">
-                <span className="chip">start {lastHttp.start || "-"}</span>
-                <span className="chip">snap {lastHttp.snapshot || "-"}</span>
-                <span className="chip">stop {lastHttp.stop || "-"}</span>
-              </span>
-              <span style={{opacity:.7}}>
-                {DEBUG_FETCH ? " (debug)" : " (beacon)"}
-              </span>
-            </div>
-            <div className="subline">
-              <b>Faces:</b>
-              <span className="badge">
-                <span className="chip">total {totals.all}</span>
-                <span className="chip">green {totals.green}</span>
-                <span className="chip">red {totals.red}</span>
-                <span className="chip">≤ {greenMaxM.toFixed(2)} m</span>
-              </span>
-            </div>
-            {/* Green-zone distance control */}
-             <div className="subline" style={{alignItems:'center', gap:12}}>
-               <b>Green zone distance:</b>
-               <div style={{ display:'flex', alignItems:'center', gap:10, flex:1 }}>
-                 <input
-                   type="range"
-                   min="0.3"
-                   max="2.0"
-                   step="0.05"
-                   value={greenMaxM}
-                   onChange={e => setGreenMaxM(Number(e.target.value))}
-                   style={{ width:'240px' }}
-                   aria-label="Green zone distance in meters"
-                   title="Green zone threshold (meters)"
-                 />
-                 <span className="chip">{greenMaxM.toFixed(2)} m</span>
-                 <button className="btn" onClick={()=>setGreenMaxM(DEFAULT_GREEN_MAX_M)} title="Reset">
-                 reset
-                 </button>
-                 <button className="btn" onClick={()=>setGreenMaxM(v=>Math.max(0.3, +(v-0.1).toFixed(2)))} title="-0.1 m">–0.1</button>
-                 <button className="btn" onClick={()=>setGreenMaxM(v=>Math.min(2.0, +(v+0.1).toFixed(2)))} title="+0.1 m">+0.1</button>
-               </div>
-             </div>
-             {/* UI, maybe next to "Green zone distance" */}
-             <button className="btn" style={{marginLeft:8}}
-             onClick={()=>{
-             guestSeqRef.current = 1;
-             guestMemRef.current = [];
-             saveGuestMem({ day: dayKey(), seq: 1, mem: [] });
-             }}
-             title="Clear in-browser guest memory"
-             >
-             clear guests
-             </button>
-          </div>
-        </div>
-
-        {/* MIC PANEL */}
-        <div className="panel" style={{display:'flex', flexDirection:'column', gap:10}}>
-          {/* mic status + buttons */}
-          <div className="row" style={{ gap:10 }}>
-            <span className={`dot ${micOn ? "ok" : "err"}`} />
-            <b>Mic:</b>&nbsp;{micOn ? "listening" : "idle"}
-
-            {/* right side controls */}
-            <div style={{ marginLeft:'auto', display:'flex', gap:12, alignItems:'center' }}>
-              {/* NEW: Auto-detect toggle (blue when ON) */}
-              <ToggleSwitch
-                checked={autoDetectOn}
-                onChange={setAutoDetectOn}
-                label="Auto-calibrate"
+          {/* Row 2: DISTANCE CONTROLS — two neat panels */}
+          <div className="panel">
+            {/* GREEN ZONE (interaction range) */}
+            <div className="inline-controls">
+              <b>Green zone distance</b>
+              <input
+                className="range"
+                type="range"
+                min="0.3" max="2.0" step="0.05"
+                value={greenMaxM}
+                onChange={(e) => setGreenMaxM(Number(e.target.value))}
+                aria-label="Green zone distance in meters"
               />
+              <span className="chip">{greenMaxM.toFixed(2)} m</span>
+              <button className="btn" onClick={() => setGreenMaxM(DEFAULT_GREEN_MAX_M)}>reset</button>
+              <button className="btn" onClick={() => setGreenMaxM(v => Math.max(0.3, +(v - 0.1).toFixed(2)))}>–0.1</button>
+              <button className="btn" onClick={() => setGreenMaxM(v => Math.min(2.0, +(v + 0.1).toFixed(2)))} >+0.1</button>
+            </div>
 
-              <button
-                className="btn"
-                data-active={micOn ? "true" : "false"}
-                onClick={async ()=>{ userMicOffRef.current = false; await startMic(); }}
-                title="Start microphone"
-              >
-                Start
-              </button>
-
-              <button
-                className="btn"
-                data-active={!micOn ? "true" : "false"}
-                onClick={async ()=>{ userMicOffRef.current = true; await stopMic(); }}
-                title="Stop microphone"
-              >
-                Stop
-              </button>
-
-              {/* Calibrate: turns blue while pressed */}
-              <button
-                className="btn"
-                data-active={isPressed ? "true" : "false"}
-                disabled={!micOn}
-                title="Sample 2s room noise and set threshold"
-                onClick={autoCalibrate}
-                onMouseDown={() => setIsPressed(true)}
-                onMouseUp={() => setIsPressed(false)}
-                onMouseLeave={() => setIsPressed(false)}
-                onTouchStart={() => setIsPressed(true)}
-                onTouchEnd={() => setIsPressed(false)}
-                onBlur={() => setIsPressed(false)}
-              >
-                Calibrate
-              </button>
+            {/* RED CUTOFF (ignore beyond) */}
+            <div className="inline-controls" style={{ marginTop: 8 }}>
+              <b>Red zone distance</b>
+              <input
+                className="range"
+                type="range"
+                min="1.0" max="6.0" step="0.1"
+                value={redCutoffM}
+                onChange={(e) => setRedCutoffM(Number(e.target.value))}
+                aria-label="Red zone cutoff in meters"
+              />
+              <span className="chip">{redCutoffM.toFixed(1)} m</span>
+              <button className="btn" onClick={() => setRedCutoffM(DEFAULT_RED_CUTOFF_M)}>reset</button>
+              <button className="btn" onClick={() => setRedCutoffM(v => Math.max(1.0, +(v - 0.1).toFixed(1)))} >–0.1</button>
+              <button className="btn" onClick={() => setRedCutoffM(v => Math.min(6.0, +(v + 0.1).toFixed(1)))} >+0.1</button>
             </div>
           </div>
 
-          {/* level meter */}
-          <LevelMeter levelDbfs={dbfs} thresholdDbfs={threshold} />
+          {/* Row 3: CAMERA */}
+            <div className="stage">
+              <video ref={videoRef} autoPlay muted playsInline />
+              <canvas ref={canvasRef} />
+            </div>
 
-          {/* threshold slider */}
-          <div>
-            <label className="label">Noise Threshold (dBFS)</label>
+            {captions && lastText && (
+              <div aria-live="polite" className="captions" style={{
+                marginTop: 8,
+                background: "rgba(0,0,0,0.55)",
+                padding: "10px 12px",
+                borderRadius: 10,
+                lineHeight: 1.35
+              }}>
+                {lastText}
+              </div>
+            )}
+
+            <div className="row" style={{ gap: 12, alignItems: "center" }}>
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={showAlign}
+                  onChange={(e) => setShowAlign(e.target.checked)}
+              />
+              <span>Show alignment overlay</span>
+            </label>
+
+            <label className="checkbox" style={{ marginLeft: 12 }}>
+              <input
+                type="checkbox"
+                checked={gameModeOn}
+                onChange={(e) => setGameModeOn(e.target.checked)}
+              />
+               <span>Game mode (RPS)</span>
+             </label>
+
+            <div className="kv" style={{ gap: 6 }}>
+              <b>Calib distance:</b>
+              <input
+                className="input"
+                type="number"
+                step="0.05"
+                min="0.3"
+                max="3.0"
+                value={calibDistanceM}
+                onChange={(e) => setCalibDistanceM(Number(e.target.value))}
+                style={{ width: 90 }}
+                aria-label="Calibration distance (meters)"
+              />
+              <span className="muted">m</span>
+            </div>
+
+            <button className="btn" onClick={runCalCountdown}>
+              Calibrate camera (3-2-1)
+            </button>
+          </div>
+
+          {/* Camera settings — now directly under the camera */}
+          <div className="panel" style={{ marginTop: 10 }}>
+            <h3 className="section-title" style={{ marginTop: 0 }}>camera alignment</h3>
+
+            <label className="label">Horizontal FOV (°)</label>
             <input
               className="range"
               type="range"
-              min="-60"
-              max="-20"
-              step="1"
-              value={threshold}
-              onChange={e=>setThreshold(Number(e.target.value))}
+              min="40" max="110" step="1"
+              value={fovHdeg}
+              onChange={(e)=>setFovHdeg(Number(e.target.value))}
+            />
+            <div className="help">{Math.round(fovHdeg)}°</div>
+
+            <label className="label">Vertical FOV (°)</label>
+            <input
+              className="range"
+              type="range"
+              min="25" max="90" step="1"
+              value={fovVdeg}
+              onChange={(e)=>setFovVdeg(Number(e.target.value))}
+            />
+            <div className="help">{Math.round(fovVdeg)}°</div>
+
+            <div className="row" style={{ gap: 16 }}>
+              <div className="flex1">
+                <label className="label">Pan offset (°)</label>
+                <input
+                  className="range"
+                  type="range"
+                  min="-30" max="30" step="0.5"
+                  value={panOffsetDeg}
+                  onChange={(e)=>setPanOffsetDeg(Number(e.target.value))}
+                />
+                <div className="help">{panOffsetDeg.toFixed(1)}°</div>
+              </div>
+              <div className="flex1">
+                <label className="label">Tilt offset (°)</label>
+                <input
+                  className="range"
+                  type="range"
+                  min="-30" max="30" step="0.5"
+                  value={tiltOffsetDeg}
+                  onChange={(e)=>setTiltOffsetDeg(Number(e.target.value))}
+                />
+                <div className="help">{tiltOffsetDeg.toFixed(1)}°</div>
+              </div>
+            </div>
+
+            <div className="row" style={{ gap: 8, marginTop: 8 }}>
+              <button className="btn" onClick={()=>{ setPanOffsetDeg(0); setTiltOffsetDeg(0); }}>reset offsets</button>
+              <span className="help">Tip: click a face on video to auto-zero.</span>
+            </div>
+
+            <div className="divider" />
+
+            <h4 className="section-title">focus weights</h4>
+
+            <label className="label">Closeness</label>
+            <input
+              className="range"
+              type="range"
+              min="0" max="1" step="0.05"
+              value={wNear}
+              onChange={(e)=>setWNear(Number(e.target.value))}
+            />
+
+            <label className="label">Centeredness</label>
+            <input
+              className="range"
+              type="range"
+              min="0" max="1" step="0.05"
+              value={wCenter}
+              onChange={(e)=>setWCenter(Number(e.target.value))}
+            />
+
+            <label className="label">Mouth activity</label>
+            <input
+              className="range"
+              type="range"
+              min="0" max="1" step="0.05"
+              value={wMouth}
+              onChange={(e)=>setWMouth(Number(e.target.value))}
             />
           </div>
 
-          {/* Listen / Silence sliders (0–5s) */}
-          <div className="row" style={{gap:16}}>
-            <div style={{flex:1}}>
-              <label className="label">Listen</label>
-              <input
-                className="range"
-                type="range" min="0" max="5000" step="100"
-                value={listenMs}
-                onChange={e=>setListenMs(Number(e.target.value))}
-              />
-              <div style={{fontSize:12,opacity:.7,marginTop:4}}>
-                {Math.round(listenMs/100)/10}s
-              </div>
-            </div>
-            <div style={{flex:1}}>
-              <label className="label">Silence</label>
-              <input
-                className="range"
-                type="range" min="0" max="5000" step="100"
-                value={silenceMs}
-                onChange={e=>setSilenceMs(Number(e.target.value))}
-              />
-              <div style={{fontSize:12,opacity:.7,marginTop:4}}>
-                {Math.round(silenceMs/100)/10}s
-              </div>
-            </div>
-          </div>
-
-          {/* device selectors (mic + camera) */}
-          <div className="row" style={{ gap:8 }}>
-            <div style={{flex:1}}>
-              <label className="label">Microphone</label>
-              <select
-                className="select"
-                value={audioId}
-                onChange={async (e)=>{ 
-                  const next = e.target.value; 
-                  setAudioId(next); 
-                  await startMic(next, { force: true }); 
-                }}
-              >
-                <option value="">(Default)</option>
-                {audioDevs.map(d => (
-                  <option key={d.deviceId} value={d.deviceId}>{d.label || 'Microphone'}</option>
+          {/* Row 4: GUEST TABLE */}
+          <div className="panel tablewrap" style={{ padding: 12 }}>
+            <table className="table">
+              <thead>
+                <tr>{["#", "Name", "Gesture", "Emotion", "Zone", "AgeGroup", "Gender", "Distance"].map(h => <th key={h}>{h}</th>)}</tr>
+              </thead>
+              <tbody>
+                {table.map((r) => (
+                  <tr key={r.idx}>
+                    <td>{r.idx}</td>
+                    <td>{r.name}</td>
+                    <td>{r.gesture ?? "-"}</td>
+                    <td>{r.emotion ?? "-"}</td>
+                    <td className={r.zone === "green" ? "zone-green" : r.zone === "red" ? "zone-red" : "zone-unk"}>{r.zone}</td>
+                    <td>{r.ageGroup}</td>
+                    <td>{r.gender}</td>
+                    <td>{r.distance}</td>
+                  </tr>
                 ))}
-              </select>
-            </div>
-            <div style={{flex:1}}>
-              <label className="label">Camera</label>
-              <select
-                className="select"
-                value={videoId}
-                onChange={async (e)=>{ setVideoId(e.target.value); await startCamera(e.target.value); }}
-              >
-                <option value="">(Default)</option>
-                {videoDevs.map(d => (
-                  <option key={d.deviceId} value={d.deviceId}>{d.label || 'Camera'}</option>
-                ))}
-              </select>
-            </div>
+              </tbody>
+            </table>
           </div>
         </div>
-      </div>
 
-      {/* Optional: show if session active, mic is off */}
-      {sessionStatus === "ACTIVE" && !micOn && (
-        <div className="panel" style={{ marginTop: 12 }} aria-live="polite">
-          <b>Mic permission needed:</b>&nbsp;
-          <button className="btn" onClick={()=>startMic()}>
-            Enable Microphone
-          </button>
-        </div>
-      )}
+        {/* ===== RIGHT COLUMN ===== */}
+        <div className="rightcol" style={{ position: "sticky", top: 12, alignSelf: "start", zIndex: 1000 }}>
+          {/* System message */}
+          <section className="panel system-panel" style={{ pointerEvents: "auto", zIndex: 1001 }}>
+            <h3 className="section-title">system message</h3>
+            <textarea
+              className="input multiline bigpad"
+              value={systemInstruction}
+              placeholder="Add/override the system instruction…"
+              onChange={(e) => setSystemInstruction(e.target.value)}
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              id="system-instruction-textarea" // Added ID for accessibility
+            />
+            <label htmlFor="system-instruction-textarea" className="visually-hidden">System Instruction</label> {/* Added label for accessibility */}
+          </section>
 
-      {/* MIDDLE: CAMERA STAGE */}
-      <div className="stage">
-        <video ref={videoRef} autoPlay muted playsInline />
-        <canvas ref={canvasRef} />
-      </div>
+          {/* Gemini */}
+          <section className="panel" style={{ pointerEvents: "auto", zIndex: 1001 }}>
+          
+            <h3 className="section-title">gemini settings</h3>
 
-      {/* BOTTOM: TABLE */}
-      <div className="tablewrap panel" style={{padding:12}}>
-        <table className="table">
-          <thead>
-            <tr>
-              {["#", "Gender", "AgeGroup", "Zone", "Name", "Distance"].map(h => (
-                <th key={h}>{h}</th>
+            <label className="label" htmlFor="gemini-api-key-input">Gemini API Key</label> {/* Added htmlFor */}
+            <input
+              className="input bigpad"
+              type="password"
+              inputMode="text"
+              autoComplete="off"
+              placeholder="gsk-…"
+              value={geminiApiKey}
+              onChange={(e) => setGeminiApiKey(e.target.value)}
+              id="gemini-api-key-input" // Added ID
+            />
+
+            <label className="label" htmlFor="gemini-model-select">Model</label> {/* Added htmlFor */}
+            <select
+              className="select big"
+              value={modelQuick}
+              onChange={(e) => setModelQuick(e.target.value)}
+              id="gemini-model-select" // Added ID
+            >
+              {MODEL_OPTIONS.map((m) => (
+                <option key={m.value} value={m.value}>{m.label}</option>
               ))}
-            </tr>
-          </thead>
-          <tbody>
-            {table.map(r => (
-              <tr key={r.idx}>
-                <td>{r.idx}</td>
-                <td>{r.gender}</td>
-                <td>{r.ageGroup}</td>
-                <td className={
-                  r.zone==="green" ? "zone-green" : r.zone==="red" ? "zone-red" : "zone-unk"
-                }>
-                  {r.zone}
-                </td>
-                <td>{r.name}</td>
-                <td>{r.distance}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+            </select>
+
+            <label className="label" htmlFor="gemini-voice-select">Voice</label> {/* Added htmlFor */}
+            <select
+              className="select big"
+              value={geminiVoiceQuick}
+              onChange={(e) => setGeminiVoiceQuick(e.target.value)}
+              id="gemini-voice-select" // Added ID
+            >
+              {(GEMINI_VOICES[modelKind] || []).map((v) => (
+                <option key={v} value={v}>{v}</option>
+              ))}
+            </select>
+
+            <label className="label" htmlFor="gemini-language-select">Language</label> {/* Added htmlFor */}
+            <select
+              className="select big"
+              value={languageCodeQuick}
+              onChange={(e) => setLanguageCodeQuick(e.target.value)}
+              id="gemini-language-select" // Added ID
+            >
+              {LANGS.map(([label, code]) => (
+                <option key={code} value={code}>{label}</option>
+              ))}
+            </select>
+
+            <label className="label" htmlFor="gemini-temperature-range">Temperature</label> {/* Added htmlFor */}
+            <input
+              className="range"
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              value={temperatureQuick}
+              onChange={(e) => setTemperatureQuick(Number(e.target.value))}
+              id="gemini-temperature-range" // Added ID
+            />
+            <div className="help">{temperatureQuick.toFixed(2)}</div>
+
+            <div className="row wrap" style={{ gap: 12, marginTop: 8 }}>
+              <label className="checkbox"><input type="checkbox" checked={enableAffectiveQuick} onChange={(e)=>setEnableAffectiveQuick(e.target.checked)} id="checkbox-affective" /><span>Affective dialog</span></label> {/* Added ID */}
+              <label className="checkbox"><input type="checkbox" checked={proactiveAudioQuick} onChange={(e)=>setProactiveAudioQuick(e.target.checked)} id="checkbox-proactive" /><span>Proactive dialog</span></label> {/* Added ID */}
+              <label className="checkbox"><input type="checkbox" checked={functionCallingQuick} onChange={(e)=>setFunctionCallingQuick(e.target.checked)} id="checkbox-function-calling" /><span>Function calling</span></label> {/* Added ID */}
+              <label className="checkbox"><input type="checkbox" checked={autoFunctionResponseQuick} onChange={(e)=>setAutoFunctionResponseQuick(e.target.checked)} id="checkbox-auto-function-response" /><span>Auto function response</span></label> {/* Added ID */}
+              <label className="checkbox"><input type="checkbox" checked={groundingQuick} onChange={(e)=>setGroundingQuick(e.target.checked)} id="checkbox-grounding" /><span>Grounding (Search)</span></label> {/* Added ID */}
+            </div>
+
+            <div className="row" style={{ gap: 8, marginTop: 10 }}>
+              <button className="btn stretch" onClick={onCreateSession}>Apply & (re)start Gemini</button>
+              <button className="btn" onClick={onHotUpdate}>Hot update</button>
+            </div>
+
+            <div className="divider" />
+
+            <label className="label" htmlFor="tts-provider-select">TTS Provider</label> {/* Added htmlFor */}
+            <select
+              className="select big"
+              value={ttsProviderQuick}
+              onChange={(e) => setTtsProviderQuick(e.target.value)}
+              id="tts-provider-select" // Added ID
+            >
+              <option value="gemini">Gemini</option>
+              <option value="elevenlabs">ElevenLabs</option>
+            </select>
+          </section>
+
+          {/* ElevenLabs settings — ALWAYS mounted; visibility via CSS */}
+          <section className={`panel elevenlabs-panel ${ttsProviderQuick === "elevenlabs" ? "is-active" : ""}`}>
+            <h3 className="section-title">elevenlabs settings</h3>
+            <ElevenLabsSettings />
+          </section>
+        </div>
       </div>
     </main>
   );

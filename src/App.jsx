@@ -5,6 +5,7 @@
 // - Right sidebar: system message, Gemini settings, ElevenLabs settings
 // - Status counters + green zone distance + device selectors
 
+import * as React from "react";
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import * as tf from "@tensorflow/tfjs";
 import "@tensorflow/tfjs-backend-webgl";
@@ -14,6 +15,16 @@ import * as faceapi from "face-api.js";
 import io from "socket.io-client";
 import { FilesetResolver, HandLandmarker } from "@mediapipe/tasks-vision";
 import "./App.css";
+
+// Add this helper (same-origin by default; allows http(s) and ws(s))
+function normalizeServerUrl(u) {
+  if (!u) return undefined; // same-origin
+  let s = String(u || "").trim();
+  if (!s) return undefined;
+  if (/^ws(s)?:\/\//i.test(s)) s = s.replace(/^ws/i, "http"); // ws:// → http://, wss:// → https://
+  if (!/^https?:\/\//i.test(s)) s = "http://" + s; // allow bare host:port
+  return s.replace(/\/+$/, ""); // strip trailing slash
+}
 
 /* ====================== CONSTANTS / CONFIG ====================== */
 const MODEL_URL = "/models";
@@ -844,6 +855,20 @@ export default function App() {
   const socketRef = useRef(null);
   const ttsPlayerRef = useRef(null);
 
+  // Configurable server URL (empty = same-origin)
+  const [serverUrl, setServerUrl] = useState(() => localStorage.getItem("ika:serverUrl") || "");
+  const [serverUrlDraft, setServerUrlDraft] = useState(serverUrl);
+  useEffect(() => { setServerUrlDraft(serverUrl); }, [serverUrl]);
+  useEffect(() => { try { localStorage.setItem("ika:serverUrl", serverUrl); } catch {} }, [serverUrl]);
+
+  // Pick up ?server=… from query string once
+  useEffect(() => {
+    try {
+      const u = new URLSearchParams(window.location.search).get("server");
+      if (u) setServerUrl(u);
+    } catch {}
+  }, []);
+
   /* ---------- Global/session UI state ---------- */
   const [sessionStatus, setSessionStatus] = useState("IDLE");
   const [sessionId, setSessionId] = useState(null);
@@ -1036,66 +1061,50 @@ export default function App() {
   /* ---------- Socket lifecycle ---------- */
   useEffect(() => {
     if (!USE_SOCKET_SERVER) return;
-    const socket = io(SOCKET_URL ?? undefined, {
+
+    const url = normalizeServerUrl(serverUrl || SOCKET_URL);
+    const socket = io(url, {
       transports: ["websocket"],
       path: "/socket.io",
       autoConnect: true,
       reconnection: true,
       reconnectionDelay: 500,
       reconnectionAttempts: Infinity,
+      withCredentials: false,
     });
     socketRef.current = socket;
 
-    socket.on("connect", () => console.log("[socket] connected", socket.id));
-    // tell server who we are ASAP
-    try { socket.emit("hello", { deviceId, sessionId }); } catch {}
-    socket.on("disconnect", () => console.log("[socket] disconnected"));
-
-    // unified status from server (connection, tts, model, binding, etc.)
-    socket.on("server_status", (m) => {
-      console.log("[server_status]", m);
-      // optional: display in UI
-      setServerInfo((prev) => ({ ...prev, ...m }));
+    socket.on("connect", () => {
+      console.log("[socket] connected", socket.id, "url:", url || "(same-origin)");
+      try { socket.emit("hello", { deviceId, sessionId }); } catch {}
     });
-
+    socket.on("disconnect", () => console.log("[socket] disconnected"));
+    socket.on("server_status", (m) => setServerInfo((prev) => ({ ...prev, ...m })));
     socket.on("session_created", (m) => {
-      console.log("[session_created]", m);
       setSessionStatus("ACTIVE");
       setSessionId(m?.sessionId || uuid());
       bump("start");
     });
-
     socket.on("text_response", (t) => {
       const text = typeof t === "string" ? t : t?.text || "";
       if (text) setLastText(text);
     });
-
     socket.on("audio_chunk_received", (pkt) => {
       try {
-        const b64 = pkt?.chunk;
-        if (!b64) return;
-        const bin = atob(b64);
-        const u8 = new Uint8Array(bin.length);
+        const b64 = pkt?.chunk; if (!b64) return;
+        const bin = atob(b64); const u8 = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-        const mime = pkt?.mime || "audio/mpeg";
-        ttsPlayerRef.current.enqueue(u8, mime);
-      } catch (e) {
-        console.warn("[audio] chunk error:", e);
-      }
+        ttsPlayerRef.current.enqueue(u8, pkt?.mime || "audio/mpeg");
+      } catch (e) { console.warn("[audio] chunk error:", e); }
     });
-
     socket.on("server_message", (m) => console.log("[server]", m));
-    socket.on("on_connection_failed", () =>
-      console.warn("[socket] model connection failed on server")
-    );
+    socket.on("on_connection_failed", () => console.warn("[socket] model connection failed on server"));
 
     return () => {
-      try {
-        socket.disconnect();
-      } catch {}
+      try { socket.disconnect(); } catch {}
+      socketRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [serverUrl, deviceId, sessionId]);
 
   const bump = (which) => {
     const nowStr = new Date().toLocaleTimeString();
@@ -1782,6 +1791,14 @@ export default function App() {
           faceapi.nets.ageGenderNet.loadFromUri(MODEL_URL),
           faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
         ]);
+
+          console.log("[models] loaded:", {
+          tiny: !!faceapi.nets.tinyFaceDetector?.isLoaded,
+          lmk68: !!faceapi.nets.faceLandmark68Net?.isLoaded,
+          expr: !!faceapi.nets.faceExpressionNet?.isLoaded,
+          ageg: !!faceapi.nets.ageGenderNet?.isLoaded,
+          recog: !!faceapi.nets.faceRecognitionNet?.isLoaded,
+        });
 
         await startCamera();
 
@@ -2729,12 +2746,12 @@ export default function App() {
 
         let dets = [];
         try {
-          dets = await faceapi
-            .detectAllFaces(video, tinyOptsRef.current)
-            .withFaceLandmarks()
-            .withFaceExpressions()
-            .withAgeAndGender()
-            .withFaceDescriptors();
+          let chain = faceapi.detectAllFaces(video, tinyOptsRef.current);
+          if (faceapi.nets.faceLandmark68Net?.isLoaded)  chain = chain.withFaceLandmarks();
+          if (faceapi.nets.faceExpressionNet?.isLoaded) chain = chain.withFaceExpressions();
+          if (faceapi.nets.ageGenderNet?.isLoaded)      chain = chain.withAgeAndGender();
+          if (faceapi.nets.faceRecognitionNet?.isLoaded)chain = chain.withFaceDescriptors();
+          dets = await chain;
         } catch (e) {
           console.warn("faceapi detect chain failed:", e?.message || e);
           dets = [];
@@ -4325,6 +4342,30 @@ export default function App() {
 
         {/* ===== RIGHT COLUMN ===== */}
         <div className="rightcol" style={{ position: "sticky", top: 12, alignSelf: "start", zIndex: 1000 }}>
+          {/* IP Address */}
+        <section className="panel" style={{ pointerEvents: "auto", zIndex: 1001 }}>
+          <h3 className="section-title">server connection</h3>
+          <div className="row" style={{ gap: 8 }}>
+            <input
+              className="input bigpad"
+              placeholder="(same-origin) or http://PC-IP:PORT"
+              value={serverUrlDraft}
+              onChange={(e) => setServerUrlDraft(e.target.value)}
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+            />
+            <button className="btn" onClick={() => setServerUrl(serverUrlDraft.trim())}>
+              Apply & reconnect
+            </button>
+            <button className="btn" onClick={() => { setServerUrlDraft(""); setServerUrl(""); }}>
+              Use same-origin
+            </button>
+          </div>
+          <div className="help" style={{ marginTop: 6 }}>
+            Current: {serverUrl ? serverUrl : "(same-origin)"} · {serverInfo.connected ? "connected" : "disconnected"}
+          </div>
+        </section>
           {/* System message */}
           <section className="panel system-panel" style={{ pointerEvents: "auto", zIndex: 1001 }}>
             <h3 className="section-title">system message</h3>

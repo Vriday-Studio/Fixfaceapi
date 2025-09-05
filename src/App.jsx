@@ -80,7 +80,7 @@ const HANDS_ENABLED = true;
 // runtime & cadence
 const HANDS_FAST_MS = 66;
 const HANDS_IDLE_MS = 180;
-const HANDS_CACHE_MS = 800;
+const HANDS_CACHE_MS = 1000;
 const HANDS_SEND_MS  = 600;
 
 // Game mode cadence (snappier)
@@ -89,7 +89,7 @@ const GM_HANDS_IDLE_MS = 120;
 
 // Hand constants
 const HANDS_MODEL_URL = "/mp/hand_landmarker.task";
-const HANDS_MAX_NUM = 1;
+const HANDS_MAX_NUM = 2;
 const HANDS_IMAGE_SIDE = 256;
 
 // polite “call over” policy
@@ -200,11 +200,14 @@ function dist(a, b){ return Math.hypot((a.x-b.x)||0, (a.y-b.y)||0); }
 // Keep micro history for wave velocity
 const waveHistRef = { t: 0, xs: [] }; // xs: recent x positions (screen-normalized)
 
+
 // classify a "wave": lateral wrist direction changes within short window
 function classifyWave(landmarks, now){
   try {
     const wrist = landmarks[MP.WRIST];
     if (!wrist) return {ok:false};
+    // drop tiny/ghost hands
+    if (palmSpanLen(landmarks) < 0.020) return { ok: false };
     const x = wrist.x;
     const xs = waveHistRef.xs;
 
@@ -229,15 +232,15 @@ function classifyWave(landmarks, now){
     const vel = recentLateralMotion();
     // ...inside classifyWave, after `const amp = Math.max(...xs) - Math.min(...xs);`...
     // fast-path A: medium swing with ≥1 flip → lock sooner
-    if (xs.length >= 6 && amp > 0.030 && flips >= 1) {
+    if (xs.length >= 6 && amp > 0.028 && flips >= 1) {
       return { ok: true, type: "wave", score: Math.min(1, 0.50 + Math.min(0.35, amp * 4.0)) };
     }
     // fast-path B: small swing + noticeable lateral velocity (typical subtle wave)
-    if (flips >= 1 && amp > 0.018 && vel > 0.040) {
+    if (flips >= 2 && amp > 0.018 && vel > 0.048) {
       return { ok: true, type: "wave", score: Math.min(1, 0.44 + Math.min(0.30, amp * 3.2) + Math.min(0.12, (vel - 0.045) * 3.2)) };
     }
     // normal path: 2 flips with modest amplitude
-    if (flips >= 2 && amp > 0.010) {
+    if (flips >= 2 && amp > 0.012) {
       return { ok:true, type:"wave", score: Math.min(1, 0.28 + 0.18 * flips + Math.min(0.35, amp * 3.8)) };
     }
     return {ok:false};
@@ -300,7 +303,7 @@ function classifyThumbsUp(landmarks){
 
     // Anti-wave gate: if hand is moving side-to-side, don't call 👍
     const vel = recentLateralMotion();
-    if (vel > 0.06) return { ok: false };
+    if (vel > 0.08) return { ok: false };
 
     // Hand axis (wrist → index MCP): want it roughly vertical for 👍
     const vIdx = v2(indexMcp.x - wrist.x, indexMcp.y - wrist.y);
@@ -310,8 +313,8 @@ function classifyThumbsUp(landmarks){
     // Basic pose checks
     const thumbAbove = thumbTip.y < indexMcp.y - 0.012;   // stronger than before
     const open = dist(thumbTip, indexTip) > 0.030;        // small relaxed gap
-    const bigEnough = palmSpanLen(landmarks) > 0.035;
-    const orientedUp = axisCosToVertical > 0.86;
+    const orientedUp = axisCosToVertical > 0.80;
+    const bigEnough = palmSpanLen(landmarks) > 0.030;
 
     // Other fingers mostly closed
     const idxClosed = fingerClosed(landmarks, MP.INDEX_TIP, MP.INDEX_MCP).closed;
@@ -319,6 +322,13 @@ function classifyThumbsUp(landmarks){
     const rngClosed = fingerClosed(landmarks, MP.RING_TIP, MP.RING_MCP).closed;
     const pkyClosed = fingerClosed(landmarks, MP.PINKY_TIP, MP.PINKY_MCP).closed;
     const closedCount = [idxClosed, midClosed, rngClosed, pkyClosed].filter(Boolean).length;
+    // Fast path: clear 👍 pose (snappy, anti-false guarded by pose checks)
+    const otherClosed = closedCount >= 2;
+    if (thumbAbove && open && bigEnough && orientedUp && otherClosed) {
+      const openness = Math.max(0, Math.min(1, (dist(thumbTip, indexTip) - 0.03) / 0.12));
+      const sFast = Math.min(1, 0.78 + 0.22 * openness);
+      return { ok: true, type: "thumbs_up", score: sFast };
+    }
 
     if (thumbAbove && open && bigEnough && orientedUp && closedCount >= 2) {
       // Score: openness + orientation + stillness boost (faster lock when steady)
@@ -360,7 +370,7 @@ function classifyPeace(lm) {
     if (idx.open && mid.open && !rng.open && !pky.open) {
       const margin = Math.max(0, idx.margin) + Math.max(0, mid.margin);
       const clamp = Math.max(0, 0.12 - Math.max(0, rng.margin)) + Math.max(0, 0.12 - Math.max(0, pky.margin));
-      const score = Math.min(1, 0.45 + 0.35 * margin + 0.25 * clamp);
+      const score = Math.min(1, 0.50 + 0.35 * margin + 0.25 * clamp);
       return { ok: true, type: "peace", score };
     }
     return { ok: false };
@@ -390,11 +400,17 @@ function classifyRaiseHand(lm) {
     const vel = recentLateralMotion();
 
     const wa = waveActivity();
-    const isWaving = (wa.flips >= 2 && wa.amp > 0.025);
+    const isWaving = (wa.flips >= 3 && wa.amp > 0.030); // require stronger wave to block
+
+    if (!isWaving && opens >= 3 && cosToVertical > 0.52 && palmSpanLen(lm) >= 0.030) {
+      const heightBoostFast = Math.max(0, (0.68 - minY) * 0.8);
+      const sFast = Math.min(1, 0.60 + 0.20 * Math.min(1, (opens - 2) / 2) + heightBoostFast);
+      return { ok: true, type: "raise_hand", score: sFast };
+    }
 
     // Variant A: open palm (stricter)
-    const highA = minY <= 0.55;
-    const passOpenPalm = (opens >= 3) && (cosToVertical > 0.68) && !isWaving && highA && (vel <= 0.032);
+    const highA = minY <= 0.62; // allow slightly lower in frame
+    const passOpenPalm = (opens >= 3) && (cosToVertical > 0.58) && !isWaving && highA && (vel <= 0.060);
 
     // Variant B: flat palm (fingers together), stricter
     const span = palmSpanLen(lm);
@@ -406,16 +422,16 @@ function classifyRaiseHand(lm) {
     const meanAdj = tipPairs
       .map(([a, b]) => Math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y))
       .reduce((s, d) => s + d, 0) / (tipPairs.length || 1);
-    const together = (meanAdj / Math.max(1e-3, span)) < 0.18;
-    const highB = minY <= 0.60;
-    const passFlatPalm = (opens >= 2) && together && (cosToVertical > 0.65) && !isWaving && highB && (vel <= 0.032);
+      const together = (meanAdj / Math.max(1e-3, span)) < 0.20;
+      const highB = minY <= 0.68;
+      const passFlatPalm = (opens >= 2) && together && (cosToVertical > 0.56) && !isWaving && highB && (vel <= 0.060);
 
     if (passOpenPalm || passFlatPalm) {
       const openness = Math.max(0, (idx.margin + mid.margin + rng.margin + pky.margin) / 4);
       const orientBoost = Math.max(0, (cosToVertical - 0.65) * 0.9);
       const heightBoost = Math.max(0, (0.60 - minY) * 0.8);
       const togetherBoost = passFlatPalm ? Math.min(0.22, Math.max(0, (0.18 - (meanAdj / Math.max(1e-3, span))) * 2.0)) : 0;
-      const score = Math.min(1, 0.30 + 0.28 * openness + orientBoost + heightBoost + togetherBoost);
+      const score = Math.min(1, 0.34 + 0.26 * openness + orientBoost + heightBoost + togetherBoost);
       return { ok: true, type: "raise_hand", score };
     }
     return { ok: false };
@@ -429,11 +445,13 @@ function classifyRaiseHand(lm) {
 function classifyOnPhone(lm, faces, canvasW, canvasH) {
   try {
     if (!lm || lm.length < 21 || !Array.isArray(faces) || !faces.length) return { ok: false };
-    const wrist = lm[MP.WRIST], iMcp = lm[MP.INDEX_MCP];
-    const thumbTip = lm[MP.THUMB_TIP];
+    const wrist = lm[MP.WRIST], iMcp = lm[MP.INDEX_MCP], thumbTip = lm[MP.THUMB_TIP];
     if (!wrist || !iMcp || !thumbTip) return { ok: false };
 
-    // nearest face to (wrist or thumb)
+    // tiny/ghost hands → skip
+    if (palmSpanLen(lm) < 0.020) return { ok: false };
+
+    // Use nearest provided face (we pass the assigned one already)
     const pickNear = (px, py) => {
       let best = null, bestD2 = Infinity;
       for (const f of faces) {
@@ -444,63 +462,112 @@ function classifyOnPhone(lm, faces, canvasW, canvasH) {
       }
       return best;
     };
-    const fW = pickNear(wrist.x, wrist.y) || faces[0];
+    const f = pickNear(wrist.x, wrist.y) || faces[0];
 
-    const fx = (fW.cx || 0) / Math.max(1, canvasW);
-    const fy = (fW.cy || 0) / Math.max(1, canvasH);
-    const hw = Math.max(0.02, (fW.w || 120) / Math.max(1, canvasW) * 0.5);
-    const hh = Math.max(0.03, (fW.h || 160) / Math.max(1, canvasH) * 0.5);
+    // Face center + half extents (normalized 0..1)
+    const fx = (f.cx || 0) / Math.max(1, canvasW);
+    const fy = (f.cy || 0) / Math.max(1, canvasH);
+    const hw = Math.max(0.02, (f.w || 120) / Math.max(1, canvasW) * 0.5);
+    const hh = Math.max(0.03, (f.h || 160) / Math.max(1, canvasH) * 0.5);
 
-    // side targets for cheek/ear
-    const sideSignW = wrist.x >= fx ? +1 : -1;
-    const sideXW = fx + sideSignW * hw * 0.95;
-    const closenessSideW = Math.max(0, Math.min(1, 1 - Math.abs(wrist.x - sideXW) / (hw * 0.9)));
-    const closenessYW = Math.max(0, Math.min(1, 1 - Math.abs(wrist.y - fy) / (hh * 0.7)));
+    // Side of face (phone side = wrist side)
+    const sideSign = wrist.x >= fx ? +1 : -1;
 
-    // Alternate: thumb tip near cheek (some hold phone with thumb near ear)
-    const sideSignT = thumbTip.x >= fx ? +1 : -1;
-    const sideXT = fx + sideSignT * hw * 0.95;
-    const closenessSideT = Math.max(0, Math.min(1, 1 - Math.abs(thumbTip.x - sideXT) / (hw * 0.9)));
-    const closenessYT = Math.max(0, Math.min(1, 1 - Math.abs(thumbTip.y - fy) / (hh * 0.7)));
+    // Ear anchor (slightly behind temple, a bit above face center)
+    const earX = fx + sideSign * hw * 0.78;
+    const earY = fy - hh * 0.08;
 
-    // orientation: wrist->index MCP near vertical
-    const vx = iMcp.x - wrist.x, vy = iMcp.y - wrist.y;
-    const vlen = Math.hypot(vx, vy) || 1e-6;
-    const cosToVertical = Math.abs(vy) / vlen;
+    // Legacy cheek band (keep as supportive gate)
+    const targetBandX = fx + sideSign * hw * 0.92;
+    const bandY = (y) => Math.max(0, Math.min(1, 1 - Math.abs(y - fy) / (hh * 0.85)));
+    const closeSide = (px, tx) => Math.max(0, Math.min(1, 1 - Math.abs(px - tx) / (hw * 0.95)));
 
-    // few open fingers (holding phone)
+    // Points: wrist, thumb, and phone mid
+    const mid = { x: (wrist.x + thumbTip.x) * 0.5, y: (wrist.y + thumbTip.y) * 0.5 };
+    const closeW = { side: closeSide(wrist.x, targetBandX),    y: bandY(wrist.y) };
+    const closeT = { side: closeSide(thumbTip.x, targetBandX), y: bandY(thumbTip.y) };
+    const closeM = { side: closeSide(mid.x, targetBandX),      y: bandY(mid.y) };
+
+    // Ear distance (normalize by face half extents)
+    const normDist = (px, py) => {
+      const dx = (px - earX) / hw;
+      const dy = (py - earY) / hh;
+      return Math.hypot(dx, dy);
+    };
+    const dEarW = normDist(wrist.x, wrist.y);
+    const dEarT = normDist(thumbTip.x, thumbTip.y);
+    const dEarM = normDist(mid.x,   mid.y);
+    const dEarMin = Math.min(dEarW, dEarT, dEarM);
+    const earProx = Math.max(0, 1 - Math.min(1.3, dEarMin)); // 0..1
+
+    // Orientation: accept wrist→index OR wrist→thumb as near-vertical
+    const vx1 = iMcp.x - wrist.x, vy1 = iMcp.y - wrist.y;
+    const vlen1 = Math.hypot(vx1, vy1) || 1e-6;
+    const cosVertIdx = Math.abs(vy1) / vlen1;
+    const vx2 = thumbTip.x - wrist.x, vy2 = thumbTip.y - wrist.y;
+    const vlen2 = Math.hypot(vx2, vy2) || 1e-6;
+    const cosVertPhone = Math.abs(vy2) / vlen2;
+    const cosToVertical = Math.max(cosVertIdx, cosVertPhone);
+
+    // Few open fingers (holding phone)
     const idx = fingerOpen(lm, MP.INDEX_TIP, MP.INDEX_MCP);
-    const mid = fingerOpen(lm, MP.MIDDLE_TIP, MP.MIDDLE_MCP);
+    const midF = fingerOpen(lm, MP.MIDDLE_TIP, MP.MIDDLE_MCP);
     const rng = fingerOpen(lm, MP.RING_TIP, MP.RING_MCP);
     const pky = fingerOpen(lm, MP.PINKY_TIP, MP.PINKY_MCP);
-    const opens = [idx, mid, rng, pky].filter(f => f.open).length;
+    const opens = [idx, midF, rng, pky].filter(f => f.open).length;
+    const fewFingers = opens <= 3;
 
-    // anti-wave: allow small motion
+    // Anti-wave: allow some motion, block strong waving
     const wa = waveActivity();
     const isWaving = (wa.flips >= 2 && wa.amp > 0.025);
+    const vel = recentLateralMotion();
 
-    // Pass if either wrist-near-cheek OR thumb-near-cheek looks good
-    const passWrist = (closenessSideW > 0.18 && closenessYW > 0.15);
-    const passThumb = (closenessSideT > 0.22 && closenessYT > 0.15);
-    const fewFingers = opens <= 4;
+    // Gates
+    const passBand =
+      (closeW.side > 0.08 && closeW.y > 0.08) ||
+      (closeT.side > 0.10 && closeT.y > 0.08) ||
+      (closeM.side > 0.10 && closeM.y > 0.10);
 
+    // Ear gate: require true near-ear proximity (distance normalized by face size)
+    // 0.62 ≈ within ~62% of face half-extent; tweak 0.58–0.68 if needed
+    const passEarStrict = dEarMin <= 0.62;
+
+    // Final OK (ear distance is mandatory; band is supportive only)
     const ok =
-      (passWrist || passThumb) &&
-      (cosToVertical > 0.55) &&
+      passEarStrict &&
+      (cosToVertical > 0.45) &&
       fewFingers &&
-      !isWaving;
+      !isWaving &&
+      (vel <= 0.14);
 
     if (!ok) return { ok: false };
 
-    const closenessSide = Math.max(closenessSideW, closenessSideT);
-    const closenessY = Math.max(closenessYW, closenessYT);
+    // Fast path: very close to ear + upright-ish → snap
+    if (dEarMin <= 0.48 && cosToVertical > 0.50 && vel <= 0.12) {
+      const sFast = Math.min(1,
+        0.78 + 0.16 * earProx +            // boost ear proximity
+        0.06 * Math.max(0, (cosToVertical - 0.50) * 2.0)
+      );
+      return { ok: true, type: "on_phone", score: sFast };
+    }
+
+    // Score: emphasize ear proximity; keep cheek band and orientation as helpers
+    const closenessSide = Math.max(closeW.side, closeT.side, closeM.side);
+    const closenessY = Math.max(closeW.y, closeT.y, closeM.y);
+    const multiPointBonus =
+      (closeW.side > 0.08 && closeT.side > 0.08 ? 0.08 : 0) +
+      (closeM.side > 0.10 && (closeW.side > 0.08 || closeT.side > 0.08) ? 0.06 : 0);
+
     const score = Math.min(
       1,
-      0.42 * closenessSide +
-      0.22 * closenessY +
-      0.22 * Math.max(0, (cosToVertical - 0.55) * 2.0) +
-      0.14 * Math.max(0, 0.22 - wa.amp) // stillness bonus
+      0.30 * closenessSide +
+      0.18 * closenessY +
+      0.40 * earProx +                       // ← heavier ear weight
+      0.08 * Math.max(0, (cosToVertical - 0.50) * 2.0) +
+      0.04 * Math.max(0, 0.22 - wa.amp) +    // stillness
+      multiPointBonus
     );
+
     return { ok: true, type: "on_phone", score };
   } catch {
     return { ok: false };
@@ -560,7 +627,7 @@ function classifyScissors(lm) {
 // --- Gesture stabilizer (wave-first, anti-flicker) ---
 const WAVE_BOOT_MS = 300;        // after startup/change, allow wave to “claim” quickly
 const WAVE_GRACE_MS = 550;       // how long wave is allowed to win ties/near-ties
-const CHANGE_COOLDOWN_MS = 450;  // prevent rapid flip-flops after we lock something
+const CHANGE_COOLDOWN_MS = 520;  // prevent rapid flip-flops after we lock something
 
 // Hoisted: gesture voting config (so pickStableGesture can see them)
 const GESTURE_PRIORITY   = ["wave", "raise_hand", "on_phone", "thumbs_up", "peace", "paper", "rock", "scissors"];
@@ -570,11 +637,11 @@ const REQUIRE_CONSISTENT = 2;    // ≥3 agreeing frames
 const CLEAR_IF_IDLE_MS   = 450;  // drop stale gesture after this
 const MIN_SCORE = {
   wave: 0.40,
-  thumbs_up: 0.26,
-  peace: 0.50,
-  raise_hand: 0.50,
-  on_phone: 0.38,
-  paper: 0.45,
+  thumbs_up: 0.22,
+  peace: 0.46,
+  raise_hand: 0.36,
+  on_phone: 0.34,
+  paper: 0.38,
   rock: 0.45,
   scissors: 0.45,
 };
@@ -660,10 +727,14 @@ function pickStableGesture(now, win, prevStable) {
   const bestScoreVal = (byType.get(best.type)?.best ?? 0);
   const strong =
     (bestScoreVal >= 0.68 && best.count >= 2) ||
-    (best.type === "thumbs_up" && bestScoreVal >= 0.82) ||
-    (best.type === "raise_hand" && bestScoreVal >= 0.82) ||
-    (best.type === "on_phone" && bestScoreVal >= 0.72);
-  const consistent = strong || best.count >= REQUIRE_CONSISTENT || best.count >= Math.ceil(0.6 * fresh.length);
+    (best.type === "thumbs_up" && bestScoreVal >= 0.78) ||
+    (best.type === "raise_hand" && bestScoreVal >= 0.68) ||
+    (best.type === "peace" && bestScoreVal >= 0.70) ||
+    (best.type === "paper" && bestScoreVal >= 0.70) ||
+    (best.type === "on_phone" && bestScoreVal >= 0.68);
+  const needByType = { wave: 3 }; // wave needs 3 frames; others keep default (2)
+  const need = needByType[best.type] || REQUIRE_CONSISTENT;
+  const consistent = strong || best.count >= need || best.count >= Math.ceil(0.6 * fresh.length);
   if (!consistent) {
     return (prevStable && (now - prevStable.t) < CLEAR_IF_IDLE_MS) ? prevStable : null;
   }
@@ -912,13 +983,20 @@ export default function App() {
   const handsCtxRef = useRef(null);
 
   // last gesture memory
-  // shape: { type: "wave" | "thumbs_up" | null, score: number, t: number }
-  const lastGestureRef = useRef(null);
-  const lastGestureSentRef = useRef(0); // last time we allowed sending to server
-
-  // Windowed voting to stabilize gestures
-  const gestureWindowRef = useRef([]); // array of { type, score, t }
   const stableGestureRef = useRef(null); // { type, score, t }
+
+  // NEW: Per-face gesture windows and stable picks
+  const perFaceGestureWinRef = useRef(new Map());   // key -> [{type,score,t}, ...]
+  const perFaceStableRef = useRef(new Map());       // key -> {type,score,t}
+  const lastGestureSentPerFaceRef = useRef(new Map()); // key -> lastTs
+
+  // NEW: per-face wave histories (used by wave/velocity gates)
+  const waveHistByFaceRef = useRef(new Map());
+
+  // --- age/gender stagger + cache ---
+  const AGE_SAMPLE_MS = 600;
+  const lastAgeSampleRef = useRef(0);
+  const ageGenderCacheRef = useRef(new Map()); // key -> { age, gender }
 
   const [locationLabel, setLocationLabel] = useState(
     localStorage.getItem("ika:locationLabel") || "Jakarta (Bundaran HI)"
@@ -1030,30 +1108,30 @@ export default function App() {
 
     const ts = performance.now();
 
-    // 1) Try VIDEO mode (cheap path)
+    // 1) Try VIDEO mode
     try {
       const res = landmarker.detectForVideo(videoEl, ts);
       const hands = res?.landmarks || res?.handLandmarks || [];
       if (hands.length) {
         handsFailRef.current = 0;
         lastLmSeenTsRef.current = ts;
-        return hands[0].map(pt => ({ x: pt.x, y: pt.y }));
+        // normalize to [{x,y}...] in 0..1
+        return hands.map(h => h.map(pt => ({ x: pt.x, y: pt.y })));
       }
-    } catch { /* ignore */ }
+    } catch {}
 
     // No luck in VIDEO this frame
     handsFailRef.current = (handsFailRef.current || 0) + 1;
 
-    // 2) Occasionally try IMAGE fallback (expensive: switch modes)
-    // Only every 4th miss to avoid mode-flip cost each frame
+    // 2) Occasionally try IMAGE fallback
     if ((handsFailRef.current % 4) !== 0) return null;
 
     try {
-      await landmarker.setOptions?.({ runningMode: "IMAGE" });
+      await landmarker.setOptions?.({ runningMode: "IMAGE", numHands: HANDS_MAX_NUM });
 
       const c = handsOffscreenRef.current, g = handsCtxRef.current;
       if (!c || !g) return null;
-
+ 
       const W = c.width, H = c.height;
       const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
       const scale = Math.min(W / vw, H / vh);
@@ -1065,20 +1143,20 @@ export default function App() {
       const res2 = await landmarker.detect(c);
       const hands2 = res2?.landmarks || res2?.handLandmarks || [];
 
-      // Switch back to VIDEO mode for the next frames
-      await landmarker.setOptions?.({ runningMode: "VIDEO" });
+      await landmarker.setOptions?.({ runningMode: "VIDEO", numHands: HANDS_MAX_NUM });
 
       if (hands2.length) {
         handsFailRef.current = 0;
         lastLmSeenTsRef.current = performance.now();
-        const pts = hands2[0].map(pt => ({
-          x: (dx + pt.x * dw) / W,
-          y: (dy + pt.y * dh) / H,
-        }));
-        return pts;
+        return hands2.map(hand =>
+          hand.map(pt => ({
+            x: (dx + pt.x * dw) / W,
+            y: (dy + pt.y * dh) / H,
+          }))
+        );
       }
     } catch {
-      try { await handLmRef.current?.setOptions?.({ runningMode: "VIDEO" }); } catch {}
+      try { await handLmRef.current?.setOptions?.({ runningMode: "VIDEO", numHands: HANDS_MAX_NUM }); } catch {}
     }
 
     return null;
@@ -2842,13 +2920,17 @@ export default function App() {
         // Ensure backend is fully ready (awaits if mid-initialization)
         await backendReadyRef.current;
 
+        // ---- choose detection chain; stagger age/gender sampling ----
+        const heavyAgeNow = (now - (lastAgeSampleRef.current || 0)) >= AGE_SAMPLE_MS;
+        if (heavyAgeNow) lastAgeSampleRef.current = now;
+
         let dets = [];
         try {
           let chain = faceapi.detectAllFaces(video, tinyOptsRef.current);
           if (faceapi.nets.faceLandmark68Net?.isLoaded)  chain = chain.withFaceLandmarks();
           if (faceapi.nets.faceExpressionNet?.isLoaded) chain = chain.withFaceExpressions();
-          if (faceapi.nets.ageGenderNet?.isLoaded)      chain = chain.withAgeAndGender();
-          if (faceapi.nets.faceRecognitionNet?.isLoaded)chain = chain.withFaceDescriptors();
+          if (heavyAgeNow && faceapi.nets.ageGenderNet?.isLoaded) chain = chain.withAgeAndGender();
+          if (faceapi.nets.faceRecognitionNet?.isLoaded) chain = chain.withFaceDescriptors();
           dets = await chain;
         } catch (e) {
           console.warn("faceapi detect chain failed:", e?.message || e);
@@ -2934,28 +3016,16 @@ export default function App() {
           ctx.restore();
         }
 
-        // Snapshot current gesture once per frame (used by labels and HUD)
-        const gesturePayload = (() => {
-          const g = stableGestureRef.current || lastGestureRef.current;
-          if (!g) return null;
-          return (now - g.t) <= HANDS_CACHE_MS ? { type: g.type, score: g.score, t: g.t } : null;
-        })();
+        // Define per-frame gesture eligibility set (top-2 will be added below)
+        const gestureAllowedKeys = new Set();
 
         // 3) Draw + identify only the tracked subset (stable by name/gid)
         const tracks = recentMapRef.current;
         for (let k = 0; k < tracked.length; k++) {
           const { i, det, box, dist, zone } = tracked[k];
-          const color = "#22c55e"; // green only
-          const gender = (det.gender || "").toLowerCase();
-          const expr = topExpression(det.expressions);
-
-          // Attach gesture to each GREEN face (text labels, not emoji)
-          const gestureLbl =
-            (zone === "green" && gesturePayload)
-              ? gestureLabelOf(gesturePayload)
-              : null;
 
           // --- recognition (fast path + small margin check) ---
+          const matcher = faceMatcherRef.current;
           let name = null;
           if (matcher && det.descriptor) {
             const best = matcher.findBestMatch(det.descriptor);
@@ -2970,7 +3040,6 @@ export default function App() {
               const bestLabel = best.label;
               const bestDist = best.distance;
               let second = 1;
-
               for (const ld of matcher.labeledDescriptors) {
                 if (ld.label === bestLabel) continue;
                 for (const d of ld.descriptors) {
@@ -2989,10 +3058,17 @@ export default function App() {
 
           // --- stabilization keyed by stable identity (name or gid), not by index ---
           const stableKey = (name || guestId) ?? `tmp-${i}`;
+
+          // Slot key (stable within this frame order; decouples from identity collisions)
+          const slotKey = `slot-${k}`;
+
+          // Mark top-2 by distance as gesture-eligible
+          if (k < 2) gestureAllowedKeys.add(stableKey);
+
           const prev = tracks[stableKey];
           if (prev && prev.name !== displayName) {
             if ((prev.count || 0) < STABILIZE_FRAMES) {
-              displayName = prev.name;        // hold old label briefly
+              displayName = prev.name;
               prev.count = (prev.count || 0) + 1;
             } else {
               tracks[stableKey] = { name: displayName, count: 0 };
@@ -3000,6 +3076,16 @@ export default function App() {
           } else {
             tracks[stableKey] = { name: displayName, count: 0 };
           }
+
+          // pick gender/age with staggered cache
+          const cacheGA = ageGenderCacheRef.current.get(stableKey) || {};
+          const genderRaw = det.gender ?? cacheGA.gender ?? "";
+          const gender = String(genderRaw || "").toLowerCase();
+          const ageVal = Number.isFinite(det.age) ? det.age : (Number.isFinite(cacheGA.age) ? cacheGA.age : null);
+          if (heavyAgeNow && (Number.isFinite(det.age) || det.gender)) {
+            ageGenderCacheRef.current.set(stableKey, { age: det.age, gender: det.gender });
+          }
+          const expr = topExpression(det.expressions);
 
           // === angles / position / mouth activity / draw ===
           const dbox = shrinkBox(box);
@@ -3020,43 +3106,47 @@ export default function App() {
           const normY = Math.min(1, Math.abs((cy - cy0) / (canvas.height * 0.5)));
           const centerNorm = Math.min(1, Math.hypot(normX, normY));
 
+          // mouth EMA with hold (avoid 0-drops)
           let mouthActivity = 0;
           try {
             const lm = det.landmarks;
-            const level = mouthMAR(lm); // already 0..1
-            const key = (name || guestId) ?? `idx${i}`;
-            const rec = mouthMapRef.current.get(key) || { ema: level };
-            // EMA on the level itself (not on deltas)
-            rec.ema = rec.ema ? (0.7 * rec.ema + 0.3 * level) : level;
+            const key = stableKey;
+            const rec = mouthMapRef.current.get(key) || { ema: 0.3, t: now };
+            const level = mouthMAR(lm);
+            if (!Number.isFinite(level) || level <= 0) {
+              // hold previous with gentle decay toward neutral 0.3
+              rec.ema = 0.98 * rec.ema + 0.02 * 0.3;
+            } else {
+              rec.ema = rec.ema ? (0.7 * rec.ema + 0.3 * level) : level;
+            }
+            rec.t = now;
             mouthMapRef.current.set(key, rec);
             mouthActivity = Math.max(0, Math.min(1, rec.ema));
-          } catch {}
+          } catch {
+            const rec = mouthMapRef.current.get(stableKey);
+            if (rec) mouthActivity = rec.ema; // hold last
+          }
 
           // draw box
-          ctx.strokeStyle = color;
+          ctx.strokeStyle = "#22c55e";
           ctx.lineWidth = BOX_LINE_WIDTH;
           ctx.strokeRect(dbox.x, dbox.y, dbox.width, dbox.height);
 
-          // labels (+ optional gesture glyph for green faces)
-          const freshGesture = gesturePayload; // already time-validated above
-          const gestureIcon =
-            freshGesture && zone === "green"
-              ? ({
-                  wave: "👋",
-                  thumbs_up: "👍",
-                  on_phone: "📞",
-                  peace: "✌️",
-                  raise_hand: "✋",
-                  paper: "✋",
-                  rock: "✊",
-                  scissors: "✌️",
-                }[freshGesture.type] || "🤟")
-              : "";
+          // Per-face gesture label (no global fallback → true separation)
+          const faceStable = perFaceStableRef.current.get(stableKey);
+          const freshFaceGesture =
+            gestureAllowedKeys.has(stableKey) &&
+            faceStable && (now - faceStable.t) <= HANDS_CACHE_MS ? faceStable : null;
 
-          const ageTxt = Number.isFinite(det.age) ? Math.max(0, Math.round(det.age)) : "-";
+          const gestureLbl =
+            (zone === "green" && freshFaceGesture) ? gestureLabelOf(freshFaceGesture) : null;
+
+          const ageTxt = Number.isFinite(ageVal) ? Math.max(0, Math.round(ageVal)) : "-";
           const l1 = `${displayName}${gestureLbl ? " • " + gestureLbl : ""} • ${zone} • ${ageTxt} ${gender} • ${expr}`;
           const l2 = `yaw ${yawDeg.toFixed(1)}° · pitch ${pitchDeg.toFixed(1)}° · mouth ${mouthActivity.toFixed(2)}`;
 
+          // ----- LABEL DRAW (fixed: define color; removed duplicate vars/badges) -----
+          const color = zone === "green" ? "rgba(34,197,94,0.85)" : "rgba(239,68,68,0.85)";
           const lineH = 18;
           const lines = showAlignRef.current ? 2 : 1;
           const tw = Math.max(ctx.measureText(l1).width, showAlignRef.current ? ctx.measureText(l2).width : 0) + LABEL_PAD_X * 2;
@@ -3077,26 +3167,6 @@ export default function App() {
             ctx.fillText(l2, lx + LABEL_PAD_X, ly + LABEL_PAD_Y + lineH);
           }
 
-          // Gesture text badge (no emoji) for GREEN faces
-          if (freshGesture && zone === "green") {
-            const gtxt = gestureLabelOf(freshGesture);
-            if (gtxt) {
-              ctx.save();
-              ctx.font = "bold 14px system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif";
-              const padX = 6, padY = 4;
-              const tw2 = ctx.measureText(gtxt).width + padX * 2;
-              const th2 = 18 + padY * 2;
-              // top-right inside the box, clamped
-              const gx = Math.max(0, Math.min(dbox.x + dbox.width - tw2 - 4, canvas.width - tw2));
-              const gy = Math.max(0, dbox.y + 4);
-              ctx.fillStyle = "rgba(34,197,94,0.9)";
-              ctx.fillRect(gx, gy, tw2, th2);
-              ctx.fillStyle = "#fff";
-              ctx.fillText(gtxt, gx + padX, gy + padY);
-              ctx.restore();
-            }
-          }
-
           // tiny mouth bar
           if (showAlignRef.current) {
             const barW = 64, barH = 5, gap = 3;
@@ -3107,13 +3177,24 @@ export default function App() {
             ctx.fillRect(bx, by, barW * Math.min(1, Math.max(0, mouthActivity)), barH);
           }
 
-          // optional direction tick
-          try {
-            const len = 24;
-            const ex = cx + Math.sin(yawDeg * DEG) * len;
-            const ey = cy - Math.sin(pitchDeg * DEG) * len;
-            ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(ex, ey); ctx.stroke();
-          } catch {}
+          // Per-face gesture text badge on box (keep only this one)
+          if (freshFaceGesture && zone === "green") {
+            const gtxt = gestureLabelOf(freshFaceGesture);
+            if (gtxt) {
+              ctx.save();
+              ctx.font = "bold 14px system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif";
+              const padX = 6, padY = 4;
+              const tw2 = ctx.measureText(gtxt).width + padX * 2;
+              const th2 = 18 + padY * 2;
+              const gx = Math.max(0, Math.min(dbox.x + dbox.width - tw2 - 4, canvas.width - tw2));
+              const gy = Math.max(0, dbox.y + 4);
+              ctx.fillStyle = "rgba(34,197,94,0.9)";
+              ctx.fillRect(gx, gy, tw2, th2);
+              ctx.fillStyle = "#fff";
+              ctx.fillText(gtxt, gx + padX, gy + padY);
+              ctx.restore();
+            }
+          }
 
           // table + server payload
           rows.push({
@@ -3122,14 +3203,14 @@ export default function App() {
             gesture: gestureLbl || "-",
             emotion: expr || "-",
             zone,
-            ageGroup: ageGroupOf(det.age),
+            ageGroup: ageGroupOf(ageVal),
             gender,
             distance: dist ? dist.toFixed(2) + " m" : "-",
           });
 
           peopleForPost.push({
             gender,
-            ageGroup: ageGroupOf(det.age),
+            ageGroup: ageGroupOf(ageVal),
             zone,
             name: name || null,
             gid: guestId || null,
@@ -3139,10 +3220,34 @@ export default function App() {
             posCam: pos,
             centerNorm,
             mouthActivity,
-            _cx: cx, _cy: cy, // for click-to-zero
-            _w: dbox.width, _h: dbox.height, // for hand proximity heuristics
+            stableKey, // carry stable identity for hand/gesture mapping
+            slotKey,   // optional: keep slot for debug/UI
+            _cx: cx, _cy: cy,
+            _w: dbox.width, _h: dbox.height,
           });
         }
+
+        // remember face centers for click-to-zero + per-face hands mapping
+        trackedFacesRef.current = peopleForPost.map((p, idx) => ({
+          cx: p._cx, cy: p._cy, w: p._w, h: p._h,
+          yawDeg: p.yawDeg, pitchDeg: p.pitchDeg,
+          key: p.stableKey,
+          name: p.name || null,
+          gid: p.gid || null,
+          index: idx,
+          gestureEligible: gestureAllowedKeys.has(p.stableKey),
+          z: p.posCam?.z ?? null, // NEW: carry depth
+        }));
+        // Also expose ALL faces (GREEN + RED) for hand proximity (on_phone)
+        allFacesRef.current = candidates.map(c => {
+          const d = shrinkBox(c.box);
+          return {
+            cx: d.x + d.width * 0.5,
+            cy: d.y + d.height * 0.45,
+            w: d.width,
+            h: d.height,
+          };
+        });
 
           // --- ALSO draw non-tracked faces so RED is visible ---
           try {
@@ -3182,6 +3287,20 @@ export default function App() {
             }
           } catch {}
 
+        // prune only faces that are no longer tracked (preserve history for tracked-but-not-eligible)
+        {
+          const keep = new Set((trackedFacesRef.current || []).map(f => f.key));
+          for (const k of Array.from(mouthMapRef.current.keys())) {
+            if (!keep.has(k)) mouthMapRef.current.delete(k);
+          }
+          for (const k of Array.from(perFaceStableRef.current.keys())) {
+            if (!keep.has(k)) perFaceStableRef.current.delete(k);
+          }
+          for (const k of Array.from(waveHistByFaceRef.current.keys())) {
+            if (!keep.has(k)) waveHistByFaceRef.current.delete(k);
+          }
+        }
+
         // prune unused track slots (use stable keys: name or gid)
         {
           const seen = new Set(peopleForPost.map(p => (p.name || p.gid) ?? ""));
@@ -3189,21 +3308,6 @@ export default function App() {
             if (k && !seen.has(k)) delete recentMapRef.current[k];
           }
         }
-
-        // remember face centers for click-to-zero
-        trackedFacesRef.current = peopleForPost.map(p => ({
-          cx: p._cx, cy: p._cy, w: p._w, h: p._h, yawDeg: p.yawDeg, pitchDeg: p.pitchDeg
-        }));
-        // Also expose ALL faces (GREEN + RED) for hand proximity (on_phone)
-        allFacesRef.current = candidates.map(c => {
-          const d = shrinkBox(c.box);
-          return {
-            cx: d.x + d.width * 0.5,
-            cy: d.y + d.height * 0.45,
-            w: d.width,
-            h: d.height,
-          };
-        });
 
         // === Focus selection (prefer GREEN, fallback to any tracked) ===
         const pool = peopleForPost.filter(p => p.zone === "green");
@@ -3306,34 +3410,9 @@ export default function App() {
           loopStepMsRef.current = LOOP_STEP_ACTIVE_MS;
         }
 
-        // Send structured snapshot to server (throttled)
-        emitCrowdThrottled({
-          deviceId,
-          sessionId: sessionId || ("web-" + deviceId),
-          timeISO: new Date().toISOString(),
-          aiSpeaking: !!serverInfo.ai_speaking,
-          backend,
-          totals: { all: total, green, red },
-          gesture: gesturePayload ? { type: gesturePayload.type, score: gesturePayload.score } : null,
-          focusIndex: focusIndexRef.current,
-          focusTarget: focusTargetRef.current,
-          people: peopleForPost.map(p => ({
-            name: p.name || null,
-            gid: p.gid || null,
-            gender: p.gender || null,
-            ageGroup: p.ageGroup || null,
-            zone: p.zone,
-            yawDeg: Number.isFinite(p.yawDeg) ? +p.yawDeg.toFixed(1) : null,
-            pitchDeg: Number.isFinite(p.pitchDeg) ? +p.pitchDeg.toFixed(1) : null,
-            mouthActivity: +((p.mouthActivity ?? 0).toFixed(3)),
-            posCam: p.posCam,
-          })),
-        });
-
-        // ---- HANDS: run only when it matters ----
+        // ---- HANDS: per-person attribution (nearest green face) ----
         const handsEligible = HANDS_ENABLED && handsReadyRef.current;
         const gm = !!gameModeRef.current;
-        // Adaptive cadence: fast after landmarks seen; slower otherwise; faster in game mode
         const handsDesiredStep =
           (now - (lastLmSeenTsRef.current || 0) <= 800)
             ? (gm ? GM_HANDS_FAST_MS : HANDS_FAST_MS)
@@ -3342,139 +3421,373 @@ export default function App() {
         if (handsEligible && (now - (lastHandsRunTsRef.current || 0) >= handsDesiredStep)) {
           lastHandsRunTsRef.current = now;
           try {
-            const lm = await detectHandsOnce(video);
+            const handsList = await detectHandsOnce(video);
 
-            // HUD + wrist dot
-            if (lm && lm.length >= 21) {
-              // HUD
-              (function drawHandsHud(){
-                const msg = "hands: seen";
-                ctx.save();
-                ctx.font = "bold 14px system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif";
-                const w = ctx.measureText(msg).width + 12;
-                ctx.fillStyle = "rgba(14,165,233,0.85)";
-                ctx.fillRect(10, canvas.height - 62, w, 22);
-                ctx.fillStyle = "#fff";
-                ctx.fillText(msg, 16, canvas.height - 46);
-                ctx.restore();
-              })();
-              // wrist dot
-              const wrist = lm[0];
-              const px = wrist.x * canvas.width;
-              const py = wrist.y * canvas.height;
+            if (handsList && handsList.length) {
+              // HUD + wrist dots
               ctx.save();
-              ctx.beginPath();
-              ctx.arc(px, py, 6, 0, Math.PI * 2);
-              ctx.fillStyle = "rgba(255,255,0,0.8)";
-              ctx.fill();
+              ctx.font = "bold 14px system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif";
+              const msg = `hands: ${handsList.length}`;
+              const w = ctx.measureText(msg).width + 12;
+              ctx.fillStyle = "rgba(14,165,233,0.85)";
+              ctx.fillRect(10, canvas.height - 62, w, 22);
+              ctx.fillStyle = "#fff";
+              ctx.fillText(msg, 16, canvas.height - 46);
               ctx.restore();
-            }
 
-            if (lm && lm.length >= 21) {
-              // classify
-              const cand = [];
-              // Always check wave (used as fallback → paper in game mode)
-              try { const w = classifyWave(lm, now); if (w.ok) cand.push({ type: "wave", score: w.score }); } catch {}
-              if (gm) {
-                try { const r = classifyRock(lm);     if (r.ok) cand.push({ type: "rock",     score: r.score }); } catch {}
-                try { const s = classifyScissors(lm); if (s.ok) cand.push({ type: "scissors", score: s.score }); } catch {}
-                try { const p = classifyPaper(lm);    if (p.ok) cand.push({ type: "paper",    score: p.score }); } catch {}
+              for (const lm of handsList) {
+                const wrist = lm[0];
+                const px = wrist.x * canvas.width;
+                const py = wrist.y * canvas.height;
+                ctx.beginPath();
+                ctx.arc(px, py, 5, 0, Math.PI * 2);
+                ctx.fillStyle = "rgba(255,255,0,0.8)";
+                ctx.fill();
+              }
+              const byFace = new Map();
+
+              // helper: anchor near palm base (more stable than wrist alone)
+              const handAnchor = (lm) => {
+                const w = lm[MP.WRIST], i = lm[MP.INDEX_MCP];
+                if (!w || !i) return null;
+                return { x: (w.x + i.x) * 0.5, y: (w.y + i.y) * 0.5 };
+              };
+
+              // helper: is anchor inside (expanded) face rect
+              const wristInFace = (px, py, f) => {
+                const left = f.cx - f.w * 0.5;
+                const top  = f.cy - f.h * 0.45;
+                const right = left + f.w;
+                const bottom = top + f.h;
+                // allow more room above the face (hands raised), keep sides tighter
+                const mx = f.w * 0.09, myUp = f.h * 0.35, myDown = f.h * 0.22;
+                return px >= left - mx && px <= right + mx && py >= top - myUp && py <= bottom + myDown;
+              };
+
+              // Eligible faces (top-2 closest, marked earlier)
+              const facesAll = trackedFacesRef.current || [];
+              const faces = facesAll.filter(f => f.gestureEligible);
+              if (!faces.length) {
+                // No eligible faces this tick → keep per-face state; just update global/fallback below
               } else {
-                // Non-game gestures
-                try { const p = classifyPeace(lm); if (p.ok) cand.push({ type: "peace", score: p.score }); } catch {}
-                try {
-                  const op = classifyPaper(lm);
-                  if (op.ok) {
-                    const wrist = lm[MP.WRIST], iMcp = lm[MP.INDEX_MCP];
-                    const vx = (iMcp.x - wrist.x), vy = (iMcp.y - wrist.y);
-                    const vlen = Math.hypot(vx, vy) || 1e-6;
-                    const cosToVertical = Math.abs(vy) / vlen;
-                    const splay = Math.hypot(
-                      lm[MP.PINKY_TIP].x - lm[MP.INDEX_TIP].x,
-                      lm[MP.PINKY_TIP].y - lm[MP.INDEX_TIP].y
-                    ) / Math.max(1e-3, palmSpanLen(lm));
-                    const tips = [MP.INDEX_TIP, MP.MIDDLE_TIP, MP.RING_TIP, MP.PINKY_TIP].map(i => lm[i]);
-                    const minY = Math.min(...tips.map(t => t?.y ?? 1));
-                    const vel = recentLateralMotion();
+                // 1) Build hand→face candidate pairs (eligible faces only)
+                const hands = handsList.map((lm, hi) => {
+                  const a = handAnchor(lm);
+                  if (!a) return null;
+                  const ax = a.x * canvas.width;
+                  const ay = a.y * canvas.height;
+                  return { lm, hi, ax, ay };
+                }).filter(h => {
+                  if (!(h && Number.isFinite(h.ax) && Number.isFinite(h.ay))) return false;
+                  // reject tiny/tentative hands (ghosts)
+                  const span = palmSpanLen(h.lm); // normalized 0..1
+                  return span >= 0.020; // ~2% of frame width
+                });
 
-                    // Require: good score, upright-ish, decent finger splay, not too low
-                    if (op.score >= 0.62 && cosToVertical > 0.68 && splay > 0.28 && minY <= 0.60 && vel <= 0.032) {
-                      cand.push({ type: "raise_hand", score: op.score });
+                const allPairs = [];
+                for (const h of hands) {
+                  // primary: anchor inside face window
+                  let contenders = faces.filter(f => wristInFace(h.ax, h.ay, f));
+
+                  // fallback: if none hit, accept nearest face if horizontally aligned and vertically near
+                  if (!contenders.length) {
+                    let best = null, bestDx = Infinity;
+                    for (const f of faces) {
+                      const dx = Math.abs(h.ax - f.cx);
+                      const withinX = dx <= f.w * 0.45;
+                      const withinY = h.ay >= (f.cy - f.h * 0.60) && h.ay <= (f.cy + f.h * 0.20);
+                      if (withinX && withinY && dx < bestDx) { bestDx = dx; best = f; }
+                    }
+                    if (best) contenders = [best];
+                  }
+
+                  // final fallback: always assign (handles hands far from faces)
+                 if (!contenders.length) {
+                   if (faces.length === 1) {
+                     // single eligible face → give it the hand
+                     contenders = [faces[0]];
+                   } else if (faces.length === 2) {
+                     // 2 faces: split by midline (stable left/right assignment)
+                     const [leftF, rightF] = faces[0].cx <= faces[1].cx ? [faces[0], faces[1]] : [faces[1], faces[0]];
+                     const midX = (leftF.cx + rightF.cx) * 0.5;
+                     contenders = [h.ax <= midX ? leftF : rightF];
+                   } else {
+                     // 3+ faces: nearest center with small vertical penalty
+                     let bestN = null, bestScore = Infinity;
+                     for (const f of faces) {
+                       const dx = h.ax - f.cx, dy = h.ay - f.cy;
+                       const score = dx*dx + (dy*dy) * 0.4;
+                       if (score < bestScore) { bestScore = score; bestN = f; }
+                     }
+                     if (bestN) contenders = [bestN];
+                   }
+                 }
+
+                  for (const f of contenders) {
+                    const dx = h.ax - f.cx, dy = h.ay - f.cy;
+                    allPairs.push({ hi: h.hi, lm: h.lm, face: f, d2: dx*dx + dy*dy });
+                  }
+                }
+
+                // 2) Per-hand filter: keep only best candidate; drop if ambiguous
+                const byHand = new Map(); // hi -> sorted pairs
+                for (const p of allPairs) {
+                  const arr = byHand.get(p.hi) || [];
+                  arr.push(p);
+                  byHand.set(p.hi, arr);
+                }
+                const filtered = [];
+                for (const [hi, arr] of byHand.entries()) {
+                  arr.sort((a,b) => a.d2 - b.d2);
+                  const best = arr[0];
+                  const second = arr[1];
+                  // size-scaled near-tie (don’t drop unless truly ambiguous)
+                  const wRef = second ? Math.max(best.face.w || 1, second.face.w || 1) : 1;
+                  if (second) {
+                    const nearTie = Math.abs(best.d2 - second.d2) <= (wRef * 0.15) * (wRef * 0.15);
+                    if (nearTie) {
+                      // depth tiebreak: prefer nearer-Z
+                      const zBest = Number.isFinite(best.face.z) ? best.face.z : Infinity;
+                      const zSecond = Number.isFinite(second.face.z) ? second.face.z : Infinity;
+                      if (zSecond < zBest - 0.05) { filtered.push(second); continue; }
                     }
                   }
-                } catch {}
-                try { const ph = classifyOnPhone(lm, allFacesRef.current || [], canvas.width, canvas.height); if (ph.ok) cand.push({ type: "on_phone", score: ph.score }); } catch {}
-                try { const t = classifyThumbsUp(lm); if (t.ok) cand.push({ type: "thumbs_up", score: t.score }); } catch {}
-              }
-
-              if (cand.length) {
-                const bestFrame = cand.reduce((a, b) => (b.score > a.score ? b : a));
-                gestureWindowRef.current.push({ ...bestFrame, t: now });
-                const maxLen = VOTE_WINDOW * 2;
-                if (gestureWindowRef.current.length > maxLen) {
-                  gestureWindowRef.current.splice(0, gestureWindowRef.current.length - maxLen);
-                }
-              }
-
-              // stabilize
-              let stable = null;
-              try {
-                stable = pickStableGesture(now, gestureWindowRef.current, stableGestureRef.current);
-              } catch {}
-
-              if (stable) {
-                // Game mode mapping: wave→paper, ignore thumbs_up
-                let out = stable;
-                if (gm) {
-                  if (stable.type === "wave") out = { ...stable, type: "paper" };
-                  if (stable.type === "thumbs_up") out = null;
+                  filtered.push(best);
                 }
 
-                if (out) {
-                  const prev = stableGestureRef.current;
-                  const changed = !prev || prev.type !== out.type;
-                  stableGestureRef.current = out;
-                  lastGestureRef.current = { ...out };
+                // 3) Greedy assign without collisions
+                filtered.sort((a, b) => a.d2 - b.d2);
+                const usedHands = new Set();
+                const usedFaces = new Set();
+                const assignments = [];
+                for (const p of filtered) {
+                  if (usedHands.has(p.hi) || usedFaces.has(p.face.key)) continue;
+                  assignments.push(p);
+                  usedHands.add(p.hi);
+                  usedFaces.add(p.face.key);
+                }
 
-                  // Emit: gesture_event (normal) or game_event (RPS) when changed and not speaking
-                  if (changed && (now - (lastGestureSentRef.current || 0)) >= HANDS_SEND_MS && !speakingRef.current) {
+                // 4) Classify per assigned face (wave history is per-face)
+                // Game mode runs 4 classifiers (wave + R/P/S); normal runs 5 (wave + peace + raise_hand + on_phone + thumbs_up)
+                for (const { lm, face } of assignments) {
+                  let hist = waveHistByFaceRef.current.get(face.key);
+                  if (!hist) { hist = { t: 0, xs: [] }; waveHistByFaceRef.current.set(face.key, hist); }
+                  const xs = hist.xs;
+                  if (now - (hist.t || 0) > 900) xs.length = 0;
+                  hist.t = now;
+
+                  waveHistRef.xs = xs;
+                  waveHistRef.t = hist.t;
+
+                  const a0 = handAnchor(lm);
+                  let allowWave = false;
+                  if (a0) {
+                    const ax0 = a0.x * canvas.width, ay0 = a0.y * canvas.height;
+                    // near this face box or broadly aligned band
+                    if (wristInFace(ax0, ay0, face)) {
+                      allowWave = true;
+                    } else {
+                      const dx = Math.abs(ax0 - face.cx);
+                      const withinX = dx <= face.w * 0.90;
+                      const withinY = ay0 >= (face.cy - face.h * 1.10) && ay0 <= (face.cy + face.h * 0.50);
+                      allowWave = withinX && withinY;
+                    }
+                  }
+                  // if far from box but motion clearly wave-y, still allow
+                  if (!allowWave) {
+                    const wa = waveActivity();
+                    if (wa.flips >= 2 && wa.amp > 0.020) allowWave = true;
+                  }
+
+                  // debug ear anchor for assigned face `face` (safe: no undefined refs)
+                  ctx.save();
+                  ctx.fillStyle = "rgba(0,180,255,0.8)";
+                  const handX = a0 ? (a0.x * canvas.width) : ((lm[MP.WRIST]?.x || 0) * canvas.width);
+                  const sideSignDbg = handX >= face.cx ? +1 : -1;
+                  const earX = face.cx + sideSignDbg * (face.w * 0.5) * 0.78;
+                  const earY = face.cy - (face.h * 0.5) * 0.08;
+                  ctx.beginPath(); ctx.arc(earX, earY, 5, 0, Math.PI * 2); ctx.fill();
+                  ctx.restore();
+
+                  const velNow = recentLateralMotion();
+                  const wrist = lm[MP.WRIST], iMcp = lm[MP.INDEX_MCP];
+                  const vx = (iMcp?.x ?? 0) - (wrist?.x ?? 0), vy = (iMcp?.y ?? 0) - (wrist?.y ?? 0);
+                  const axisLen = Math.hypot(vx, vy) || 1e-6;
+                  const cosToVertical = Math.abs(vy) / axisLen; // 1 = vertical, 0 = horizontal
+
+                  // Face-relative proximity for “pose” gestures (prevents random pops)
+                  let allowNearFace = false, nearX = false, highPalm = false;
+                  if (a0) {
+                    const ax0 = a0.x * canvas.width, ay0 = a0.y * canvas.height;
+                    nearX = Math.abs(ax0 - face.cx) <= face.w * 1.00;
+                    // "high palm": above face center by a bit, even if not inside the box
+                    highPalm = ay0 <= (face.cy - face.h * 0.05);
+                    const highEnough = ay0 <= (face.cy + face.h * 0.25);
+                    allowNearFace = (Math.abs(ax0 - face.cx) <= face.w * 0.85) && highEnough;
+                  }
+
+                  const cand = [];
+                  try {
+                    const w = classifyWave(lm, now);
+                    // Accept always if wave is strong; else require near-face band
+                    if (w.ok && (allowWave || w.score >= 0.62)) {
+                      cand.push({ type: "wave", score: w.score });
+                    }
+                  } catch {}
+
+                  const palm = palmSpanLen(lm);
+
+                  if (gm) {
+                    try { const r = classifyRock(lm);     if (r.ok) cand.push({ type: "rock",     score: r.score }); } catch {}
+                    try { const s = classifyScissors(lm); if (s.ok) cand.push({ type: "scissors", score: s.score }); } catch {}
                     try {
-                       if (gm && (out.type === "paper" || out.type === "rock" || out.type === "scissors")) {
-                        // activity ping for game timers
-                        lastGameActivityRef.current = now;
-                        socketRef.current?.emit?.("game_event", {
-                          sessionId: sessionId || "web-" + deviceId,
-                          deviceId,
-                          rps: out.type,
-                          at: Date.now(),
-                          focusIndex: focusIndexRef.current,
-                          focusTarget: focusTargetRef.current,
-                        });
-                      } else {
-                        socketRef.current?.emit?.("gesture_event", {
-                          sessionId: sessionId || "web-" + deviceId,
-                          deviceId,
-                          gesture: { type: out.type, score: out.score },
-                          at: Date.now(),
-                          focusIndex: focusIndexRef.current,
-                          focusTarget: focusTargetRef.current,
-                        });
+                      const p = classifyPaper(lm);
+                      // paper: open palm; allow near face OR clearly high & aligned; upright-ish; not swinging
+                      if (p.ok && (allowNearFace || highPalm || palm >= 0.038) &&
+                          velNow <= 0.11 && cosToVertical > 0.50 && palm >= 0.028) {
+                        cand.push({ type: "paper", score: p.score });
                       }
                     } catch {}
-                    lastGestureSentRef.current = now;
+                  } else {
+                    try { const p = classifyPeace(lm); if (p.ok) cand.push({ type: "peace", score: p.score }); } catch {}
+                    try {
+                      const rh = classifyRaiseHand(lm);
+                      if (rh.ok) cand.push({ type: "raise_hand", score: rh.score });
+                    } catch {}
+                    // phone stays scoped to this face (already done)
+                    try {
+                      const ph = classifyOnPhone(
+                        lm,
+                        [{ cx: face.cx, cy: face.cy, w: face.w, h: face.h }],
+                        canvas.width,
+                        canvas.height
+                      );
+                    if (ph.ok) cand.push({ type: "on_phone", score: ph.score });
+                  } catch {}
+                    try { const t = classifyThumbsUp(lm); if (t.ok) cand.push({ type: "thumbs_up", score: t.score }); } catch {}
+                  }
+
+                  // If a strong pose is present, drop weaker wave this frame
+                  {
+                    const poseBest = cand
+                      .filter(c => c.type === "thumbs_up" || c.type === "peace" || c.type === "raise_hand" || c.type === "on_phone")
+                      .sort((a,b) => b.score - a.score)[0];
+                    const waveIdx = cand.findIndex(c => c.type === "wave");
+                    if (poseBest && waveIdx >= 0) {
+                      const waveScore = cand[waveIdx].score;
+                      if (waveScore < poseBest.score + 0.12) {
+                        cand.splice(waveIdx, 1);
+                      }
+                    }
+                  }
+
+                  if (!cand.length) continue;
+                  const bestFrame = cand.reduce((a, b) => (b.score > a.score ? b : a));
+
+                  const prev = byFace.get(face.key);
+                  const adj = gm && bestFrame.type === "wave" ? { type: "paper", score: bestFrame.score }
+                            : gm && bestFrame.type === "thumbs_up" ? null
+                            : bestFrame;
+                  if (adj && (!prev || adj.score > prev.score)) byFace.set(face.key, adj);
+                }
+
+                // update per-face windows/stable + emit changes
+                const updatedKeys = new Set();
+                for (const [key, frame] of byFace.entries()) {
+                  const win = perFaceGestureWinRef.current.get(key) || [];
+                  win.push({ ...frame, t: now });
+                  if (win.length > VOTE_WINDOW * 2) win.splice(0, win.length - VOTE_WINDOW * 2);
+                  perFaceGestureWinRef.current.set(key, win);
+
+                  const prevStable = perFaceStableRef.current.get(key) || null;
+                  const nextStable = pickStableGesture(now, win, prevStable);
+                  if (nextStable) {
+                    const changed = !prevStable || prevStable.type !== nextStable.type;
+                    perFaceStableRef.current.set(key, nextStable);
+                    updatedKeys.add(key);
+                    const lastSent = lastGestureSentPerFaceRef.current.get(key) || 0;
+                    if (changed && (now - lastSent) >= HANDS_SEND_MS && !speakingRef.current) {
+                      const facesMeta = trackedFacesRef.current || [];
+                      const meta = facesMeta.find(f => f.key === key) || {};
+                      try {
+                        socketRef.current?.emit?.(gm ? "game_event" : "gesture_event", gm ? {
+                          sessionId: sessionId || ("web-" + deviceId),
+                          deviceId,
+                          rps: nextStable.type,
+                          at: Date.now(),
+                          focusIndex: meta.index ?? focusIndexRef.current,
+                          focusTarget: { name: meta.name || null, gid: meta.gid || null },
+                        } : {
+                          sessionId: sessionId || ("web-" + deviceId),
+                          deviceId,
+                          gesture: { type: nextStable.type, score: nextStable.score },
+                          at: Date.now(),
+                          focusIndex: meta.index ?? focusIndexRef.current,
+                          focusTarget: { name: meta.name || null, gid: meta.gid || null },
+                        });
+                      } catch {}
+                      lastGestureSentPerFaceRef.current.set(key, now);
+                    }
+                  } else {
+                    perFaceStableRef.current.delete(key);
                   }
                 }
-              } else {
-                if (lastGestureRef.current && (now - lastGestureRef.current.t) > HANDS_CACHE_MS) {
-                  lastGestureRef.current = null;
-                }
+
+                // Update global stable gesture for legacy HUD/policy (focus face wins)
+                (() => {
+                  const faces = (trackedFacesRef.current || []);
+                  const eligible = new Set(faces.filter(f => f.gestureEligible).map(f => f.key));
+                  const fi = focusIndexRef.current;
+                  let chosen = null;
+                  if (fi >= 0 && faces[fi] && eligible.has(faces[fi].key)) {
+                    chosen = perFaceStableRef.current.get(faces[fi].key) || null;
+                  }
+                  if (!chosen) {
+                    for (const [k, g] of perFaceStableRef.current.entries()) {
+                      if (!eligible.has(k)) continue;
+                      if ((now - g.t) <= HANDS_CACHE_MS && g.type === "on_phone") { chosen = g; break; }
+                    }
+                  }
+                  if (!chosen) {
+                    for (const [k, g] of perFaceStableRef.current.entries()) {
+                      if (!eligible.has(k)) continue;
+                      if ((now - g.t) <= HANDS_CACHE_MS) { chosen = g; break; }
+                    }
+                  }
+                  stableGestureRef.current = chosen ? { ...chosen, t: now } : null;
+                })();
               }
             }
-          } catch {}
-        } else {
-          if (lastGestureRef.current && (now - lastGestureRef.current.t) > HANDS_CACHE_MS) {
-            lastGestureRef.current = null;
-          }
+
+        // AFTER hands: emit snapshot with up-to-date gesture
+        {
+          const g = stableGestureRef.current;
+          const fresh = g && (now - g.t) <= HANDS_CACHE_MS ? { type: g.type, score: g.score } : null;
+          emitCrowdThrottled({
+            deviceId,
+            sessionId: sessionId || ("web-" + deviceId),
+            timeISO: new Date().toISOString(),
+            aiSpeaking: !!serverInfo.ai_speaking,
+            backend,
+            totals: { all: total, green, red },
+            gesture: fresh,
+            focusIndex: focusIndexRef.current,
+            focusTarget: focusTargetRef.current,
+            people: peopleForPost.map(p => ({
+              name: p.name || null,
+              gid: p.gid || null,
+              gender: p.gender || null,
+              ageGroup: p.ageGroup || null,
+              zone: p.zone,
+              yawDeg: Number.isFinite(p.yawDeg) ? +p.yawDeg.toFixed(1) : null,
+              pitchDeg: Number.isFinite(p.pitchDeg) ? +p.pitchDeg.toFixed(1) : null,
+              mouthActivity: +((p.mouthActivity ?? 0).toFixed(3)),
+              posCam: p.posCam,
+            })),
+          });
+        }
+        } catch (e) {
+          // ignore hand pipeline hiccups so the frame loop keeps running
         }
 
         // ---- Policy: zone transitions -> call-over / greet (candidates include red) ----
@@ -3630,6 +3943,7 @@ export default function App() {
         } catch (e) {
           console.warn("[speaker] error:", e);
         }
+      }
       } catch (e) {
         console.warn("[frame] error:", e);
       } finally {

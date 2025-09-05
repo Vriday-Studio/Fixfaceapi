@@ -1231,21 +1231,36 @@ export default function App() {
     if (!USE_SOCKET_SERVER) return;
 
     const url = normalizeServerUrl(serverUrl || SOCKET_URL);
+    const isHttpsPage = window.location.protocol === "https:";
+    const isLoopback = /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(url || "");
+    // From HTTPS page to http://localhost: use websocket-only to avoid CORS on XHR polling
+    const transports = (isHttpsPage && isLoopback) ? ["websocket"] : ["polling", "websocket"];
+
     const socket = io(url, {
-      transports: ["websocket"],
+      transports,
       path: "/socket.io",
       autoConnect: true,
       reconnection: true,
       reconnectionDelay: 500,
       reconnectionAttempts: Infinity,
       withCredentials: false,
+      timeout: 12000,
+      rememberUpgrade: true,   // cache WS upgrade when it succeeds
+      forceNew: true
     });
     socketRef.current = socket;
+    console.log("[socket] connecting", { url, transports });
 
     socket.on("connect", () => {
       console.log("[socket] connected", socket.id, "url:", url || "(same-origin)");
-      try { socket.emit("hello", { deviceId, sessionId }); } catch {}
+      try { socket.emit("hello", { deviceId, sessionId, role: "web" }); } catch {}
       setServerInfo((s) => ({ ...s, connected: true }));
+    });
+    socket.on("connect_error", (err) => {
+      console.warn("[socket] connect_error:", err?.message || err);
+    });
+    socket.on("reconnect_error", (err) => {
+      console.warn("[socket] reconnect_error:", err?.message || err);
     });
     socket.on("disconnect", () => {
       console.log("[socket] disconnected");
@@ -1258,7 +1273,7 @@ export default function App() {
     socket.on("stop_rps",    () => setGameModeOn(false));
     socket.on("session_created", (m) => {
       setSessionStatus("ACTIVE");
-      setSessionId(m?.sessionId || uuid());
+      setSessionId((prev) => m?.sessionId || prev || uuid());
       bump("start");
     });
     socket.on("text_response", (t) => {
@@ -1270,7 +1285,12 @@ export default function App() {
         const b64 = pkt?.chunk; if (!b64) return;
         const bin = atob(b64); const u8 = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-        ttsPlayerRef.current.enqueue(u8, pkt?.mime || "audio/mpeg");
+        const mime = (pkt?.mime || "").toLowerCase();
+    if (mime.includes("mpeg")) {
+      ttsPlayerRef.current.enqueue(u8, mime);
+    } else {
+      // ignore PCM on the website; UE consumes it
+    }
       } catch (e) { console.warn("[audio] chunk error:", e); }
     });
     socket.on("server_message", (m) => console.log("[server]", m));
@@ -1280,7 +1300,25 @@ export default function App() {
       try { socket.disconnect(); } catch {}
       socketRef.current = null;
     };
-  }, [serverUrl, deviceId, sessionId]);
+  }, [serverUrl, deviceId]);
+  
+  // Auto-reconnect when network comes online or tab becomes visible (no mic/cam impact)
+  useEffect(() => {
+    const onOnline = () => {
+      try { if (socketRef.current && !socketRef.current.connected) socketRef.current.connect(); } catch {}
+    };
+    const onVisible = () => {
+      if (!document.hidden) {
+        try { if (socketRef.current && !socketRef.current.connected) socketRef.current.connect(); } catch {}
+      }
+    };
+    window.addEventListener("online", onOnline);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.removeEventListener("online", onOnline);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, []);
 
   const bump = (which) => {
     const nowStr = new Date().toLocaleTimeString();
@@ -1389,6 +1427,7 @@ export default function App() {
 
       s.emit("create_session", {
         ...payload,
+        sessionId: (sessionId || ("web-" + deviceId)),
         gemini_api_key: (localStorage.getItem("ika:gemini:key") || undefined),
       });
       bump("start");
@@ -1415,7 +1454,8 @@ export default function App() {
       const s = socketRef.current;
       if (!s) return;
       s.emit("crowd_status", {
-        sessionId: sessionId || "default",
+        deviceId,
+        sessionId: sessionId || ("web-" + deviceId),
         ...payload,
       });
       bump("snapshot");
@@ -1498,39 +1538,19 @@ export default function App() {
   const lastGroupAskTsRef = useRef(0);
   const speakerRef = useRef({ key: null, topKeyPrev: null, framesDominant: 0, topSince: 0 });
 
-  const prevCrowdRef = useRef({ json: "", t: 0 });
+  const lastCrowdSendRef = useRef({ t: 0, sig: "" });
   function emitCrowdThrottled(payload) {
     const now = performance.now();
-
-    function sanitize(obj) {
-      if (obj == null) return obj;
-      if (typeof obj === "number") return Number.isFinite(obj) ? +obj.toFixed(4) : null;
-      if (Array.isArray(obj)) return obj.map(sanitize);
-      if (typeof obj === "object") {
-        const out = {};
-        for (const [k, v] of Object.entries(obj)) {
-          // ignore volatile in signature (but still send them in payload!)
-          if (k === "timeISO" || k === "localTime" || k === "aiSpeaking") continue;
-          if (k === "gesture" && v && typeof v === "object") {
-            out.gesture = { type: v.type || null, score: sanitize(v.score) };
-            continue;
-          }
-          out[k] = sanitize(v);
-        }
-        return out;
-      }
-      return obj;
-    }
-
-    const signature = JSON.stringify(sanitize(payload));
-
-    if (
-      signature !== (prevCrowdRef.current.json || "") &&
-      now - (prevCrowdRef.current.t || 0) > 1000
-    ) {
-      try { server.crowdStatus(payload); } catch {}
-      prevCrowdRef.current = { json: signature, t: now };
-    }
+    const MIN_MS = 66; // ~15 Hz
+    const state = lastCrowdSendRef.current;
+    // compact signature: focus + per-person pose/lip
+    const ppl = (payload.people || []).map(p => [
+      p.yawDeg, p.pitchDeg, Math.round((p.mouthActivity || 0) * 1000)
+    ]);
+    const sig = JSON.stringify([payload.focusIndex, ppl]);
+    if ((now - state.t) < MIN_MS && sig === state.sig) return;
+    try { server.crowdStatus(payload); } catch {}
+    lastCrowdSendRef.current = { t: now, sig };
   }
 
   const videoRef = useRef(null);
@@ -3843,6 +3863,8 @@ export default function App() {
                 s.last = now;
                 callOverStateRef.current.set(p.key, s);
                 socketRef.current?.emit?.("policy_event", {
+                  deviceId,
+                  sessionId: sessionId || ("web-" + deviceId),
                   type: "call_over",
                   attempt: s.tries,
                   target: { name: p.name || null, gid: p.gid || null, gender: p.gender || null },
@@ -3861,6 +3883,8 @@ export default function App() {
                 : (groupSize > 1 ? (hasKid ? "family" : "everyone")
                    : (p.gender === "male" ? "sir" : p.gender === "female" ? "ma’am" : "there"));
               socketRef.current?.emit?.("policy_event", {
+                deviceId,
+                sessionId: sessionId || ("web-" + deviceId),
                 type: "greet",
                 address,
                 target: { name: p.name || null, gid: p.gid || null, gender: p.gender || null },
@@ -3879,6 +3903,8 @@ export default function App() {
             if ((now - (lastGroupAskTsRef.current || 0)) >= GROUP_ASK_COOLDOWN_MS) {
               lastGroupAskTsRef.current = now;
               socketRef.current?.emit?.("policy_event", {
+                deviceId,
+                sessionId: sessionId || ("web-" + deviceId),
                 type: "ask_group_change",
                 prevSize: prevSet.size,
                 currSize: curSet.size,
@@ -3929,6 +3955,8 @@ export default function App() {
 
               const p = list[absIdx];
               socketRef.current?.emit?.("policy_event", {
+                deviceId,
+                sessionId: sessionId || ("web-" + deviceId),
                 type: "speaker_focus",
                 target: {
                   name: p.name || null,
@@ -4230,6 +4258,7 @@ export default function App() {
       eleven_model: localStorage.getItem("ika:11labs:model") || "eleven_turbo_v2_5",
       eleven_voice_id: localStorage.getItem("ika:11labs:voiceId") || "",
       eleven_api_key: localStorage.getItem("ika:11labs:key") || undefined,
+      eleven_output_format: "pcm_24000",
     });
   }, [
     server,

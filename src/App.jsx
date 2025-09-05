@@ -1127,7 +1127,7 @@ export default function App() {
     if ((handsFailRef.current % 4) !== 0) return null;
 
     try {
-      await landmarker.setOptions?.({ runningMode: "IMAGE", numHands: HANDS_MAX_NUM });
+      await landmarker.setOptions?.({ runningMode: "IMAGE", numHands: gestureTargetsRef.current });
 
       const c = handsOffscreenRef.current, g = handsCtxRef.current;
       if (!c || !g) return null;
@@ -1143,7 +1143,7 @@ export default function App() {
       const res2 = await landmarker.detect(c);
       const hands2 = res2?.landmarks || res2?.handLandmarks || [];
 
-      await landmarker.setOptions?.({ runningMode: "VIDEO", numHands: HANDS_MAX_NUM });
+      await landmarker.setOptions?.({ runningMode: "VIDEO", numHands: gestureTargetsRef.current });
 
       if (hands2.length) {
         handsFailRef.current = 0;
@@ -1163,7 +1163,7 @@ export default function App() {
   }, []);
 
   // Gestures on/off (persist to localStorage)
-  const [gesturesOn, setGesturesOn] = useState(() => localStorage.getItem("ika:gesturesOn") !== "true");
+  const [gesturesOn, setGesturesOn] = useState(() => localStorage.getItem("ika:gesturesOn") === "true");
   const gesturesOnRef = useRef(false);
   useEffect(() => {
     gesturesOnRef.current = gesturesOn;
@@ -1176,6 +1176,14 @@ export default function App() {
       stableGestureRef.current = null;
     }
   }, [gesturesOn]);
+
+  // Keep camera/mic alive when tab is in background (Windows fix)
+  const [keepBgOn, setKeepBgOn] = useState(() => localStorage.getItem("ika:keepBgOn") !== "false");
+  const keepBgOnRef = useRef(true);
+  useEffect(() => {
+    keepBgOnRef.current = keepBgOn;
+    try { localStorage.setItem("ika:keepBgOn", String(keepBgOn)); } catch {}
+  }, [keepBgOn]);
 
   // How many people run gesture tracking for (1 or 2)
   const [gestureTargets, setGestureTargets] = useState(() => {
@@ -2282,24 +2290,17 @@ export default function App() {
   // visibility → stop
   useEffect(() => {
     const onVisibility = () => {
-      if (document.hidden) {
+      if (document.hidden && !keepBgOnRef.current) {
         userMicOffRef.current = true;
         stopAll({ reason: "visibility" });
       }
     };
     const onPageHide = () => {
+      // Page is actually leaving (navigate/close) → always stop
       userMicOffRef.current = true;
       stopAll({ reason: "pagehide" });
     };
-    const onBeforeUnload = () => {
-      try {
-        const rec = audioRef.current?.vad?.recorder;
-        if (rec && rec.state === "recording") rec.stop();
-      } catch {}
-      try {
-        if (audioRef.current.raf) cancelAnimationFrame(audioRef.current.raf);
-      } catch {}
-    };
+    const onBeforeUnload = () => { /* ...existing... */ };
     document.addEventListener("visibilitychange", onVisibility);
     window.addEventListener("pagehide", onPageHide);
     window.addEventListener("beforeunload", onBeforeUnload);
@@ -4027,15 +4028,16 @@ export default function App() {
     }
       const ago = performance.now() - lastFrameTsRef.current;
 
+      // When tab is hidden and keepBgOn is true, skip idle enforcement
+      if (document.hidden && keepBgOnRef.current) return;
       // Mic idle: stop listening
       if (ago > MIC_IDLE_MS && micOnRef.current) {
         userMicOffRef.current = true;
         stopMic().catch(() => {});
       }
-
       // Camera idle: stop everything, including LLM
       if (ago > CAM_IDLE_MS) {
-        stopAll({ reset: true }); // now this is the ONLY place that flips session to IDLE
+        stopAll({ reset: true });
       }
     }, CHECK_MS);
     return () => clearInterval(timer);
@@ -4919,6 +4921,16 @@ export default function App() {
             </div>
             <div className="help" style={{ marginTop: 6 }}>
               Turn off on low-power devices (Android/Edge) to improve FPS.
+            </div>
+            <div className="row" style={{ gap: 12, alignItems: "center", marginTop: 8 }}>
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={keepBgOn}
+                  onChange={(e) => setKeepBgOn(e.target.checked)}
+                />
+                <span>Keep running in background</span>
+              </label>
             </div>
           </section>
 

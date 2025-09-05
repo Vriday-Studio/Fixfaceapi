@@ -1162,6 +1162,34 @@ export default function App() {
     return null;
   }, []);
 
+  // Gestures on/off (persist to localStorage)
+  const [gesturesOn, setGesturesOn] = useState(() => localStorage.getItem("ika:gesturesOn") !== "true");
+  const gesturesOnRef = useRef(false);
+  useEffect(() => {
+    gesturesOnRef.current = gesturesOn;
+    try { localStorage.setItem("ika:gesturesOn", String(gesturesOn)); } catch {}
+    if (!gesturesOn) {
+      // clear per-face gesture state immediately
+      perFaceGestureWinRef.current = new Map();
+      perFaceStableRef.current = new Map();
+      lastGestureSentPerFaceRef.current = new Map();
+      stableGestureRef.current = null;
+    }
+  }, [gesturesOn]);
+
+  // How many people run gesture tracking for (1 or 2)
+  const [gestureTargets, setGestureTargets] = useState(() => {
+    const v = parseInt(localStorage.getItem("ika:gestureTargets") || "2", 10);
+    return v === 1 ? 1 : 2;
+  });
+  const gestureTargetsRef = useRef(2);
+  useEffect(() => {
+    gestureTargetsRef.current = gestureTargets;
+    try { localStorage.setItem("ika:gestureTargets", String(gestureTargets)); } catch {}
+    // Hint the landmarker to track fewer hands when set to 1
+    try { handLmRef.current?.setOptions?.({ numHands: gestureTargets }); } catch {}
+  }, [gestureTargets]);
+
   // --- TFJS backend gating (avoid detect while switching) ---
   const backendReadyRef = useRef(Promise.resolve());
   const backendSwitchingRef = useRef(false);
@@ -3083,7 +3111,7 @@ export default function App() {
           const slotKey = `slot-${k}`;
 
           // Mark top-2 by distance as gesture-eligible
-          if (k < 2) gestureAllowedKeys.add(stableKey);
+          if (gesturesOnRef.current && k < gestureTargetsRef.current) gestureAllowedKeys.add(stableKey);
 
           const prev = tracks[stableKey];
           if (prev && prev.name !== displayName) {
@@ -3431,7 +3459,7 @@ export default function App() {
         }
 
         // ---- HANDS: per-person attribution (nearest green face) ----
-        const handsEligible = HANDS_ENABLED && handsReadyRef.current;
+        const handsEligible = HANDS_ENABLED && handsReadyRef.current && gesturesOnRef.current;
         const gm = !!gameModeRef.current;
         const handsDesiredStep =
           (now - (lastLmSeenTsRef.current || 0) <= 800)
@@ -3781,7 +3809,7 @@ export default function App() {
 
         // AFTER hands: emit snapshot with up-to-date gesture
         {
-          const g = stableGestureRef.current;
+          const g = gesturesOnRef.current ? stableGestureRef.current : null;
           const fresh = g && (now - g.t) <= HANDS_CACHE_MS ? { type: g.type, score: g.score } : null;
           emitCrowdThrottled({
             deviceId,
@@ -3790,7 +3818,7 @@ export default function App() {
             aiSpeaking: !!serverInfo.ai_speaking,
             backend,
             totals: { all: total, green, red },
-            gesture: fresh,
+            gesture: gesturesOnRef.current ? fresh : null,
             focusIndex: focusIndexRef.current,
             focusTarget: focusTargetRef.current,
             people: peopleForPost.map(p => ({
@@ -4862,6 +4890,36 @@ export default function App() {
               id="system-instruction-textarea" // Added ID for accessibility
             />
             <label htmlFor="system-instruction-textarea" className="visually-hidden">System Instruction</label> {/* Added label for accessibility */}
+          </section>
+
+          <section className="panel" style={{ pointerEvents: "auto", zIndex: 1001 }}>
+            <h3 className="section-title">performance</h3>
+            <div className="row" style={{ gap: 12, alignItems: "center" }}>
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={gesturesOn}
+                  onChange={(e) => setGesturesOn(e.target.checked)}
+                />
+                <span>Gestures</span>
+              </label>
+              <div className="row" style={{ gap: 8, alignItems: "center", marginLeft: 8 }}>
+                <label className="label" style={{ margin: 0 }}>Targets</label>
+                <select
+                  className="select"
+                  value={gestureTargets}
+                  onChange={(e) => setGestureTargets(parseInt(e.target.value, 10) === 1 ? 1 : 2)}
+                  disabled={!gesturesOn}
+                  title="Limit gesture tracking to 1 or 2 people"
+                >
+                  <option value={1}>1 person</option>
+                  <option value={2}>2 people</option>
+                </select>
+              </div>
+            </div>
+            <div className="help" style={{ marginTop: 6 }}>
+              Turn off on low-power devices (Android/Edge) to improve FPS.
+            </div>
           </section>
 
           {/* Gemini */}

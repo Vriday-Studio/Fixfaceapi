@@ -72,3 +72,29 @@ Plugins/**/Intermediate/*
 
 # Cache files for the editor to use
 DerivedDataCache/*
+
+# Node modules
+node_modules/
+
+# Build output
+dist/
+
+# Local environment variables
+.env.local
+.env.*.local
+
+# Log files
+*.log
+
+# Vite cache
+.vite/
+
+# Editor directories and files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.sln

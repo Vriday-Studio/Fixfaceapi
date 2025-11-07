@@ -15,7 +15,8 @@ import * as faceapi from "face-api.js";
 import io from "socket.io-client";
 import { FilesetResolver, HandLandmarker } from "@mediapipe/tasks-vision";
 import "./App.css";
-import { use } from "react";
+import { json } from "react-router-dom";
+import { FaceTracker, createFaceTracker } from "./utils/index";
 
 // Add this helper (same-origin by default; allows http(s) and ws(s))
 function normalizeServerUrl(u) {
@@ -111,36 +112,6 @@ const GROUP_ASK_COOLDOWN_MS = 20_000;
 // Distance estimate from face box width (pixels) via pinhole camera
 const estimateDistanceM = (wPx) =>
   Number.isFinite(wPx) && wPx > 0 ? (FOCAL_PX * FACE_WIDTH_M) / wPx : null;
-
-// Coarse age binning
-const ageGroupOf = (age) => {
-  if (!Number.isFinite(age)) return "unknown";
-  const a = Math.round(age);
-  if (a >= 18) return "adult";
-  if (a >= 12) return "teen";
-  return "child";
-};
-
-// Green/Red zone helper
-const zoneOf = (d, greenMaxM) =>
-  Number.isFinite(d) && Number.isFinite(greenMaxM) && d <= greenMaxM
-    ? "green"
-    : "red";
-
-// Best-scoring expression label
-const topExpression = (e) => {
-  if (!e || typeof e !== "object") return "neutral";
-  let bestKey = "neutral",
-    bestVal = -Infinity;
-  for (const [k, v] of Object.entries(e)) {
-    const val = Number(v) || 0;
-    if (val > bestVal) {
-      bestVal = val;
-      bestKey = k;
-    }
-  }
-  return bestKey;
-};
 
 // Add the helper gestureLabelOf
 function gestureLabelOf(g) {
@@ -508,8 +479,8 @@ function classifyRaiseHand(lm) {
       !isWaving &&
       opens >= 3 &&
       cosToVertical > 0.52 &&
-      palmSpanLen(lm) >= 0.03
-    ) {
+      palmSpanLen(lm) >= 0.03) {
+
       const heightBoostFast = Math.max(0, (0.68 - minY) * 0.8);
       const sFast = Math.min(
         1,
@@ -580,6 +551,7 @@ function classifyOnPhone(lm, faces, canvasW, canvasH) {
     const wrist = lm[MP.WRIST],
       iMcp = lm[MP.INDEX_MCP],
       thumbTip = lm[MP.THUMB_TIP];
+
     if (!wrist || !iMcp || !thumbTip) return { ok: false };
 
     // tiny/ghost hands → skip
@@ -602,6 +574,7 @@ function classifyOnPhone(lm, faces, canvasW, canvasH) {
       }
       return best;
     };
+
     const f = pickNear(wrist.x, wrist.y) || faces[0];
 
     // Face center + half extents (normalized 0..1)
@@ -1198,7 +1171,6 @@ export default function App() {
 
   /* ---------- Global/session UI state ---------- */
   const [sessionStatus, setSessionStatus] = useState("IDLE");
-  const [machineId, setMachineId] = useState(null);
   const [sessionId, setSessionId] = useState(null);
   const [serverInfo, setServerInfo] = useState({
     connected: false,
@@ -1236,8 +1208,6 @@ export default function App() {
   const lastHandsRunTsRef = useRef(0);
   const lastLmSeenTsRef = useRef(0); // added: when we last saw landmarks
   const handsFailRef = useRef(0); // added: consecutive VIDEO misses
-  const lastCrowdStatSentRef = useRef(0); // throttle for SendWebsockCommandToServer
-  const lastIdCrowdSentRef = useRef(''); // per-id throttles
 
   // downscale buffer for hands
   const handsOffscreenRef = useRef(null);
@@ -1571,20 +1541,21 @@ export default function App() {
       const oldId = sessionId || "web-" + deviceId;
       const newId = uuid();
 
-      try {
-        socketRef.current?.emit?.("rotate_session", {
-          oldSessionId: oldId,
-          newSessionId: newId,
-          at: Date.now(),
-          people: people.map((p) => ({
-            name: p.name || null,
-            gid: p.gid || null,
-          })),
-        });
-        socketRef.current?.emit?.("close_session", { sessionId: oldId });
-      } catch { }
+      // UNUSED : Emit rotate_session and close_session to server (if socket connected) 
+      //try {
+      //   socketRef.current?.emit?.("rotate_session", {
+      //     oldSessionId: oldId,
+      //     newSessionId: newId,
+      //     at: Date.now(),
+      //     people: people.map((p) => ({
+      //       name: p.name || null,
+      //       gid: p.gid || null,
+      //     })),
+      //   });
+      //   socketRef.current?.emit?.("close_session", { sessionId: oldId });
+      // } catch { }
 
-      setSessionId(newId);
+      //setSessionId(newId);
       lastRotateRef.current = now;
 
       // If you want a fresh LLM dialog immediately, you can also:
@@ -1597,12 +1568,9 @@ export default function App() {
     }
   }
 
-  const nop = false;
   /* ---------- Socket lifecycle ---------- */
+  /*
   useEffect(() => {
-    if (!nop)
-      return;
-
     if (!USE_SOCKET_SERVER) return;
 
     const url = normalizeServerUrl(serverUrl || SOCKET_URL);
@@ -1613,6 +1581,7 @@ export default function App() {
     const transports =
       isHttpsPage && isLoopback ? ["websocket"] : ["polling", "websocket"];
 
+      
     const socket = io(url, {
       transports,
       path: "/socket.io",
@@ -1625,6 +1594,7 @@ export default function App() {
       rememberUpgrade: true, // cache WS upgrade when it succeeds
       forceNew: true,
     });
+
     socketRef.current = socket;
     console.log("[socket] connecting", { url, transports });
 
@@ -1637,7 +1607,7 @@ export default function App() {
       );
       try {
         socket.emit("hello", { deviceId, sessionId, role: "web" });
-      } catch { }
+      } catch {}
       setServerInfo((s) => ({ ...s, connected: true }));
     });
     socket.on("connect_error", (err) => {
@@ -1691,12 +1661,13 @@ export default function App() {
     return () => {
       try {
         socket.disconnect();
-      } catch { }
+      } catch {}
       socketRef.current = null;
     };
   }, [serverUrl, deviceId]);
+  *
 
-  //#region direct websocket
+  /* ---------- direct websocket ---------- */
   const wsSocket = useRef(null);
   const wsIsConnected = useRef(false);
 
@@ -1712,7 +1683,7 @@ export default function App() {
     VocStart: 7,
     VocEnd: 8,
     CrowdStat: 9,
-    MicData: 10,
+    MicData : 10,
   }
 
   const PolicyTypeEnum = {
@@ -1727,8 +1698,8 @@ export default function App() {
   }
 
   class SessionData {
-    constructor(machineId, startedAt) {
-      this.MachineId = machineId;
+    constructor(sessionId, startedAt) {
+      this.SessionId = sessionId;
       this.StartedAt = startedAt;
       this.EndedAt = null;
     }
@@ -1745,7 +1716,6 @@ export default function App() {
       this.attemptNumber = attemptNumber;
     }
   }
-
   /**
    * Establishes a WebSocket connection to the specified server URL and sets up event handlers.
    *
@@ -1783,8 +1753,7 @@ export default function App() {
       if (jsonObj != null && jsonObj.hasOwnProperty("ClassName") && jsonObj.ClassName === "SessionData") {
         let sessData = Object.assign(new SessionData(), jsonObj);
         setSessionStatus("ACTIVE");
-        //setSessionId(sessData?.MachineId || sessionId || uuid());
-        setMachineId(sessData?.MachineId || uuid());
+        setSessionId(sessData?.SessionId)
       }
     };
 
@@ -1800,29 +1769,32 @@ export default function App() {
 
   }
 
+
+
   /**
    * Sends a command to the server via a WebSocket connection.
    *
+   * @param {React.MutableRefObject<WebSocket>} wsSocket - A ref object containing the WebSocket instance.
    * @param {Object} t - An object containing message type constants.
    * @param {string} [sessionId] - Optional session ID. If not provided, a new UUID will be generated.
    */
-  function SendWebsockCommandToServer(t, inputData = null) {
-    if (wsSocket.current == null) {
+  function SendWebsockCommandToServer(wsSocket, t, inputData = null) {
+    if(wsSocket.current == null) {
       connectWebSocket(serverUrl + "/ws", wsSocket.current);
     }
 
-    if (wsIsConnected.current == false || wsSocket.current?.readyState !== WebSocket.OPEN) {
+    if(wsIsConnected.current == false || wsSocket.current?.readyState !== WebSocket.OPEN) {
       connectWebSocket(serverUrl + "/ws", wsSocket.current);
     }
 
     const customSendData = {
       MachineId: deviceId,
       Platform: "web",
-      Custom: inputData ?? {},
+      Custom : inputData ?? {},
     };
 
     console.log("[websocket] sending command", t, customSendData);
-
+    
     wsSocket.current?.send(
       JSON.stringify({
         MessageType: t,
@@ -1839,53 +1811,56 @@ export default function App() {
 
   function sendHeartbeat(intervalInMs) {
     return setInterval(() => {
-      SendWebsockCommandToServer(MSG_TYPE.Heartbeat);
+      SendWebsockCommandToServer(wsSocket, MSG_TYPE.Heartbeat);
     }, intervalInMs);
   }
 
-  //#endregion
+  function sendMicData(deviceId, noiseThreshold, listenMs, silenceMs, autoDetectOn, start_of_speech_sensitivity, end_of_speech_sensitivity, silence_duration_ms) {
+    SendWebsockCommandToServer(wsSocket, MSG_TYPE.MicData, {
+      MachineId: deviceId,
+      Platform: "web",
+      NoiseThreshold: noiseThreshold,
+      ListenMs: listenMs,
+      SilenceMs: silenceMs,
+      AutoDetectOn: autoDetectOn,
+      StartOfSpeechSensitivity: start_of_speech_sensitivity,
+      EndOfSpeechSensitivity: end_of_speech_sensitivity,
+      SilenceDurationMs: silence_duration_ms,
 
-  //#region websocket loop
+    });
+  }
+
+  //main websocket effect
   useEffect(() => {
 
-    if (!USE_SOCKET_SERVER)
-      return;
+    let intervalId;
 
-    connectWebSocket(serverUrl + "/ws", wsSocket.current);
-    const heartbeatInterval = sendHeartbeat(CONNECTION_POOL_MS);
+    if (!USE_SOCKET_SERVER) return;
 
-    return () => {
-      clearInterval(heartbeatInterval);
-      try {
-        wsSocket.current?.close();
-      } catch { }
-
-    };
-  }, [serverUrl]);
-  //#endregion
+    //check connection every 5 seconds
+    const checkConnIntervalId = sendHeartbeat(CONNECTION_POOL_MS);
+    return () => clearInterval(checkConnIntervalId);
+  }, []);
 
   // Auto-reconnect when network comes online or tab becomes visible (no mic/cam impact)
   useEffect(() => {
     const onOnline = () => {
       try {
-        //if (socketRef.current && !socketRef.current.connected)
-        //  socketRef.current.connect();
-        connectWebSocket(serverUrl + "/ws", wsSocket.current);
-
+        if (!USE_SOCKET_SERVER) return;
       } catch { }
     };
     const onVisible = () => {
       if (!document.hidden) {
-        try {
-          if (wsSocket.current && wsSocket.current.readyState !== WebSocket.OPEN) {
-            connectWebSocket(serverUrl + "/ws", wsSocket.current);
-          }
-        } catch { }
+        intervalId = sendHeartbeat(CONNECTION_POOL_MS);
       }
     };
+
+    /* ---------- online event ---------- */
+    // clear old listeners (if any) and add a no-op to avoid multiple
     window.addEventListener("online", onOnline);
     document.addEventListener("visibilitychange", onVisible);
     return () => {
+      clearInterval(intervalId);
       window.removeEventListener("online", onOnline);
       document.removeEventListener("visibilitychange", onVisible);
     };
@@ -1919,127 +1894,133 @@ export default function App() {
       const s = socketRef.current;
       if (!s) return;
 
-      const payload = {
-        model:
-          preset?.model ||
-          localStorage.getItem("ika:model") ||
-          "gemini-2.5-flash-live-preview",
+      // const payload = {
+      //   model:
+      //     preset?.model ||
+      //     localStorage.getItem("ika:model") ||
+      //     "gemini-2.5-flash-live-preview",
 
-        // system + language + output modalities
-        system_instruction:
-          preset?.system_instruction ||
-          localStorage.getItem("ika:systemInstruction") ||
-          "You are a friendly, concise on-site concierge.",
-        language_code:
-          preset?.language_code ||
-          localStorage.getItem("ika:langCode") ||
-          "en-US",
-        response_modalities: Array.isArray(preset?.response_modalities)
-          ? preset.response_modalities
-          : ["AUDIO", "TEXT"],
+      //   // system + language + output modalities
+      //   system_instruction:
+      //     preset?.system_instruction ||
+      //     localStorage.getItem("ika:systemInstruction") ||
+      //     "You are a friendly, concise on-site concierge.",
+      //   language_code:
+      //     preset?.language_code ||
+      //     localStorage.getItem("ika:langCode") ||
+      //     "en-US",
+      //   response_modalities: Array.isArray(preset?.response_modalities)
+      //     ? preset.response_modalities
+      //     : ["AUDIO", "TEXT"],
 
-        // voice & style
-        voice: preset?.voice || localStorage.getItem("ika:voice") || "Puck",
-        temperature: Number.isFinite(preset?.temperature)
-          ? preset.temperature
-          : Number(localStorage.getItem("ika:temperature") ?? 0.6),
+      //   // voice & style
+      //   voice: preset?.voice || localStorage.getItem("ika:voice") || "Puck",
+      //   temperature: Number.isFinite(preset?.temperature)
+      //     ? preset.temperature
+      //     : Number(localStorage.getItem("ika:temperature") ?? 0.6),
 
-        // Live AAD (from sliders in Mic panel)
-        start_of_speech_sensitivity:
-          preset?.start_of_speech_sensitivity ??
-          getStoredNumber("ika:sos") ??
-          0.5,
-        end_of_speech_sensitivity:
-          preset?.end_of_speech_sensitivity ??
-          getStoredNumber("ika:eos") ??
-          0.5,
-        prefix_padding_ms:
-          preset?.prefix_padding_ms ?? getStoredNumber("ika:prefixPad") ?? 150,
-        silence_duration_ms:
-          preset?.silence_duration_ms ??
-          getStoredNumber("ika:silenceDur") ??
-          800,
+      //   // Live AAD (from sliders in Mic panel)
+      //   start_of_speech_sensitivity:
+      //     preset?.start_of_speech_sensitivity ??
+      //     getStoredNumber("ika:sos") ??
+      //     0.5,
+      //   end_of_speech_sensitivity:
+      //     preset?.end_of_speech_sensitivity ??
+      //     getStoredNumber("ika:eos") ??
+      //     0.5,
+      //   prefix_padding_ms:
+      //     preset?.prefix_padding_ms ?? getStoredNumber("ika:prefixPad") ?? 150,
+      //   silence_duration_ms:
+      //     preset?.silence_duration_ms ??
+      //     getStoredNumber("ika:silenceDur") ??
+      //     800,
 
-        // behaviors
-        enable_affective_dialog:
-          preset?.enable_affective_dialog ??
-          localStorage.getItem("ika:enableAffective") === "true",
-        proactive_audio:
-          preset?.proactive_audio ??
-          localStorage.getItem("ika:proactiveAudio") === "true",
-        function_calling:
-          preset?.function_calling ??
-          localStorage.getItem("ika:functionCalling") === "true",
-        auto_function_response:
-          preset?.auto_function_response ??
-          localStorage.getItem("ika:autoFunctionResponse") === "true",
-        grounding:
-          preset?.grounding ?? localStorage.getItem("ika:grounding") === "true",
+      //   // behaviors
+      //   enable_affective_dialog:
+      //     preset?.enable_affective_dialog ??
+      //     localStorage.getItem("ika:enableAffective") === "true",
+      //   proactive_audio:
+      //     preset?.proactive_audio ??
+      //     localStorage.getItem("ika:proactiveAudio") === "true",
+      //   function_calling:
+      //     preset?.function_calling ??
+      //     localStorage.getItem("ika:functionCalling") === "true",
+      //   auto_function_response:
+      //     preset?.auto_function_response ??
+      //     localStorage.getItem("ika:autoFunctionResponse") === "true",
+      //   grounding:
+      //     preset?.grounding ?? localStorage.getItem("ika:grounding") === "true",
 
-        // TTS routing
-        tts_provider: (
-          preset?.tts_provider ||
-          localStorage.getItem("ika:ttsProvider") ||
-          "gemini"
-        )?.toLowerCase(),
-        eleven_voice_id:
-          preset?.eleven_voice_id || localStorage.getItem("ika:11labs:voiceId"),
-        eleven_api_key:
-          preset?.eleven_api_key || localStorage.getItem("ika:11labs:key"),
-        eleven_model:
-          preset?.eleven_model ||
-          localStorage.getItem("ika:11labs:model") ||
-          "eleven_turbo_v2_5",
+      //   // TTS routing
+      //   tts_provider: (
+      //     preset?.tts_provider ||
+      //     localStorage.getItem("ika:ttsProvider") ||
+      //     "gemini"
+      //   )?.toLowerCase(),
+      //   eleven_voice_id:
+      //     preset?.eleven_voice_id || localStorage.getItem("ika:11labs:voiceId"),
+      //   eleven_api_key:
+      //     preset?.eleven_api_key || localStorage.getItem("ika:11labs:key"),
+      //   eleven_model:
+      //     preset?.eleven_model ||
+      //     localStorage.getItem("ika:11labs:model") ||
+      //     "eleven_turbo_v2_5",
 
-        // UI toggles
-        captions:
-          preset?.captions ?? localStorage.getItem("ika:captions") === "true",
+      //   // UI toggles
+      //   captions:
+      //     preset?.captions ?? localStorage.getItem("ika:captions") === "true",
 
-        // locale/location hints
-        lat: preset?.lat ?? getStoredNumber("ika:lat"),
-        lon: preset?.lon ?? getStoredNumber("ika:lon"),
-        locale: preset?.locale || localStorage.getItem("ika:locale") || "en-US",
+      //   // locale/location hints
+      //   lat: preset?.lat ?? getStoredNumber("ika:lat"),
+      //   lon: preset?.lon ?? getStoredNumber("ika:lon"),
+      //   locale: preset?.locale || localStorage.getItem("ika:locale") || "en-US",
 
-        deviceId,
-      };
+      //   deviceId,
+      // };
 
-      /* old create session
-      s.emit("create_session", {
-        ...payload,
-        sessionId: sessionId || "web-" + deviceId,
-        gemini_api_key: localStorage.getItem("ika:gemini:key") || undefined,
-      });*/
-
-      SendWebsockCommandToServer(MSG_TYPE.SessionStart, payload);
+      // UNUSED : emit create_session over socket.io
+      // s.emit("create_session", {
+      //   ...payload,
+      //   sessionId: sessionId || "web-" + deviceId,
+      //   gemini_api_key: localStorage.getItem("ika:gemini:key") || undefined,
+      // });
 
       bump("start");
+
       setSessionStatus("ACTIVE");
-      setSessionId((id) => id || uuid());
+      //setSessionId((id) => id || uuid());
+      console.log("create session for device", deviceId);
+      SendWebsockCommandToServer(wsSocket, MSG_TYPE.SessionStart);
     },
     [deviceId]
   );
 
   const updateServerSettings = useCallback((fields) => {
-    const s = socketRef.current;
-    if (!s) return;
-    s.emit("update_settings", fields || {});
+    //UNUSED : emit update_settings over socket.io
+    // const s = socketRef.current;
+    // if (!s) return;
+    // s.emit("update_settings", fields || {});
   }, []);
 
   const sendTextPrompt = useCallback((text) => {
-    const s = socketRef.current;
-    if (!s || !text) return;
-    s.emit("send_text_prompt", { text });
+    //UNUSED : emit send_text_prompt over socket.io
+    // const s = socketRef.current;
+    // if (!s || !text) return;
+    // s.emit("send_text_prompt", { text });
   }, []);
 
+  //crowd status emitter
   const emitCrowdStatus = useCallback(
     (payload) => {
       const s = socketRef.current;
-      if (!s) return;
-      s.emit("crowd_status", {
-        deviceId,
-        sessionId: sessionId || "web-" + deviceId,
-        ...payload,
-      });
+      //UNUSED : emit crowd_status over socket.io
+      // if (!s) return;
+      // s.emit("crowd_status", {
+      //   deviceId,
+      //   sessionId: sessionId || "web-" + deviceId,
+      //   ...payload,
+      // });
+
       bump("snapshot");
     },
     [sessionId]
@@ -2135,6 +2116,9 @@ export default function App() {
   // All faces (green + red) for hand proximity heuristics
   const allFacesRef = useRef([]);
 
+  // Face tracker instance
+  const faceTrackerRef = useRef(null);
+
   const speakingRef = useRef(false);
 
   // ---- Policy + speaker state ----
@@ -2163,9 +2147,8 @@ export default function App() {
     const sig = JSON.stringify([payload.focusIndex, ppl]);
     if (now - state.t < MIN_MS && sig === state.sig) return;
     try {
-      //server.crowdStatus(payload);
-      console.log("[websocket] sending crowd status", payload);
-      SendWebsockCommandToServer(MSG_TYPE.CrowdStat, payload);
+
+      server.crowdStatus(payload);
     } catch { }
     lastCrowdSendRef.current = { t: now, sig };
   }
@@ -2265,17 +2248,43 @@ export default function App() {
   const lastAutoCalRef = useRef(0);
   const [isPressed, setIsPressed] = useState(false);
 
-  // mic/VAD prefs
-  const [dbfs, setDbfs] = useState(-60);
-  const [threshold, setThreshold] = useState(
-    Number(localStorage.getItem("ika:threshold") ?? -45)
-  );
-  const [listenMs, setListenMs] = useState(
+  //vad class container
+  class VADSetting {
+    constructor( threshold, listenMs, silenceMs, sosQuick, eosQuick, prefixPadQuick, silenceDurQuick) {
+      this.threshold = threshold;
+      this.listenMs = listenMs;
+      this.silenceMs = silenceMs;
+      this.sosQuick = sosQuick;
+      this.eosQuick = eosQuick;
+      this.prefixPadQuick = prefixPadQuick;
+      this.silenceDurQuick = silenceDurQuick;
+    }
+
+    isEqual(other) {
+      return (
+        this.threshold === other.threshold &&
+        this.listenMs === other.listenMs &&
+        this.silenceMs === other.silenceMs &&
+        this.sosQuick === other.sosQuick &&
+        this.eosQuick === other.eosQuick &&
+        this.prefixPadQuick === other.prefixPadQuick &&
+        this.silenceDurQuick === other.silenceDurQuick
+      );
+
+    } 
+  }
+
+    // mic/VAD prefs
+    const [dbfs, setDbfs] = useState(-60);
+    const [threshold, setThreshold] = useState(
+      Number(localStorage.getItem("ika:threshold") ?? -45)
+    );
+    const [listenMs, setListenMs] = useState(
     Number(localStorage.getItem("ika:listenMs") ?? 400)
   );
   const [silenceMs, setSilenceMs] = useState(
     Number(localStorage.getItem("ika:silenceMs") ?? 500)
-  );
+  );0
 
   // Live AAD knobs (moved here)
   const [sosQuick, setSosQuick] = useState(
@@ -2290,7 +2299,7 @@ export default function App() {
   const [silenceDurQuick, setSilenceDurQuick] = useState(
     Number(localStorage.getItem("ika:silenceDur") ?? 800)
   );
-
+  
   // mirror into refs for VAD loop
   const thresholdLiveRef = useRef(threshold);
   const listenMsLiveRef = useRef(listenMs);
@@ -2323,6 +2332,45 @@ export default function App() {
       localStorage.setItem("ika:silenceDur", String(silenceDurQuick));
     } catch { }
   }, [sosQuick, eosQuick, prefixPadQuick, silenceDurQuick]);
+
+  //vad setting ref container 
+ const vadSettingRef = useRef(new VADSetting( threshold, listenMs, silenceMs, 
+    sosQuick, eosQuick, prefixPadQuick, silenceDurQuick));  
+
+  useEffect(() => {
+    const currentVad = new VADSetting(
+      threshold,
+      listenMs,
+      silenceMs,
+      sosQuick,
+      eosQuick,
+      prefixPadQuick,
+      silenceDurQuick
+    );
+
+    if (vadSettingRef.current.isEqual(currentVad)) {
+      console.log("VAD settings unchanged, not sending");
+      return;
+    } else {
+      vadSettingRef.current = currentVad;
+      SendWebsockCommandToServer(
+        wsSocket,
+        MSG_TYPE.MicData,
+        vadSettingRef.current
+      );
+    }
+  }, [
+    threshold,
+    listenMs,
+    silenceMs,
+    sosQuick,
+    eosQuick,
+    prefixPadQuick,
+    silenceDurQuick,
+  ]);
+
+
+
 
   const [micOn, setMicOn] = useState(false);
   const micOnRef = useRef(false);
@@ -2401,6 +2449,7 @@ export default function App() {
       guestSavePendingRef.current = false;
     }, 750);
   }
+
   function assignGuestIdFor(descriptor) {
     if (!descriptor || !descriptor.length) {
       const id = `Guest${String(guestSeqRef.current++).padStart(2, "0")}`;
@@ -2427,6 +2476,7 @@ export default function App() {
     scheduleGuestSave();
     return id;
   }
+
   function saveGuestMem({
     day = dayKey(),
     seq = guestSeqRef.current,
@@ -2443,6 +2493,7 @@ export default function App() {
       localStorage.setItem(GUEST_STORE_KEY, JSON.stringify(payload));
     } catch { }
   }
+
   function loadGuestMem() {
     try {
       const raw = localStorage.getItem(GUEST_STORE_KEY);
@@ -2776,6 +2827,21 @@ export default function App() {
 
         if (!cancelled) {
           faceMatcherRef.current = matcher;
+          
+          // Initialize face tracker if not already created
+          if (!faceTrackerRef.current) {
+            faceTrackerRef.current = createFaceTracker({
+              maxTracked: 5,
+              ageGenderSampleMs: 1000,
+              handsEnabled: HANDS_ENABLED,
+              handsCacheMs: HANDS_CACHE_MS,
+              gestureTargets: 2
+            });
+          }
+          
+          // Update face tracker with new matcher
+          faceTrackerRef.current.setFaceMatcher(matcher);
+          
           setKnownCount(
             usable.reduce((acc, l) => acc + l.descriptors.length, 0)
           );
@@ -2996,6 +3062,7 @@ export default function App() {
 
     analyser.smoothingTimeConstant = origSmoothing;
   }, []);
+
   async function maybeAutoCalibrate() {
     if (!autoDetectOnRef.current) return;
     if (!micOnRef.current) return;
@@ -3024,6 +3091,8 @@ export default function App() {
       micIdleToStandbyTimerRef.current = setTimeout(() => {
         if (!micOnRef.current && isCamLive()) {
           setSessionStatus("STANDBY");
+
+          SendWebsockCommandToServer(wsSocket, MSG_TYPE.Standby);
         }
         micIdleToStandbyTimerRef.current = null;
       }, MIC_IDLE_MS);
@@ -3083,6 +3152,9 @@ export default function App() {
     micIdleToStandbyTimerRef.current = setTimeout(() => {
       if (!micOnRef.current && isCamLive()) {
         setSessionStatus("STANDBY");
+
+        //sending session end event
+        SendWebsockCommandToServer(wsSocket, MSG_TYPE.Standby);
       }
       micIdleToStandbyTimerRef.current = null;
     }, MIC_IDLE_MS);
@@ -3099,10 +3171,21 @@ export default function App() {
       const same = (id || "") === (audioRef.current.deviceId || "");
       if (!force && same) {
         console.log("[Mic] already running");
+
         // ensure status reflects live mic
-        setSessionStatus(isCamLive() ? "ACTIVE" : "STANDBY");
+        const x = isCamLive() ? "ACTIVE" : "STANDBY";
+        setSessionStatus(x);
+        let c = MSG_TYPE.Unknown;
+        if (x === "ACTIVE")
+          c = MSG_TYPE.SessionStart;
+        else if (x === "STANDBY")
+          c = MSG_TYPE.Standby;
+
+        SendWebsockCommandToServer(wsSocket, c);
+
         return;
       }
+
       await stopMic();
     }
 
@@ -3257,6 +3340,12 @@ export default function App() {
             vad.recording = true;
             vad.lowSince = 0;
 
+            rec.onstart = () => {
+              console.log("vad rec started", { mimeType: rec.mimeType });
+              //UNUSED for now
+              //SendWebsockCommandToServer(wsSocket, MSG_TYPE.VocStart);
+
+            };
             rec.ondataavailable = (e) => {
               if (e.data?.size) vad.chunks.push(e.data);
             };
@@ -3281,6 +3370,10 @@ export default function App() {
 
                 // TODO: Upload to your STT endpoint; for now simulate
                 handleTranscriptResult({ text: "(utterance)" });
+                //handle voice trigger here
+                //UNUSED for now
+                //SendWebsockCommandToServer(wsSocket, MSG_TYPE.VocEnd);
+
               } catch (e) {
                 console.error("[STT] onstop error:", e);
               } finally {
@@ -3552,6 +3645,21 @@ export default function App() {
     // Zero offsets so centered person yields yaw≈0, pitch≈0
     setPanOffsetDeg((p) => p - yawMed);
     setTiltOffsetDeg((t) => t - pitchMed);
+    
+    // Update face tracker with new camera parameters
+    if (faceTrackerRef.current) {
+      faceTrackerRef.current.updateCameraParams(fxMed, fy, panOffRef.current, tiltOffRef.current);
+    }
+  }
+
+  // Helper function to update camera parameters in both refs and face tracker
+  function updateCameraParams(fx, fy) {
+    camFxRef.current = fx;
+    camFyRef.current = fy;
+    
+    if (faceTrackerRef.current) {
+      faceTrackerRef.current.updateCameraParams(fx, fy, panOffRef.current, tiltOffRef.current);
+    }
   }
 
   async function runCalCountdown() {
@@ -3631,7 +3739,6 @@ export default function App() {
           now - (lastAgeSampleRef.current || 0) >= AGE_SAMPLE_MS;
         if (heavyAgeNow) lastAgeSampleRef.current = now;
 
-        //#region detection chain
         let dets = [];
         try {
           let chain = faceapi.detectAllFaces(video, tinyOptsRef.current);
@@ -3649,9 +3756,6 @@ export default function App() {
           dets = [];
         }
 
-        //#endregion
-
-        //console.log(`[FaceAPI] detected ${dets.length} faces`);
         // ==== drawing + bookkeeping ====
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         // --- alignment overlay: crosshair and banner ---
@@ -3695,57 +3799,54 @@ export default function App() {
         ctx.font = LABEL_FONT;
         ctx.textBaseline = "top";
 
-        const resized = faceapi
-          .resizeResults(dets, { width: canvas.width, height: canvas.height })
-          .sort((a, b) => a.detection.box.x - b.detection.box.x);
-
-        const matcher = faceMatcherRef.current;
-        const rows = [];
-        const peopleForPost = [];
-        let total = 0,
-          green = 0,
-          red = 0;
-
-        // build candidates (same as before)
-        const cutoff = Number.isFinite(redCutoffM) ? redCutoffM : Infinity;
-        const candidates = [];
-        for (let i = 0; i < resized.length; i++) {
-          const det = resized[i];
-          const box = det.detection.box;
-          const dist = estimateDistanceMpx(box.width);
-          if (dist != null && dist > cutoff) continue; // skip way too far
-          const zone = zoneOf(dist, greenMaxMRef.current);
-          candidates.push({ i, det, box, dist, zone });
+        // Use face tracker for all detection and drawing
+        if (!faceTrackerRef.current) {
+          // Initialize face tracker if not already created
+          faceTrackerRef.current = createFaceTracker({
+            maxTracked: 5,
+            ageGenderSampleMs: 1000,
+            handsEnabled: HANDS_ENABLED,
+            handsCacheMs: HANDS_CACHE_MS,
+            gestureTargets: 2
+          });
+          
+          // Set up camera parameters
+          faceTrackerRef.current.updateCameraParams(
+            camFxRef.current, 
+            camFyRef.current, 
+            panOffRef.current, 
+            tiltOffRef.current
+          );
+          
+          // Set face matcher if available
+          if (faceMatcherRef.current) {
+            faceTrackerRef.current.setFaceMatcher(faceMatcherRef.current);
+          }
         }
 
-        // Totals for status/mic policy (all visible faces within cutoff)
-        total = candidates.length;
-        green = candidates.filter((c) => c.zone === "green").length;
-        red = total - green;
+        // Track faces and get results
+        const trackingOptions = {
+          redCutoffM,
+          greenMaxM: greenMaxMRef.current,
+          showAlignment: showAlignRef.current,
+          calibrationMessage: calibMsgRef.current,
+          gesturesOn: gesturesOnRef.current,
+          video,
+          handsCount: 0, // Will be updated if hands are detected
+          handsList: []
+        };
 
-        // 2) Only TRACK up to 5 people in the GREEN zone, nearest first
-        const greenCandidates = candidates
-          .filter((c) => c.zone === "green" && Number.isFinite(c.dist))
-          .sort((a, b) => a.dist - b.dist);
-        const tracked = greenCandidates.slice(0, 5);
+        const trackingResult = await faceTrackerRef.current.trackFaces(
+          dets, 
+          canvas, 
+          ctx, 
+          trackingOptions
+        );
 
-        if (tracked.length) {
-          ctx.save();
-          ctx.font = "bold 12px system-ui";
-          const msg = `tracked: ${tracked.length}`;
-          const w = ctx.measureText(msg).width + 10;
-          ctx.fillStyle = "rgba(34,197,94,0.85)";
-          ctx.fillRect(10, 10, w, 20);
-          ctx.fillStyle = "#fff";
-          ctx.fillText(msg, 15, 24);
-          ctx.restore();
-        }
+        const { peopleForPost, rows, totals } = trackingResult;
+        const { total, green, red } = totals;
 
-        // Define per-frame gesture eligibility set (top-2 will be added below)
-        const gestureAllowedKeys = new Set();
-
-        // 3) Draw + identify only the tracked subset (stable by name/gid)
-        const tracks = recentMapRef.current;
+        // Mic policy with grace
         for (let k = 0; k < tracked.length; k++) {
           const { i, det, box, dist, zone } = tracked[k];
 
@@ -3753,7 +3854,6 @@ export default function App() {
           const matcher = faceMatcherRef.current;
           let name = null;
           if (matcher && det.descriptor) {
-            
             const best = matcher.findBestMatch(det.descriptor);
             if (
               best &&
@@ -3986,6 +4086,7 @@ export default function App() {
             distance: dist ? dist.toFixed(2) + " m" : "-",
           });
 
+          //NOTE :collect for server posting
           peopleForPost.push({
             gender,
             ageGroup: ageGroupOf(ageVal),
@@ -4005,6 +4106,9 @@ export default function App() {
             _w: dbox.width,
             _h: dbox.height,
           });
+
+          //send to server only tracked
+
         }
 
         // remember face centers for click-to-zero + per-face hands mapping
@@ -4022,41 +4126,6 @@ export default function App() {
           gestureEligible: gestureAllowedKeys.has(p.stableKey),
           z: p.posCam?.z ?? null, // NEW: carry depth
         }));
-
-        //#region Send crowd stats to server
-        // Throttle to send only once every 500ms
-        //console.log("now is:", now);
-        const ms = 5000;
-        let doOnce = true;
-        let trackedName = trackedFacesRef.current.at(0)?.name || trackedFacesRef.current.at(0)?.gid;
-
-        if(trackedName !== undefined && trackedName !== null) 
-        {
-          if(lastIdCrowdSentRef.current !== trackedName) 
-          {
-            doOnce = true;
-          }
-          else{
-            doOnce = false;
-          }
-
-          if (doOnce) {
-            doOnce = false;
-
-            let jsonData = {
-              id : trackedName,
-              timestamp: new Date().toISOString(),
-            }
-
-            console.log("Sending crowd stat for id:", trackedName);
-            let id = trackedName;
-            SendWebsockCommandToServer(MSG_TYPE.CrowdStat, JSON.stringify(jsonData));
-            lastIdCrowdSentRef.current = id;
-          }
-        }
-
-       
-        //#endregion
 
         // Also expose ALL faces (GREEN + RED) for hand proximity (on_phone)
         allFacesRef.current = candidates.map((c) => {
@@ -4105,7 +4174,7 @@ export default function App() {
             ctx.fillText(l1, lx + LABEL_PAD_X, ly + LABEL_PAD_Y);
             ctx.restore();
           }
-        } catch {}
+        } catch { }
 
         // prune only faces that are no longer tracked (preserve history for tracked-but-not-eligible)
         {
@@ -4181,17 +4250,19 @@ export default function App() {
         const nowMs = performance.now();
         if (shouldListen) {
           lastAllGreenRef.current = nowMs;
+          //mic detect voice
           if (!micOnRef.current) {
             userMicOffRef.current = false;
-            startMic().catch(() => {});
+
+            SendWebsockCommandToServer(wsSocket, MSG_TYPE.SessionStart);
+            startMic().catch(() => { });
             setSessionStatus("ACTIVE");
-            if (!sessionId) setSessionId(uuid());
           }
         } else {
           const sinceAllGreen = nowMs - (lastAllGreenRef.current || 0);
           if (micOnRef.current && sinceAllGreen >= MIC_STOP_GRACE_MS) {
             userMicOffRef.current = true;
-            stopMic().catch(() => {});
+            stopMic().catch(() => { });
           }
         }
 
@@ -4242,7 +4313,7 @@ export default function App() {
               LOOP_STEP_IDLE_MIN_MS +
               Math.floor(
                 Math.random() *
-                  (LOOP_STEP_IDLE_MAX_MS - LOOP_STEP_IDLE_MIN_MS + 1)
+                (LOOP_STEP_IDLE_MAX_MS - LOOP_STEP_IDLE_MIN_MS + 1)
               );
             loopStepMsRef.current = jitter;
           }
@@ -4261,8 +4332,8 @@ export default function App() {
               ? GM_HANDS_FAST_MS
               : HANDS_FAST_MS
             : gm
-            ? GM_HANDS_IDLE_MS
-            : HANDS_IDLE_MS;
+              ? GM_HANDS_IDLE_MS
+              : HANDS_IDLE_MS;
 
         if (
           handsEligible &&
@@ -4543,7 +4614,7 @@ export default function App() {
                     if (w.ok && (allowWave || w.score >= 0.62)) {
                       cand.push({ type: "wave", score: w.score });
                     }
-                  } catch {}
+                  } catch { }
 
                   const palm = palmSpanLen(lm);
 
@@ -4551,11 +4622,11 @@ export default function App() {
                     try {
                       const r = classifyRock(lm);
                       if (r.ok) cand.push({ type: "rock", score: r.score });
-                    } catch {}
+                    } catch { }
                     try {
                       const s = classifyScissors(lm);
                       if (s.ok) cand.push({ type: "scissors", score: s.score });
-                    } catch {}
+                    } catch { }
                     try {
                       const p = classifyPaper(lm);
                       // paper: open palm; allow near face OR clearly high & aligned; upright-ish; not swinging
@@ -4568,17 +4639,17 @@ export default function App() {
                       ) {
                         cand.push({ type: "paper", score: p.score });
                       }
-                    } catch {}
+                    } catch { }
                   } else {
                     try {
                       const p = classifyPeace(lm);
                       if (p.ok) cand.push({ type: "peace", score: p.score });
-                    } catch {}
+                    } catch { }
                     try {
                       const rh = classifyRaiseHand(lm);
                       if (rh.ok)
                         cand.push({ type: "raise_hand", score: rh.score });
-                    } catch {}
+                    } catch { }
                     // phone stays scoped to this face (already done)
                     try {
                       const ph = classifyOnPhone(
@@ -4589,12 +4660,12 @@ export default function App() {
                       );
                       if (ph.ok)
                         cand.push({ type: "on_phone", score: ph.score });
-                    } catch {}
+                    } catch { }
                     try {
                       const t = classifyThumbsUp(lm);
                       if (t.ok)
                         cand.push({ type: "thumbs_up", score: t.score });
-                    } catch {}
+                    } catch { }
                   }
 
                   // If a strong pose is present, drop weaker wave this frame
@@ -4627,8 +4698,8 @@ export default function App() {
                     gm && bestFrame.type === "wave"
                       ? { type: "paper", score: bestFrame.score }
                       : gm && bestFrame.type === "thumbs_up"
-                      ? null
-                      : bestFrame;
+                        ? null
+                        : bestFrame;
                   if (adj && (!prev || adj.score > prev.score))
                     byFace.set(face.key, adj);
                 }
@@ -4658,37 +4729,40 @@ export default function App() {
                     ) {
                       const facesMeta = trackedFacesRef.current || [];
                       const meta = facesMeta.find((f) => f.key === key) || {};
-                      try {
-                        socketRef.current?.emit?.(
-                          gm ? "game_event" : "gesture_event",
-                          gm
-                            ? {
-                                sessionId: sessionId || "web-" + deviceId,
-                                deviceId,
-                                rps: nextStable.type,
-                                at: Date.now(),
-                                focusIndex: meta.index ?? focusIndexRef.current,
-                                focusTarget: {
-                                  name: meta.name || null,
-                                  gid: meta.gid || null,
-                                },
-                              }
-                            : {
-                                sessionId: sessionId || "web-" + deviceId,
-                                deviceId,
-                                gesture: {
-                                  type: nextStable.type,
-                                  score: nextStable.score,
-                                },
-                                at: Date.now(),
-                                focusIndex: meta.index ?? focusIndexRef.current,
-                                focusTarget: {
-                                  name: meta.name || null,
-                                  gid: meta.gid || null,
-                                },
-                              }
-                        );
-                      } catch {}
+
+                      console.log("faces send!");
+                      // UNUSED : Emit gesture event (throttled per-person)
+                      // try {
+                      //   socketRef.current?.emit?.(
+                      //     gm ? "game_event" : "gesture_event",
+                      //     gm
+                      //       ? {
+                      //         sessionId: sessionId || "web-" + deviceId,
+                      //         deviceId,
+                      //         rps: nextStable.type,
+                      //         at: Date.now(),
+                      //         focusIndex: meta.index ?? focusIndexRef.current,
+                      //         focusTarget: {
+                      //           name: meta.name || null,
+                      //           gid: meta.gid || null,
+                      //         },
+                      //       }
+                      //       : {
+                      //         sessionId: sessionId || "web-" + deviceId,
+                      //         deviceId,
+                      //         gesture: {
+                      //           type: nextStable.type,
+                      //           score: nextStable.score,
+                      //         },
+                      //         at: Date.now(),
+                      //         focusIndex: meta.index ?? focusIndexRef.current,
+                      //         focusTarget: {
+                      //           name: meta.name || null,
+                      //           gid: meta.gid || null,
+                      //         },
+                      //       }
+                      //   );
+                      // } catch { }
                       lastGestureSentPerFaceRef.current.set(key, now);
                     }
                   } else {
@@ -4743,9 +4817,6 @@ export default function App() {
                 g && now - g.t <= HANDS_CACHE_MS
                   ? { type: g.type, score: g.score }
                   : null;
-
-                  console.log("emiting crowds");
-              //emit crowd snapshot
               emitCrowdThrottled({
                 deviceId,
                 sessionId: sessionId || "web-" + deviceId,
@@ -4843,20 +4914,37 @@ export default function App() {
                   s.tries += 1;
                   s.last = now;
                   callOverStateRef.current.set(p.key, s);
-                  socketRef.current?.emit?.("policy_event", {
-                    deviceId,
-                    sessionId: sessionId || "web-" + deviceId,
-                    type: "call_over",
-                    attempt: s.tries,
+
+                  let data = {
+                    deviceid: deviceId,
+                    sessionId: sessionId,
+                    type: PolicyTypeEnum.CallOver,
                     target: {
-                      name: p.name || null,
-                      gid: p.gid || null,
-                      gender: p.gender || null,
+                      name: p.name,
+                      gid: p.gid,
                     },
-                    group: { size: groupSize, hasKid },
+                    group: { size: groupSize, hasKid: hasKid },
                     reason: "left_green_zone",
                     at: Date.now(),
-                  });
+                  };
+
+                  SendPolicyData(wsSocket, data);
+
+                  // UNUSED: Emit call-over event
+                  // socketRef.current?.emit?.("policy_event", {
+                  //   deviceId,
+                  //   sessionId: sessionId || "web-" + deviceId,
+                  //   type: "call_over",
+                  //   attempt: s.tries,
+                  //   target: {
+                  //     name: p.name || null,
+                  //     gid: p.gid || null,
+                  //     gender: p.gender || null,
+                  //   },
+                  //   group: { size: groupSize, hasKid },
+                  //   reason: "left_green_zone",
+                  //   at: Date.now(),
+                  // });
                 }
               }
 
@@ -4878,19 +4966,37 @@ export default function App() {
                       : p.gender === "female"
                         ? "ma’am"
                         : "there";
-                socketRef.current?.emit?.("policy_event", {
-                  deviceId,
-                  sessionId: sessionId || "web-" + deviceId,
-                  type: "greet",
-                  address,
+
+                let data = {
+                  deviceid: deviceId,
+                  sessionId: sessionId,
+                  type: PolicyTypeEnum.Greet,
                   target: {
-                    name: p.name || null,
-                    gid: p.gid || null,
-                    gender: p.gender || null,
+                    name: p.name,
+                    gid: p.gid,
+                    gender: p.gender,
                   },
-                  group: { size: groupSize, hasKid },
+                  group: { size: groupSize, hasKid: hasKid },
+                  reason: '',
                   at: Date.now(),
-                });
+                };
+
+                SendPolicyData(wsSocket, data);
+
+                //UNUSED: Emit greet event
+                // socketRef.current?.emit?.("policy_event", {
+                //   deviceId,
+                //   sessionId: sessionId || "web-" + deviceId,
+                //   type: "greet",
+                //   address,
+                //   target: {
+                //     name: p.name || null,
+                //     gid: p.gid || null,
+                //     gender: p.gender || null,
+                //   },
+                //   group: { size: groupSize, hasKid },
+                //   at: Date.now(),
+                // });
               }
             }
 
@@ -4906,15 +5012,30 @@ export default function App() {
                 GROUP_ASK_COOLDOWN_MS
               ) {
                 lastGroupAskTsRef.current = now;
-                socketRef.current?.emit?.("policy_event", {
-                  deviceId,
-                  sessionId: sessionId || "web-" + deviceId,
-                  type: "ask_group_change",
+
+                let dataTobeSent = {
+                  deviceid: deviceId,
+                  sessionId: sessionId,
+                  type: PolicyTypeEnum.GroupChange,  
                   prevSize: prevSet.size,
                   currSize: curSet.size,
                   overlap,
                   at: Date.now(),
-                });
+                };
+
+                SendPolicyData(wsSocket, dataTobeSent);
+
+                // UNUSED: Emit group change event
+                // socketRef.current?.emit?.("policy_event", {
+                //   deviceId,
+                //   sessionId: sessionId || "web-" + deviceId,
+                //   type: "ask_group_change",
+                //   prevSize: prevSet.size,
+                //   currSize: curSet.size,
+                //   overlap,
+                //   at: Date.now(),
+                // });
+
               }
             }
             // update last group
@@ -4965,18 +5086,35 @@ export default function App() {
                 sp.key = topKey;
 
                 const p = list[absIdx];
-                socketRef.current?.emit?.("policy_event", {
-                  deviceId,
-                  sessionId: sessionId || "web-" + deviceId,
-                  type: "speaker_focus",
+
+                let dataTobeSent = {
+                  deviceid: deviceId,
+                  sessionId: sessionId,
+                  type: PolicyTypeEnum.SpeakerFocus,
                   target: {
-                    name: p.name || null,
-                    gid: p.gid || null,
-                    gender: p.gender || null,
+                    name: p.name,
+                    gid: p.gid,
+                    gender: p.gender,
                     index: absIdx,
                   },
                   at: Date.now(),
-                });
+                };
+
+                SendPolicyData(wsSocket, dataTobeSent);
+
+                // UNUSED: Emit speaker focus event
+                // socketRef.current?.emit?.("policy_event", {
+                //   deviceId,
+                //   sessionId: sessionId || "web-" + deviceId,
+                //   type: "speaker_focus",
+                //   target: {
+                //     name: p.name || null,
+                //     gid: p.gid || null,
+                //     gender: p.gender || null,
+                //     index: absIdx,
+                //   },
+                //   at: Date.now(),
+                // });
               }
             }
           } catch (e) {
@@ -5016,6 +5154,7 @@ export default function App() {
       if (ago > MIC_IDLE_MS && micOnRef.current) {
         userMicOffRef.current = true;
         stopMic().catch(() => { });
+
       }
       // Camera idle: stop everything, including LLM
       if (ago > CAM_IDLE_MS) {
@@ -5054,12 +5193,14 @@ export default function App() {
     speakingRef.current = false;
     S.current = { id: null, seenFrames: 0, lastFaceTs: 0, lastSnapshotTs: 0 };
 
-    try {
-      //socketRef.current?.emit?.("close_session", { sessionId });
-      SendWebsockCommandToServer(MSG_TYPE.SessionEnd, { sessionId });
-    } catch { }
+    //UNUSED : close session on server
+    // try {
+
+    //   socketRef.current?.emit?.("close_session", { sessionId });
+    // } catch { }
     setSessionId(null);
     setSessionStatus("IDLE"); // full idle immediately
+
     recentMapRef.current = {};
 
     if (reset) bump("stop");
@@ -5523,6 +5664,7 @@ export default function App() {
                   data-active={!micOn ? "true" : "false"}
                   onClick={async () => {
                     userMicOffRef.current = true;
+
                     await stopMic();
                   }}
                 >
@@ -5555,7 +5697,10 @@ export default function App() {
                   max="-20"
                   step="1"
                   value={threshold}
-                  onChange={(e) => setThreshold(Number(e.target.value))}
+                  onChange={(e) => {
+                    setThreshold(Number(e.target.value));
+                  }
+                }
                 />
               </div>
 
@@ -5661,7 +5806,7 @@ export default function App() {
                       setAudioId(next);
                       try {
                         localStorage.setItem("ika:audioId", next);
-                      } catch { }
+                      } catch { }                      
                       await startMic(next, { force: true });
                     }}
                   >
@@ -6153,165 +6298,166 @@ export default function App() {
           </section>
 
           {/* Gemini */}
-          <section
-            className="panel"
-            style={{ pointerEvents: "auto", zIndex: 1001 }}
-          >
-            <h3 className="section-title">gemini settings</h3>
-            <label className="label" htmlFor="gemini-api-key-input">
-              Gemini API Key
-            </label>{" "}
-            {/* Added htmlFor */}
-            <input
-              className="input bigpad"
-              type="password"
-              inputMode="text"
-              autoComplete="off"
-              placeholder="gsk-…"
-              value={geminiApiKey}
-              onChange={(e) => setGeminiApiKey(e.target.value)}
-              id="gemini-api-key-input" // Added ID
-            />
-            <label className="label" htmlFor="gemini-model-select">
-              Model
-            </label>{" "}
-            {/* Added htmlFor */}
-            <select
-              className="select big"
-              value={modelQuick}
-              onChange={(e) => setModelQuick(e.target.value)}
-              id="gemini-model-select" // Added ID
+          {false && (/* Temporarily hide Gemini settings */
+            <section
+              className="panel"
+              style={{ pointerEvents: "auto", zIndex: 1001 }}
             >
-              {MODEL_OPTIONS.map((m) => (
-                <option key={m.value} value={m.value}>
-                  {m.label}
-                </option>
-              ))}
-            </select>
-            <label className="label" htmlFor="gemini-voice-select">
-              Voice
-            </label>{" "}
-            {/* Added htmlFor */}
-            <select
-              className="select big"
-              value={geminiVoiceQuick}
-              onChange={(e) => setGeminiVoiceQuick(e.target.value)}
-              id="gemini-voice-select" // Added ID
-            >
-              {(GEMINI_VOICES[modelKind] || []).map((v) => (
-                <option key={v} value={v}>
-                  {v}
-                </option>
-              ))}
-            </select>
-            <label className="label" htmlFor="gemini-language-select">
-              Language
-            </label>{" "}
-            {/* Added htmlFor */}
-            <select
-              className="select big"
-              value={languageCodeQuick}
-              onChange={(e) => setLanguageCodeQuick(e.target.value)}
-              id="gemini-language-select" // Added ID
-            >
-              {LANGS.map(([label, code]) => (
-                <option key={code} value={code}>
-                  {label}
-                </option>
-              ))}
-            </select>
-            <label className="label" htmlFor="gemini-temperature-range">
-              Temperature
-            </label>{" "}
-            {/* Added htmlFor */}
-            <input
-              className="range"
-              type="range"
-              min="0"
-              max="1"
-              step="0.05"
-              value={temperatureQuick}
-              onChange={(e) => setTemperatureQuick(Number(e.target.value))}
-              id="gemini-temperature-range" // Added ID
-            />
-            <div className="help">{temperatureQuick.toFixed(2)}</div>
-            <div className="row wrap" style={{ gap: 12, marginTop: 8 }}>
-              <label className="checkbox">
-                <input
-                  type="checkbox"
-                  checked={enableAffectiveQuick}
-                  onChange={(e) => setEnableAffectiveQuick(e.target.checked)}
-                  id="checkbox-affective"
-                />
-                <span>Affective dialog</span>
+              <h3 className="section-title">gemini settings</h3>
+              <label className="label" htmlFor="gemini-api-key-input">
+                Gemini API Key
               </label>{" "}
-              {/* Added ID */}
-              <label className="checkbox">
-                <input
-                  type="checkbox"
-                  checked={proactiveAudioQuick}
-                  onChange={(e) => setProactiveAudioQuick(e.target.checked)}
-                  id="checkbox-proactive"
-                />
-                <span>Proactive dialog</span>
+              {/* Added htmlFor */}
+              <input
+                className="input bigpad"
+                type="password"
+                inputMode="text"
+                autoComplete="off"
+                placeholder="gsk-…"
+                value={geminiApiKey}
+                onChange={(e) => setGeminiApiKey(e.target.value)}
+                id="gemini-api-key-input" // Added ID
+              />
+              <label className="label" htmlFor="gemini-model-select">
+                Model
               </label>{" "}
-              {/* Added ID */}
-              <label className="checkbox">
-                <input
-                  type="checkbox"
-                  checked={functionCallingQuick}
-                  onChange={(e) => setFunctionCallingQuick(e.target.checked)}
-                  id="checkbox-function-calling"
-                />
-                <span>Function calling</span>
+              {/* Added htmlFor */}
+              <select
+                className="select big"
+                value={modelQuick}
+                onChange={(e) => setModelQuick(e.target.value)}
+                id="gemini-model-select" // Added ID
+              >
+                {MODEL_OPTIONS.map((m) => (
+                  <option key={m.value} value={m.value}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+              <label className="label" htmlFor="gemini-voice-select">
+                Voice
               </label>{" "}
-              {/* Added ID */}
-              <label className="checkbox">
-                <input
-                  type="checkbox"
-                  checked={autoFunctionResponseQuick}
-                  onChange={(e) =>
-                    setAutoFunctionResponseQuick(e.target.checked)
-                  }
-                  id="checkbox-auto-function-response"
-                />
-                <span>Auto function response</span>
+              {/* Added htmlFor */}
+              <select
+                className="select big"
+                value={geminiVoiceQuick}
+                onChange={(e) => setGeminiVoiceQuick(e.target.value)}
+                id="gemini-voice-select" // Added ID
+              >
+                {(GEMINI_VOICES[modelKind] || []).map((v) => (
+                  <option key={v} value={v}>
+                    {v}
+                  </option>
+                ))}
+              </select>
+              <label className="label" htmlFor="gemini-language-select">
+                Language
               </label>{" "}
-              {/* Added ID */}
-              <label className="checkbox">
-                <input
-                  type="checkbox"
-                  checked={groundingQuick}
-                  onChange={(e) => setGroundingQuick(e.target.checked)}
-                  id="checkbox-grounding"
-                />
-                <span>Grounding (Search)</span>
+              {/* Added htmlFor */}
+              <select
+                className="select big"
+                value={languageCodeQuick}
+                onChange={(e) => setLanguageCodeQuick(e.target.value)}
+                id="gemini-language-select" // Added ID
+              >
+                {LANGS.map(([label, code]) => (
+                  <option key={code} value={code}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+              <label className="label" htmlFor="gemini-temperature-range">
+                Temperature
               </label>{" "}
-              {/* Added ID */}
-            </div>
-            <div className="row" style={{ gap: 8, marginTop: 10 }}>
-              <button className="btn stretch" onClick={onCreateSession}>
-                Apply & (re)start Gemini
-              </button>
-              <button className="btn" onClick={onHotUpdate}>
-                Hot update
-              </button>
-            </div>
-            <div className="divider" />
-            <label className="label" htmlFor="tts-provider-select">
-              TTS Provider
-            </label>{" "}
-            {/* Added htmlFor */}
-            <select
-              className="select big"
-              value={ttsProviderQuick}
-              onChange={(e) => setTtsProviderQuick(e.target.value)}
-              id="tts-provider-select" // Added ID
-            >
-              <option value="gemini">Gemini</option>
-              <option value="elevenlabs">ElevenLabs</option>
-            </select>
-          </section>
+              {/* Added htmlFor */}
+              <input
+                className="range"
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                value={temperatureQuick}
+                onChange={(e) => setTemperatureQuick(Number(e.target.value))}
+                id="gemini-temperature-range" // Added ID
+              />
+              <div className="help">{temperatureQuick.toFixed(2)}</div>
+              <div className="row wrap" style={{ gap: 12, marginTop: 8 }}>
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={enableAffectiveQuick}
+                    onChange={(e) => setEnableAffectiveQuick(e.target.checked)}
+                    id="checkbox-affective"
+                  />
+                  <span>Affective dialog</span>
+                </label>{" "}
+                {/* Added ID */}
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={proactiveAudioQuick}
+                    onChange={(e) => setProactiveAudioQuick(e.target.checked)}
+                    id="checkbox-proactive"
+                  />
+                  <span>Proactive dialog</span>
+                </label>{" "}
+                {/* Added ID */}
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={functionCallingQuick}
+                    onChange={(e) => setFunctionCallingQuick(e.target.checked)}
+                    id="checkbox-function-calling"
+                  />
+                  <span>Function calling</span>
+                </label>{" "}
+                {/* Added ID */}
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={autoFunctionResponseQuick}
+                    onChange={(e) =>
+                      setAutoFunctionResponseQuick(e.target.checked)
+                    }
+                    id="checkbox-auto-function-response"
+                  />
+                  <span>Auto function response</span>
+                </label>{" "}
+                {/* Added ID */}
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={groundingQuick}
+                    onChange={(e) => setGroundingQuick(e.target.checked)}
+                    id="checkbox-grounding"
+                  />
+                  <span>Grounding (Search)</span>
+                </label>{" "}
+                {/* Added ID */}
+              </div>
+              <div className="row" style={{ gap: 8, marginTop: 10 }}>
+                <button className="btn stretch" onClick={onCreateSession}>
+                  Apply & (re)start Gemini
+                </button>
+                <button className="btn" onClick={onHotUpdate}>
+                  Hot update
+                </button>
+              </div>
+              <div className="divider" />
+              <label className="label" htmlFor="tts-provider-select">
+                TTS Provider
+              </label>{" "}
+              {/* Added htmlFor */}
+              <select
+                className="select big"
+                value={ttsProviderQuick}
+                onChange={(e) => setTtsProviderQuick(e.target.value)}
+                id="tts-provider-select" // Added ID
+              >
+                <option value="gemini">Gemini</option>
+                <option value="elevenlabs">ElevenLabs</option>
+              </select>
+            </section>)}
 
           {/* ElevenLabs settings — ALWAYS mounted; visibility via CSS */}
           <section
@@ -6321,8 +6467,11 @@ export default function App() {
             <h3 className="section-title">elevenlabs settings</h3>
             <ElevenLabsSettings />
           </section>
+
         </div>
       </div>
     </main>
   );
 }
+
+

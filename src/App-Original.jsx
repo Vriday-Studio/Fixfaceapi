@@ -15,7 +15,6 @@ import * as faceapi from "face-api.js";
 import io from "socket.io-client";
 import { FilesetResolver, HandLandmarker } from "@mediapipe/tasks-vision";
 import "./App.css";
-import { use } from "react";
 
 // Add this helper (same-origin by default; allows http(s) and ws(s))
 function normalizeServerUrl(u) {
@@ -553,9 +552,9 @@ function classifyRaiseHand(lm) {
       const heightBoost = Math.max(0, (0.6 - minY) * 0.8);
       const togetherBoost = passFlatPalm
         ? Math.min(
-          0.22,
-          Math.max(0, (0.18 - meanAdj / Math.max(1e-3, span)) * 2.0)
-        )
+            0.22,
+            Math.max(0, (0.18 - meanAdj / Math.max(1e-3, span)) * 2.0)
+          )
         : 0;
       const score = Math.min(
         1,
@@ -697,8 +696,8 @@ function classifyOnPhone(lm, faces, canvasW, canvasH) {
       const sFast = Math.min(
         1,
         0.78 +
-        0.16 * earProx + // boost ear proximity
-        0.06 * Math.max(0, (cosToVertical - 0.5) * 2.0)
+          0.16 * earProx + // boost ear proximity
+          0.06 * Math.max(0, (cosToVertical - 0.5) * 2.0)
       );
       return { ok: true, type: "on_phone", score: sFast };
     }
@@ -715,11 +714,11 @@ function classifyOnPhone(lm, faces, canvasW, canvasH) {
     const score = Math.min(
       1,
       0.3 * closenessSide +
-      0.18 * closenessY +
-      0.4 * earProx + // ← heavier ear weight
-      0.08 * Math.max(0, (cosToVertical - 0.5) * 2.0) +
-      0.04 * Math.max(0, 0.22 - wa.amp) + // stillness
-      multiPointBonus
+        0.18 * closenessY +
+        0.4 * earProx + // ← heavier ear weight
+        0.08 * Math.max(0, (cosToVertical - 0.5) * 2.0) +
+        0.04 * Math.max(0, 0.22 - wa.amp) + // stillness
+        multiPointBonus
     );
 
     return { ok: true, type: "on_phone", score };
@@ -1049,7 +1048,7 @@ class ChunkAudioPlayer {
       this.playing = false;
       try {
         this.onEnd && this.onEnd();
-      } catch { }
+      } catch {}
       return;
     }
     const blob = new Blob([item.uint8], { type: item.mime });
@@ -1057,17 +1056,17 @@ class ChunkAudioPlayer {
     this.playing = true;
     try {
       this.onStart && this.onStart();
-    } catch { }
+    } catch {}
     this.audio.src = url;
     this.audio
       .play()
-      .catch(() => { })
+      .catch(() => {})
       .finally(() => setTimeout(() => URL.revokeObjectURL(url), 10_000));
   }
   stop() {
     try {
       this.audio.pause();
-    } catch { }
+    } catch {}
     this.queue = [];
     this.playing = false;
   }
@@ -1088,17 +1087,17 @@ function ElevenLabsSettings() {
   useEffect(() => {
     try {
       localStorage.setItem("ika:11labs:key", apiKey);
-    } catch { }
+    } catch {}
   }, [apiKey]);
   useEffect(() => {
     try {
       localStorage.setItem("ika:11labs:voiceId", voiceId);
-    } catch { }
+    } catch {}
   }, [voiceId]);
   useEffect(() => {
     try {
       localStorage.setItem("ika:11labs:model", model);
-    } catch { }
+    } catch {}
   }, [model]);
 
   return (
@@ -1185,7 +1184,7 @@ export default function App() {
   useEffect(() => {
     try {
       localStorage.setItem("ika:serverUrl", serverUrl);
-    } catch { }
+    } catch {}
   }, [serverUrl]);
 
   // Pick up ?server=… from query string once
@@ -1193,12 +1192,11 @@ export default function App() {
     try {
       const u = new URLSearchParams(window.location.search).get("server");
       if (u) setServerUrl(u);
-    } catch { }
+    } catch {}
   }, []);
 
   /* ---------- Global/session UI state ---------- */
   const [sessionStatus, setSessionStatus] = useState("IDLE");
-  const [machineId, setMachineId] = useState(null);
   const [sessionId, setSessionId] = useState(null);
   const [serverInfo, setServerInfo] = useState({
     connected: false,
@@ -1236,8 +1234,6 @@ export default function App() {
   const lastHandsRunTsRef = useRef(0);
   const lastLmSeenTsRef = useRef(0); // added: when we last saw landmarks
   const handsFailRef = useRef(0); // added: consecutive VIDEO misses
-  const lastCrowdStatSentRef = useRef(0); // throttle for SendWebsockCommandToServer
-  const lastIdCrowdSentRef = useRef(''); // per-id throttles
 
   // downscale buffer for hands
   const handsOffscreenRef = useRef(null);
@@ -1376,7 +1372,7 @@ export default function App() {
           Object.entries(bag).forEach(([k, v]) => {
             try {
               localStorage.setItem(k, v ?? "");
-            } catch { }
+            } catch {}
           });
           window.location.reload();
         } catch (e) {
@@ -1393,7 +1389,7 @@ export default function App() {
     for (const k of SETTINGS_KEYS) {
       try {
         localStorage.removeItem(k);
-      } catch { }
+      } catch {}
     }
     window.location.reload();
   };
@@ -1416,7 +1412,7 @@ export default function App() {
         // normalize to [{x,y}...] in 0..1
         return hands.map((h) => h.map((pt) => ({ x: pt.x, y: pt.y })));
       }
-    } catch { }
+    } catch {}
 
     // No luck in VIDEO this frame
     handsFailRef.current = (handsFailRef.current || 0) + 1;
@@ -1470,7 +1466,7 @@ export default function App() {
           runningMode: "VIDEO",
           numHands: HANDS_MAX_NUM,
         });
-      } catch { }
+      } catch {}
     }
 
     return null;
@@ -1485,7 +1481,7 @@ export default function App() {
     gesturesOnRef.current = gesturesOn;
     try {
       localStorage.setItem("ika:gesturesOn", String(gesturesOn));
-    } catch { }
+    } catch {}
     if (!gesturesOn) {
       // clear per-face gesture state immediately
       perFaceGestureWinRef.current = new Map();
@@ -1504,7 +1500,7 @@ export default function App() {
     keepBgOnRef.current = keepBgOn;
     try {
       localStorage.setItem("ika:keepBgOn", String(keepBgOn));
-    } catch { }
+    } catch {}
   }, [keepBgOn]);
 
   // How many people run gesture tracking for (1 or 2)
@@ -1517,11 +1513,11 @@ export default function App() {
     gestureTargetsRef.current = gestureTargets;
     try {
       localStorage.setItem("ika:gestureTargets", String(gestureTargets));
-    } catch { }
+    } catch {}
     // Hint the landmarker to track fewer hands when set to 1
     try {
       handLmRef.current?.setOptions?.({ numHands: gestureTargets });
-    } catch { }
+    } catch {}
   }, [gestureTargets]);
 
   // --- TFJS backend gating (avoid detect while switching) ---
@@ -1582,7 +1578,7 @@ export default function App() {
           })),
         });
         socketRef.current?.emit?.("close_session", { sessionId: oldId });
-      } catch { }
+      } catch {}
 
       setSessionId(newId);
       lastRotateRef.current = now;
@@ -1597,12 +1593,8 @@ export default function App() {
     }
   }
 
-  const nop = false;
   /* ---------- Socket lifecycle ---------- */
   useEffect(() => {
-    if (!nop)
-      return;
-
     if (!USE_SOCKET_SERVER) return;
 
     const url = normalizeServerUrl(serverUrl || SOCKET_URL);
@@ -1637,7 +1629,7 @@ export default function App() {
       );
       try {
         socket.emit("hello", { deviceId, sessionId, role: "web" });
-      } catch { }
+      } catch {}
       setServerInfo((s) => ({ ...s, connected: true }));
     });
     socket.on("connect_error", (err) => {
@@ -1691,196 +1683,25 @@ export default function App() {
     return () => {
       try {
         socket.disconnect();
-      } catch { }
+      } catch {}
       socketRef.current = null;
     };
   }, [serverUrl, deviceId]);
-
-  //#region direct websocket
-  const wsSocket = useRef(null);
-  const wsIsConnected = useRef(false);
-
-  const CONNECTION_POOL_MS = 5_000;
-  const MSG_TYPE = {
-    Unknown: 0,
-    Heartbeat: 1,
-    PeopleData: 2,
-    AudioData: 3,
-    SessionStart: 4,
-    SessionEnd: 5,
-    Standby: 6,
-    VocStart: 7,
-    VocEnd: 8,
-    CrowdStat: 9,
-    MicData: 10,
-  }
-
-  const PolicyTypeEnum = {
-    Empty: 0,
-    Greet: 1,
-    OnGreenZone: 2,
-    RedZone: 3,
-    SpeakerFocus: 4,
-    AskGroupChange: 5,
-    LeftZone: 6,
-    CallOver: 7,
-  }
-
-  class SessionData {
-    constructor(machineId, startedAt) {
-      this.MachineId = machineId;
-      this.StartedAt = startedAt;
-      this.EndedAt = null;
-    }
-  }
-
-  class PolicyDataSent {
-    constructor(policyTypeEnum, sessionId, target = {}, group = {}, reason, atDate = new Date(), attamptNumber = 1,) {
-      this.policyType = policyTypeEnum;
-      this.sessionId = sessionId;
-      this.target = target; // {name, gid}
-      this.group = group; // [{name, gid}, ...]
-      this.reason = reason;
-      this.atDate = atDate;
-      this.attemptNumber = attemptNumber;
-    }
-  }
-
-  /**
-   * Establishes a WebSocket connection to the specified server URL and sets up event handlers.
-   *
-   * @param {string} urlStr - The server URL to connect to.
-   * @param {WebSocket} wsSockObj - The WebSocket object to initialize and assign event handlers to.
-   *
-   * @returns {void}
-   *
-   * @description
-   * This function normalizes the server URL, creates a new WebSocket connection,
-   * and assigns handlers for open, message, error, and close events. It also updates
-   * the connection status using setServerInfo and stores the WebSocket instance in wsSocket.current.
-   */
-  function connectWebSocket(urlStr, wsSockObj) {
-    // already connected
-    const url = normalizeServerUrl(urlStr);
-    wsSockObj = new WebSocket(url);
-    wsSockObj.binaryType = "arraybuffer";
-
-    console.log("[websocket] start connecting", url);
-
-    wsSockObj.onopen = function () {
-      console.log("[websocket] connected", url);
-      setServerInfo((s) => ({ ...s, connected: true }));
-
-      wsSocket.current = wsSockObj;
-      wsIsConnected.current = (wsSockObj.readyState === WebSocket.OPEN);
-    };
-
-    wsSockObj.onmessage = function (evt) {
-
-      const jsonObj = JSON.parse(evt.data);
-      console.log("[websocket] message received", jsonObj);
-
-      if (jsonObj != null && jsonObj.hasOwnProperty("ClassName") && jsonObj.ClassName === "SessionData") {
-        let sessData = Object.assign(new SessionData(), jsonObj);
-        setSessionStatus("ACTIVE");
-        //setSessionId(sessData?.MachineId || sessionId || uuid());
-        setMachineId(sessData?.MachineId || uuid());
-      }
-    };
-
-    wsSockObj.onerror = function (error) {
-      console.log("[websocket] error", error.message);
-      //setServerInfo((s) => ({ ...s, connected: false }));
-    };
-
-    wsSockObj.onclose = function () {
-      setServerInfo((s) => ({ ...s, connected: false }));
-
-    };
-
-  }
-
-  /**
-   * Sends a command to the server via a WebSocket connection.
-   *
-   * @param {Object} t - An object containing message type constants.
-   * @param {string} [sessionId] - Optional session ID. If not provided, a new UUID will be generated.
-   */
-  function SendWebsockCommandToServer(t, inputData = null) {
-    if (wsSocket.current == null) {
-      connectWebSocket(serverUrl + "/ws", wsSocket.current);
-    }
-
-    if (wsIsConnected.current == false || wsSocket.current?.readyState !== WebSocket.OPEN) {
-      connectWebSocket(serverUrl + "/ws", wsSocket.current);
-    }
-
-    const customSendData = {
-      MachineId: deviceId,
-      Platform: "web",
-      Custom: inputData ?? {},
-    };
-
-    console.log("[websocket] sending command", t, customSendData);
-
-    wsSocket.current?.send(
-      JSON.stringify({
-        MessageType: t,
-        TimeStamp: new Date().toISOString(),
-        Data: customSendData,
-      })
-    );
-  }
-
-  function SendPolicyData(socket, crowdDataSet) {
-    socket.current?.send(
-      JSON.stringify(crowdDataSet));
-  }
-
-  function sendHeartbeat(intervalInMs) {
-    return setInterval(() => {
-      SendWebsockCommandToServer(MSG_TYPE.Heartbeat);
-    }, intervalInMs);
-  }
-
-  //#endregion
-
-  //#region websocket loop
-  useEffect(() => {
-
-    if (!USE_SOCKET_SERVER)
-      return;
-
-    connectWebSocket(serverUrl + "/ws", wsSocket.current);
-    const heartbeatInterval = sendHeartbeat(CONNECTION_POOL_MS);
-
-    return () => {
-      clearInterval(heartbeatInterval);
-      try {
-        wsSocket.current?.close();
-      } catch { }
-
-    };
-  }, [serverUrl]);
-  //#endregion
 
   // Auto-reconnect when network comes online or tab becomes visible (no mic/cam impact)
   useEffect(() => {
     const onOnline = () => {
       try {
-        //if (socketRef.current && !socketRef.current.connected)
-        //  socketRef.current.connect();
-        connectWebSocket(serverUrl + "/ws", wsSocket.current);
-
-      } catch { }
+        if (socketRef.current && !socketRef.current.connected)
+          socketRef.current.connect();
+      } catch {}
     };
     const onVisible = () => {
       if (!document.hidden) {
         try {
-          if (wsSocket.current && wsSocket.current.readyState !== WebSocket.OPEN) {
-            connectWebSocket(serverUrl + "/ws", wsSocket.current);
-          }
-        } catch { }
+          if (socketRef.current && !socketRef.current.connected)
+            socketRef.current.connect();
+        } catch {}
       }
     };
     window.addEventListener("online", onOnline);
@@ -2003,15 +1824,11 @@ export default function App() {
         deviceId,
       };
 
-      /* old create session
       s.emit("create_session", {
         ...payload,
         sessionId: sessionId || "web-" + deviceId,
         gemini_api_key: localStorage.getItem("ika:gemini:key") || undefined,
-      });*/
-
-      SendWebsockCommandToServer(MSG_TYPE.SessionStart, payload);
-
+      });
       bump("start");
       setSessionStatus("ACTIVE");
       setSessionId((id) => id || uuid());
@@ -2076,7 +1893,7 @@ export default function App() {
     try {
       localStorage.setItem("ika:showAlign", String(showAlign));
       localStorage.setItem("ika:calibDistM", String(calibDistanceM));
-    } catch { }
+    } catch {}
   }, [showAlign, calibDistanceM]);
 
   // small utility
@@ -2097,7 +1914,7 @@ export default function App() {
       localStorage.setItem("ika:fovVdeg", String(fovVdeg));
       localStorage.setItem("ika:panOffsetDeg", String(panOffsetDeg));
       localStorage.setItem("ika:tiltOffsetDeg", String(tiltOffsetDeg));
-    } catch { }
+    } catch {}
   }, [fovHdeg, fovVdeg, panOffsetDeg, tiltOffsetDeg]);
 
   const camFxRef = useRef(600);
@@ -2126,7 +1943,7 @@ export default function App() {
       localStorage.setItem("ika:wNear", String(wNear));
       localStorage.setItem("ika:wCenter", String(wCenter));
       localStorage.setItem("ika:wMouth", String(wMouth));
-    } catch { }
+    } catch {}
   }, [wNear, wCenter, wMouth]);
 
   // mouth activity smoothing + click-to-zero memory
@@ -2163,10 +1980,8 @@ export default function App() {
     const sig = JSON.stringify([payload.focusIndex, ppl]);
     if (now - state.t < MIN_MS && sig === state.sig) return;
     try {
-      //server.crowdStatus(payload);
-      console.log("[websocket] sending crowd status", payload);
-      SendWebsockCommandToServer(MSG_TYPE.CrowdStat, payload);
-    } catch { }
+      server.crowdStatus(payload);
+    } catch {}
     lastCrowdSendRef.current = { t: now, sig };
   }
 
@@ -2232,7 +2047,7 @@ export default function App() {
   useEffect(() => {
     try {
       localStorage.setItem("ika:redCutoffM", String(redCutoffM));
-    } catch { }
+    } catch {}
   }, [redCutoffM]);
 
   const [videoId, setVideoId] = useState("");
@@ -2258,7 +2073,7 @@ export default function App() {
     autoDetectOnRef.current = autoDetectOn;
     try {
       localStorage.setItem("ika:autoDetectOn", String(autoDetectOn));
-    } catch { }
+    } catch {}
   }, [autoDetectOn]);
 
   const [emptyTranscripts, setEmptyTranscripts] = useState(0);
@@ -2299,19 +2114,19 @@ export default function App() {
     thresholdLiveRef.current = threshold;
     try {
       localStorage.setItem("ika:threshold", String(threshold));
-    } catch { }
+    } catch {}
   }, [threshold]);
   useEffect(() => {
     listenMsLiveRef.current = listenMs;
     try {
       localStorage.setItem("ika:listenMs", String(listenMs));
-    } catch { }
+    } catch {}
   }, [listenMs]);
   useEffect(() => {
     silenceMsLiveRef.current = silenceMs;
     try {
       localStorage.setItem("ika:silenceMs", String(silenceMs));
-    } catch { }
+    } catch {}
   }, [silenceMs]);
 
   // persist Live AAD too
@@ -2321,7 +2136,7 @@ export default function App() {
       localStorage.setItem("ika:eos", String(eosQuick));
       localStorage.setItem("ika:prefixPad", String(prefixPadQuick));
       localStorage.setItem("ika:silenceDur", String(silenceDurQuick));
-    } catch { }
+    } catch {}
   }, [sosQuick, eosQuick, prefixPadQuick, silenceDurQuick]);
 
   const [micOn, setMicOn] = useState(false);
@@ -2441,7 +2256,7 @@ export default function App() {
       }));
       const payload = { day, seq, items, savedAt: Date.now() };
       localStorage.setItem(GUEST_STORE_KEY, JSON.stringify(payload));
-    } catch { }
+    } catch {}
   }
   function loadGuestMem() {
     try {
@@ -2653,7 +2468,7 @@ export default function App() {
               scoreThreshold: 0.4,
             })
           );
-        } catch { }
+        } catch {}
 
         if (!cancelled) setReady(true);
       } catch (e) {
@@ -2732,7 +2547,7 @@ export default function App() {
       cancelled = true;
       try {
         handLmRef.current?.close?.();
-      } catch { }
+      } catch {}
       handLmRef.current = null;
       handsReadyRef.current = false;
     };
@@ -2750,9 +2565,9 @@ export default function App() {
         const entries = Array.isArray(data)
           ? data
           : Object.entries(data).map(([label, descriptors]) => ({
-            label,
-            descriptors,
-          }));
+              label,
+              descriptors,
+            }));
 
         const labeled = await Promise.all(
           entries.map(async (e) => {
@@ -2809,12 +2624,12 @@ export default function App() {
           if (Number.isFinite(val))
             setGreenMaxM(Math.min(2.0, Math.max(0.3, val)));
         }
-      } catch { }
+      } catch {}
       try {
         const list = await navigator.mediaDevices.enumerateDevices();
         setAudioDevs(list.filter((d) => d.kind === "audioinput"));
         setVideoDevs(list.filter((d) => d.kind === "videoinput"));
-      } catch { }
+      } catch {}
     })();
   }, []);
   useEffect(() => {
@@ -2823,7 +2638,7 @@ export default function App() {
         `ika:greenMaxM:${videoId || "default"}`,
         String(greenMaxM)
       );
-    } catch { }
+    } catch {}
   }, [greenMaxM, videoId]);
 
   // restore guest memory
@@ -2866,7 +2681,7 @@ export default function App() {
         setAudioUnlocked(true);
         window.removeEventListener("touchend", unlock);
         window.removeEventListener("click", unlock);
-      } catch { }
+      } catch {}
     };
     window.addEventListener("touchend", unlock, { once: true });
     window.addEventListener("click", unlock, { once: true });
@@ -2884,7 +2699,7 @@ export default function App() {
         const v = parseFloat(gm);
         if (Number.isFinite(v)) setGreenMaxM(Math.min(2.0, Math.max(0.3, v)));
       }
-    } catch { }
+    } catch {}
   }, [videoId]);
 
   // hot-plug devices
@@ -2894,7 +2709,7 @@ export default function App() {
         const list = await navigator.mediaDevices.enumerateDevices();
         setAudioDevs(list.filter((d) => d.kind === "audioinput"));
         setVideoDevs(list.filter((d) => d.kind === "videoinput"));
-      } catch { }
+      } catch {}
     };
     navigator.mediaDevices?.addEventListener?.("devicechange", onChange);
     return () => {
@@ -2960,7 +2775,7 @@ export default function App() {
     setEmptyTranscripts(0);
     try {
       server.sendText(txt);
-    } catch { }
+    } catch {}
   }
 
   /* ---------- Auto-calibrate ---------- */
@@ -3032,30 +2847,30 @@ export default function App() {
     }
     try {
       if (audioRef.current.raf) cancelAnimationFrame(audioRef.current.raf);
-    } catch { }
+    } catch {}
     try {
       const rec = audioRef.current?.vad?.recorder;
       if (rec && rec.state === "recording") {
         try {
           rec.requestData?.();
-        } catch { }
+        } catch {}
         try {
           rec.stop();
-        } catch { }
+        } catch {}
       }
-    } catch { }
+    } catch {}
     try {
       audioRef.current.stream?.getTracks()?.forEach((t) => t.stop());
-    } catch { }
+    } catch {}
     try {
       await audioRef.current.ctx?.close();
-    } catch { }
+    } catch {}
     try {
       audioRef.current.source?.disconnect?.();
-    } catch { }
+    } catch {}
     try {
       audioRef.current.analyser?.disconnect?.();
-    } catch { }
+    } catch {}
 
     audioRef.current = {
       ctx: null,
@@ -3134,7 +2949,7 @@ export default function App() {
     });
     try {
       await ctx.resume();
-    } catch { }
+    } catch {}
     const source = ctx.createMediaStreamSource(stream);
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 512;
@@ -3219,10 +3034,10 @@ export default function App() {
           if (rec && rec.state === "recording") {
             try {
               rec.requestData?.();
-            } catch { }
+            } catch {}
             try {
               rec.stop();
-            } catch { }
+            } catch {}
           }
           vad.recording = false;
           vad.recorder = null;
@@ -3312,10 +3127,10 @@ export default function App() {
             if (rec && rec.state === "recording") {
               try {
                 rec.requestData?.();
-              } catch { }
+              } catch {}
               try {
                 rec.stop();
-              } catch { }
+              } catch {}
             }
           }
         } else {
@@ -3327,10 +3142,10 @@ export default function App() {
           if (rec && rec.state === "recording") {
             try {
               rec.requestData?.();
-            } catch { }
+            } catch {}
             try {
               rec.stop();
-            } catch { }
+            } catch {}
           }
         }
       } else {
@@ -3353,7 +3168,7 @@ export default function App() {
   async function startCamera(id = videoId) {
     try {
       camRef.current.stream?.getTracks()?.forEach((t) => t.stop());
-    } catch { }
+    } catch {}
 
     let stream = null;
     if (id) {
@@ -3373,7 +3188,7 @@ export default function App() {
           setVideoId("");
           try {
             localStorage.setItem("ika:videoId", "");
-          } catch { }
+          } catch {}
         }
       }
     }
@@ -3416,12 +3231,12 @@ export default function App() {
         t.addEventListener("ended", onCamGone);
         t.onended = onCamGone;
         t.addEventListener("mute", handleMute);
-        t.addEventListener("unmute", () => { });
+        t.addEventListener("unmute", () => {});
       });
       if (typeof stream.addEventListener === "function") {
         stream.addEventListener("inactive", onCamGone);
       }
-    } catch { }
+    } catch {}
 
     if (videoRef.current) {
       videoRef.current.srcObject = stream;
@@ -3475,7 +3290,7 @@ export default function App() {
       const list = await navigator.mediaDevices.enumerateDevices();
       setAudioDevs(list.filter((d) => d.kind === "audioinput"));
       setVideoDevs(list.filter((d) => d.kind === "videoinput"));
-    } catch { }
+    } catch {}
   }
 
   /* ---------- Calibrate Camera ---------- */
@@ -3631,7 +3446,6 @@ export default function App() {
           now - (lastAgeSampleRef.current || 0) >= AGE_SAMPLE_MS;
         if (heavyAgeNow) lastAgeSampleRef.current = now;
 
-        //#region detection chain
         let dets = [];
         try {
           let chain = faceapi.detectAllFaces(video, tinyOptsRef.current);
@@ -3649,9 +3463,6 @@ export default function App() {
           dets = [];
         }
 
-        //#endregion
-
-        //console.log(`[FaceAPI] detected ${dets.length} faces`);
         // ==== drawing + bookkeeping ====
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         // --- alignment overlay: crosshair and banner ---
@@ -3753,7 +3564,6 @@ export default function App() {
           const matcher = faceMatcherRef.current;
           let name = null;
           if (matcher && det.descriptor) {
-            
             const best = matcher.findBestMatch(det.descriptor);
             if (
               best &&
@@ -3815,8 +3625,8 @@ export default function App() {
           const ageVal = Number.isFinite(det.age)
             ? det.age
             : Number.isFinite(cacheGA.age)
-              ? cacheGA.age
-              : null;
+            ? cacheGA.age
+            : null;
           if (heavyAgeNow && (Number.isFinite(det.age) || det.gender)) {
             ageGenderCacheRef.current.set(stableKey, {
               age: det.age,
@@ -3885,8 +3695,8 @@ export default function App() {
           const faceStable = perFaceStableRef.current.get(stableKey);
           const freshFaceGesture =
             gestureAllowedKeys.has(stableKey) &&
-              faceStable &&
-              now - faceStable.t <= HANDS_CACHE_MS
+            faceStable &&
+            now - faceStable.t <= HANDS_CACHE_MS
               ? faceStable
               : null;
 
@@ -3898,8 +3708,9 @@ export default function App() {
           const ageTxt = Number.isFinite(ageVal)
             ? Math.max(0, Math.round(ageVal))
             : "-";
-          const l1 = `${displayName}${gestureLbl ? " • " + gestureLbl : ""
-            } • ${zone} • ${ageTxt} ${gender} • ${expr}`;
+          const l1 = `${displayName}${
+            gestureLbl ? " • " + gestureLbl : ""
+          } • ${zone} • ${ageTxt} ${gender} • ${expr}`;
           const l2 = `yaw ${yawDeg.toFixed(1)}° · pitch ${pitchDeg.toFixed(
             1
           )}° · mouth ${mouthActivity.toFixed(2)}`;
@@ -4022,42 +3833,6 @@ export default function App() {
           gestureEligible: gestureAllowedKeys.has(p.stableKey),
           z: p.posCam?.z ?? null, // NEW: carry depth
         }));
-
-        //#region Send crowd stats to server
-        // Throttle to send only once every 500ms
-        //console.log("now is:", now);
-        const ms = 5000;
-        let doOnce = true;
-        let trackedName = trackedFacesRef.current.at(0)?.name || trackedFacesRef.current.at(0)?.gid;
-
-        if(trackedName !== undefined && trackedName !== null) 
-        {
-          if(lastIdCrowdSentRef.current !== trackedName) 
-          {
-            doOnce = true;
-          }
-          else{
-            doOnce = false;
-          }
-
-          if (doOnce) {
-            doOnce = false;
-
-            let jsonData = {
-              id : trackedName,
-              timestamp: new Date().toISOString(),
-            }
-
-            console.log("Sending crowd stat for id:", trackedName);
-            let id = trackedName;
-            SendWebsockCommandToServer(MSG_TYPE.CrowdStat, JSON.stringify(jsonData));
-            lastIdCrowdSentRef.current = id;
-          }
-        }
-
-       
-        //#endregion
-
         // Also expose ALL faces (GREEN + RED) for hand proximity (on_phone)
         allFacesRef.current = candidates.map((c) => {
           const d = shrinkBox(c.box);
@@ -4743,9 +4518,6 @@ export default function App() {
                 g && now - g.t <= HANDS_CACHE_MS
                   ? { type: g.type, score: g.score }
                   : null;
-
-                  console.log("emiting crowds");
-              //emit crowd snapshot
               emitCrowdThrottled({
                 deviceId,
                 sessionId: sessionId || "web-" + deviceId,
@@ -4870,14 +4642,14 @@ export default function App() {
                 const address = p.name
                   ? p.name
                   : groupSize > 1
-                    ? hasKid
-                      ? "family"
-                      : "everyone"
-                    : p.gender === "male"
-                      ? "sir"
-                      : p.gender === "female"
-                        ? "ma’am"
-                        : "there";
+                  ? hasKid
+                    ? "family"
+                    : "everyone"
+                  : p.gender === "male"
+                  ? "sir"
+                  : p.gender === "female"
+                  ? "ma’am"
+                  : "there";
                 socketRef.current?.emit?.("policy_event", {
                   deviceId,
                   sessionId: sessionId || "web-" + deviceId,
@@ -4919,7 +4691,7 @@ export default function App() {
             }
             // update last group
             lastGroupSetRef.current = curSet;
-          } catch { }
+          } catch {}
 
           // ---- Speaker focus (1–2s or 3 frames dominance among green tracked) ----
           try {
@@ -5015,7 +4787,7 @@ export default function App() {
       // Mic idle: stop listening
       if (ago > MIC_IDLE_MS && micOnRef.current) {
         userMicOffRef.current = true;
-        stopMic().catch(() => { });
+        stopMic().catch(() => {});
       }
       // Camera idle: stop everything, including LLM
       if (ago > CAM_IDLE_MS) {
@@ -5045,19 +4817,18 @@ export default function App() {
 
     try {
       await stopMic();
-    } catch { }
+    } catch {}
     try {
       camRef.current.stream?.getTracks()?.forEach((t) => t.stop());
-    } catch { }
+    } catch {}
     camRef.current.stream = null;
 
     speakingRef.current = false;
     S.current = { id: null, seenFrames: 0, lastFaceTs: 0, lastSnapshotTs: 0 };
 
     try {
-      //socketRef.current?.emit?.("close_session", { sessionId });
-      SendWebsockCommandToServer(MSG_TYPE.SessionEnd, { sessionId });
-    } catch { }
+      socketRef.current?.emit?.("close_session", { sessionId });
+    } catch {}
     setSessionId(null);
     setSessionStatus("IDLE"); // full idle immediately
     recentMapRef.current = {};
@@ -5257,7 +5028,7 @@ export default function App() {
       localStorage.setItem("ika:weatherLabel", weatherLabel);
 
       localStorage.setItem("ika:gemini:key", geminiApiKey);
-    } catch { }
+    } catch {}
   }, [
     systemInstruction,
     modelQuick,
@@ -5440,9 +5211,9 @@ export default function App() {
                       &nbsp;
                       {serverInfo.boundDeviceId
                         ? `(bound ${String(serverInfo.boundDeviceId).slice(
-                          0,
-                          8
-                        )}…)`
+                            0,
+                            8
+                          )}…)`
                         : `(not bound)`}
                     </span>
                   </div>
@@ -5661,7 +5432,7 @@ export default function App() {
                       setAudioId(next);
                       try {
                         localStorage.setItem("ika:audioId", next);
-                      } catch { }
+                      } catch {}
                       await startMic(next, { force: true });
                     }}
                   >
@@ -5683,7 +5454,7 @@ export default function App() {
                       setVideoId(next);
                       try {
                         localStorage.setItem("ika:videoId", next);
-                      } catch { }
+                      } catch {}
                       await startCamera(next);
                     }}
                   >
@@ -5983,8 +5754,8 @@ export default function App() {
                         r.zone === "green"
                           ? "zone-green"
                           : r.zone === "red"
-                            ? "zone-red"
-                            : "zone-unk"
+                          ? "zone-red"
+                          : "zone-unk"
                       }
                     >
                       {r.zone}
@@ -6315,8 +6086,9 @@ export default function App() {
 
           {/* ElevenLabs settings — ALWAYS mounted; visibility via CSS */}
           <section
-            className={`panel elevenlabs-panel ${ttsProviderQuick === "elevenlabs" ? "is-active" : ""
-              }`}
+            className={`panel elevenlabs-panel ${
+              ttsProviderQuick === "elevenlabs" ? "is-active" : ""
+            }`}
           >
             <h3 className="section-title">elevenlabs settings</h3>
             <ElevenLabsSettings />

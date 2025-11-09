@@ -1196,6 +1196,15 @@ export default function App() {
 
   /* ---------- Global/session UI state ---------- */
   const [sessionStatus, setSessionStatus] = useState("IDLE");
+  const [autoSession, setAutoSession] = useState(
+    localStorage.getItem("ika:autoSession") !== "false"
+  );
+  const autoSessionPendingRef = useRef(false);
+  useEffect(() => {
+    try {
+      localStorage.setItem("ika:autoSession", String(autoSession));
+    } catch { }
+  }, [autoSession]);
   const [machineId, setMachineId] = useState(null);
   const [sessionId, setSessionId] = useState(null);
   const [serverInfo, setServerInfo] = useState({
@@ -4771,6 +4780,38 @@ export default function App() {
     }
   }, [sessionId, deviceId]);
 
+  useEffect(() => {
+    if (sessionStatus === "ACTIVE" || sessionStatus === "IDLE") {
+      autoSessionPendingRef.current = false;
+    }
+  }, [sessionStatus]);
+
+  useEffect(() => {
+    if (!autoSession) return;
+
+    const serverUp = !!serverInfo.connected;
+    const ueUp = !!ueConnected;
+
+    if (serverUp && ueUp) {
+      if (sessionStatus !== "ACTIVE" && !autoSessionPendingRef.current) {
+        autoSessionPendingRef.current = true;
+        handleStartSession();
+      }
+    } else {
+      autoSessionPendingRef.current = false;
+      if (sessionStatus === "ACTIVE") {
+        handleStopSession();
+      }
+    }
+  }, [
+    autoSession,
+    serverInfo.connected,
+    ueConnected,
+    sessionStatus,
+    handleStartSession,
+    handleStopSession,
+  ]);
+
   const onHotUpdate = useCallback(() => {
     server.updateSettings({
       temperature: temperatureQuick,
@@ -5048,8 +5089,25 @@ export default function App() {
                     Stop session
                   </button>
                 </div>
+                <div
+                  className="row"
+                  style={{ gap: 8, marginTop: 12, alignItems: "center" }}
+                >
+                  <label className="checkbox">
+                    <input
+                      type="checkbox"
+                      checked={autoSession}
+                      onChange={(e) => setAutoSession(e.target.checked)}
+                    />
+                    <span>Auto-manage when server + UE are online</span>
+                  </label>
+                </div>
                 <div className="help" style={{ marginTop: 6 }}>
                   Status: {sessionStatus}
+                  <br />
+                  {autoSession
+                    ? "Auto-starts when both links are up and stops if either drops."
+                    : "Auto session is off; use the buttons above."}
                 </div>
               </section>
 

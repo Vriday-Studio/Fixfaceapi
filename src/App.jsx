@@ -1856,7 +1856,7 @@ export default function App() {
       },
     };
 
-    console.log("[websocket] sending command", t, payload.data);
+    console.log("[websocket] sending command", t, payload.Data);
 
     wsSocket.current?.send(
       JSON.stringify(payload)
@@ -2152,7 +2152,7 @@ export default function App() {
 
   // ---- Policy + speaker state ----
   const prevZoneMapRef = useRef(new Map()); // key -> "green" | "red"
-  const callOverStateRef = useRef(new Map()); // key -> { tries, last }
+  const callOverStateRef = useRef(new Map()); // key -> { tries, last }\n  const greetInviteRef = useRef(new Map()); // key -> { count, last, lastSeen }\n
   const lastGroupSetRef = useRef(new Set()); // Set(keys) of last frame
   const lastGroupAskTsRef = useRef(0);
   const speakerRef = useRef({
@@ -4240,9 +4240,11 @@ export default function App() {
           } catch (e) {
             // ignore hand pipeline hiccups so the frame loop keeps running
           }
+        } // ✅ properly close inner try before new catch
+        // handled above; removed extraneous catch
 
-          // ---- Policy: zone transitions -> call-over / greet (candidates include red) ----
-          try {
+      // ---- Policy: zone transitions -> call-over / greet (candidates include red) ----
+      try {
             const matcher = faceMatcherRef.current;
 
             const allIdentities = frameCandidates.map((c) => {
@@ -4367,11 +4369,24 @@ export default function App() {
                 });
               }
             }
+            // reset greet state for identities that disappeared for a while
+            try {
+              for (const [k, rec] of Array.from(greetInviteRef.current.entries())) {
+                if (!rec || typeof rec !== 'object') { greetInviteRef.current.delete(k); continue; }
+                const lastSeen = rec.lastSeen || 0;
+                if (now - lastSeen > NOT_SEEN_RESET_MS) {
+                  greetInviteRef.current.delete(k);
+                }
+              }
+            } catch { }
+
             // update last group
             lastGroupSetRef.current = curSet;
-          } catch { }
+        } catch (e) {
+          console.warn("[policy] zone transition error:", e);
+        }
 
-          // ---- Speaker focus (1–2s or 3 frames dominance among green tracked) ----
+        // ---- Speaker focus (1–2s or 3 frames dominance among green tracked) ----
           try {
             const list = peopleForPost || [];
             if (list.length) {
@@ -4432,10 +4447,10 @@ export default function App() {
           } catch (e) {
             console.warn("[speaker] error:", e);
           }
+        } catch (e) {
+          console.warn("[speaker] error:", e);
         }
-      } catch (e) {
-        console.warn("[frame] error:", e);
-      } finally {
+      finally {
         detecting = false;
       }
     };

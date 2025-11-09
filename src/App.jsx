@@ -1,7 +1,6 @@
 // ==== App.jsx — streamlined (Live Preview + Native Audio), neat right sidebar ====
 // - TFJS + face-api + webcam detection
 // - Socket.IO bridge for Gemini/ElevenLabs audio + text
-// - Mic/VAD with auto-calibration + Live AAD knobs in Mic panel
 // - Right sidebar: system message, Gemini settings, ElevenLabs settings
 // - Status counters + green zone distance + device selectors
 
@@ -15,7 +14,6 @@ import * as faceapi from "face-api.js";
 import io from "socket.io-client";
 import { FilesetResolver, HandLandmarker } from "@mediapipe/tasks-vision";
 import "./App.css";
-import { use } from "react";
 
 // Add this helper (same-origin by default; allows http(s) and ws(s))
 function normalizeServerUrl(u) {
@@ -50,7 +48,6 @@ const MATCH_THRESHOLD = 0.5;
 const MATCH_MARGIN = 0.03;
 const STABILIZE_FRAMES = 5;
 
-const MIC_IDLE_MS = 5000; // mic goes idle after 5s
 const CAM_IDLE_MS = 10000; // cam fully idle after 10s
 
 // drawing
@@ -216,7 +213,7 @@ function dist(a, b) {
   return Math.hypot(a.x - b.x || 0, a.y - b.y || 0);
 }
 
-// Keep micro history for wave velocity
+// Keep tiny history for wave velocity
 const waveHistRef = { t: 0, xs: [] }; // xs: recent x positions (screen-normalized)
 
 // classify a "wave": lateral wrist direction changes within short window
@@ -1286,47 +1283,6 @@ export default function App() {
     }
   });
 
-  // Settings backup helpers (export/import/reset)
-  const SETTINGS_KEYS = [
-    "ika:serverUrl",
-    "ika:systemInstruction",
-    "ika:model",
-    "ika:voice",
-    "ika:langCode",
-    "ika:temperature",
-    "ika:enableAffective",
-    "ika:proactiveAudio",
-    "ika:functionCalling",
-    "ika:autoFunctionResponse",
-    "ika:grounding",
-    "ika:ttsProvider",
-    "ika:11labs:voiceId",
-    "ika:11labs:key",
-    "ika:11labs:model",
-    "ika:captions",
-    "ika:locationLabel",
-    "ika:weatherLabel",
-    "ika:gemini:key",
-    "ika:videoId",
-    "ika:audioId",
-    "ika:fovHdeg",
-    "ika:fovVdeg",
-    "ika:panOffsetDeg",
-    "ika:tiltOffsetDeg",
-    "ika:wNear",
-    "ika:wCenter",
-    "ika:wMouth",
-    "ika:sos",
-    "ika:eos",
-    "ika:prefixPad",
-    "ika:silenceDur",
-    "ika:threshold",
-    "ika:listenMs",
-    "ika:silenceMs",
-    "ika:autoDetectOn",
-    "ika:greenMaxM", // base key (per-camera variants are also used)
-  ];
-
   const exportSettings = async () => {
     try {
       // Collect all keys with "ika:" prefix (covers new settings automatically)
@@ -1390,11 +1346,18 @@ export default function App() {
 
   const resetSettings = () => {
     if (!confirm("Reset all saved settings?")) return;
-    for (const k of SETTINGS_KEYS) {
-      try {
-        localStorage.removeItem(k);
-      } catch { }
-    }
+    try {
+      const keysToRemove = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith("ika:")) keysToRemove.push(key);
+      }
+      keysToRemove.forEach((k) => {
+        try {
+          localStorage.removeItem(k);
+        } catch {}
+      });
+    } catch {}
     window.location.reload();
   };
 
@@ -1495,7 +1458,7 @@ export default function App() {
     }
   }, [gesturesOn]);
 
-  // Keep camera/mic alive when tab is in background (Windows fix)
+  // Keep camera alive when tab is in background (Windows fix)
   const [keepBgOn, setKeepBgOn] = useState(
     () => localStorage.getItem("ika:keepBgOn") !== "false"
   );
@@ -1712,7 +1675,6 @@ export default function App() {
     VocStart: 7,
     VocEnd: 8,
     CrowdStat: 9,
-    MicData: 10,
   }
 
   const PolicyTypeEnum = {
@@ -1864,7 +1826,7 @@ export default function App() {
   }, [serverUrl]);
   //#endregion
 
-  // Auto-reconnect when network comes online or tab becomes visible (no mic/cam impact)
+  // Auto-reconnect when network comes online or tab becomes visible (no camera impact)
   useEffect(() => {
     const onOnline = () => {
       try {
@@ -1944,21 +1906,6 @@ export default function App() {
           ? preset.temperature
           : Number(localStorage.getItem("ika:temperature") ?? 0.6),
 
-        // Live AAD (from sliders in Mic panel)
-        start_of_speech_sensitivity:
-          preset?.start_of_speech_sensitivity ??
-          getStoredNumber("ika:sos") ??
-          0.5,
-        end_of_speech_sensitivity:
-          preset?.end_of_speech_sensitivity ??
-          getStoredNumber("ika:eos") ??
-          0.5,
-        prefix_padding_ms:
-          preset?.prefix_padding_ms ?? getStoredNumber("ika:prefixPad") ?? 150,
-        silence_duration_ms:
-          preset?.silence_duration_ms ??
-          getStoredNumber("ika:silenceDur") ??
-          800,
 
         // behaviors
         enable_affective_dialog:
@@ -2055,7 +2002,7 @@ export default function App() {
     [createServerSession, updateServerSettings, sendTextPrompt, emitCrowdStatus]
   );
 
-  /* ====================== MIC / CAMERA / DETECTION ====================== */
+  /* ====================== CAMERA / DETECTION ====================== */
   // === Camera alignment (FOV & pan/tilt offsets) ===
   const [fovHdeg, setFovHdeg] = useState(() =>
     Number(localStorage.getItem("ika:fovHdeg") ?? 70)
@@ -2206,20 +2153,21 @@ export default function App() {
   const loopStepMsRef = useRef(LOOP_STEP_ACTIVE_MS);
   const loopIdleStateRef = useRef(false);
 
-  const micIdleToStandbyTimerRef = useRef(null);
-
-  const MIC_STOP_GRACE_MS = 5_000;
-  const lastAllGreenRef = useRef(0);
-  const userMicOffRef = useRef(false);
-
   const [ready, setReady] = useState(false);
   const [backend, setBackend] = useState("cpu");
 
   // === Green Zone Distance ===
-  const [greenMaxM, setGreenMaxM] = useState(DEFAULT_GREEN_MAX_M);
+  const [greenMaxM, setGreenMaxM] = useState(() => {
+    const raw = localStorage.getItem("ika:greenMaxM");
+    const v = raw == null ? DEFAULT_GREEN_MAX_M : parseFloat(raw);
+    return Number.isFinite(v) ? v : DEFAULT_GREEN_MAX_M;
+  });
   const greenMaxMRef = useRef(greenMaxM);
   useEffect(() => {
     greenMaxMRef.current = greenMaxM;
+    try {
+      localStorage.setItem("ika:greenMaxM", String(greenMaxM));
+    } catch {}
   }, [greenMaxM]);
 
   // === Red Zone Cutoff (ignore faces beyond this) ===
@@ -2236,7 +2184,6 @@ export default function App() {
   }, [redCutoffM]);
 
   const [videoId, setVideoId] = useState("");
-  const [audioId, setAudioId] = useState("");
 
   const pickInputSize = (w) => (w >= 1920 ? 416 : w >= 1280 ? 320 : 256);
   const tinyOptsRef = useRef(
@@ -2244,112 +2191,7 @@ export default function App() {
   );
   const triedFallbackRef = useRef(false);
 
-  // auto-calibrate policy
-  const MAX_EMPTY_BEFORE_AUTOCAL = 3;
-  const FAILED_STARTS_BEFORE_AUTOCAL = 4;
-  const AUTO_CAL_MIN_GAP_MS = 30_000;
-  const MIN_NONEMPTY_CHARS = 2;
-
-  const [autoDetectOn, setAutoDetectOn] = useState(
-    localStorage.getItem("ika:autoDetectOn") !== "false"
-  );
-  const autoDetectOnRef = useRef(autoDetectOn);
-  useEffect(() => {
-    autoDetectOnRef.current = autoDetectOn;
-    try {
-      localStorage.setItem("ika:autoDetectOn", String(autoDetectOn));
-    } catch { }
-  }, [autoDetectOn]);
-
-  const [emptyTranscripts, setEmptyTranscripts] = useState(0);
-  const lastAutoCalRef = useRef(0);
-  const [isPressed, setIsPressed] = useState(false);
-
-  // mic/VAD prefs
-  const [dbfs, setDbfs] = useState(-60);
-  const [threshold, setThreshold] = useState(
-    Number(localStorage.getItem("ika:threshold") ?? -45)
-  );
-  const [listenMs, setListenMs] = useState(
-    Number(localStorage.getItem("ika:listenMs") ?? 400)
-  );
-  const [silenceMs, setSilenceMs] = useState(
-    Number(localStorage.getItem("ika:silenceMs") ?? 500)
-  );
-
-  // Live AAD knobs (moved here)
-  const [sosQuick, setSosQuick] = useState(
-    Number(localStorage.getItem("ika:sos") ?? 0.5)
-  );
-  const [eosQuick, setEosQuick] = useState(
-    Number(localStorage.getItem("ika:eos") ?? 0.5)
-  );
-  const [prefixPadQuick, setPrefixPadQuick] = useState(
-    Number(localStorage.getItem("ika:prefixPad") ?? 150)
-  );
-  const [silenceDurQuick, setSilenceDurQuick] = useState(
-    Number(localStorage.getItem("ika:silenceDur") ?? 800)
-  );
-
-  // mirror into refs for VAD loop
-  const thresholdLiveRef = useRef(threshold);
-  const listenMsLiveRef = useRef(listenMs);
-  const silenceMsLiveRef = useRef(silenceMs);
-  useEffect(() => {
-    thresholdLiveRef.current = threshold;
-    try {
-      localStorage.setItem("ika:threshold", String(threshold));
-    } catch { }
-  }, [threshold]);
-  useEffect(() => {
-    listenMsLiveRef.current = listenMs;
-    try {
-      localStorage.setItem("ika:listenMs", String(listenMs));
-    } catch { }
-  }, [listenMs]);
-  useEffect(() => {
-    silenceMsLiveRef.current = silenceMs;
-    try {
-      localStorage.setItem("ika:silenceMs", String(silenceMs));
-    } catch { }
-  }, [silenceMs]);
-
-  // persist Live AAD too
-  useEffect(() => {
-    try {
-      localStorage.setItem("ika:sos", String(sosQuick));
-      localStorage.setItem("ika:eos", String(eosQuick));
-      localStorage.setItem("ika:prefixPad", String(prefixPadQuick));
-      localStorage.setItem("ika:silenceDur", String(silenceDurQuick));
-    } catch { }
-  }, [sosQuick, eosQuick, prefixPadQuick, silenceDurQuick]);
-
-  const [micOn, setMicOn] = useState(false);
-  const micOnRef = useRef(false);
-  useEffect(() => {
-    micOnRef.current = micOn;
-  }, [micOn]);
-
-  const [audioDevs, setAudioDevs] = useState([]);
   const [videoDevs, setVideoDevs] = useState([]);
-
-  const audioRef = useRef({
-    ctx: null,
-    stream: null,
-    source: null,
-    analyser: null,
-    raf: 0,
-    deviceId: "",
-    vad: {
-      highSince: 0,
-      lowSince: 0,
-      recording: false,
-      recorder: null,
-      chunks: [],
-      startTs: 0,
-      failedStarts: 0,
-    },
-  });
   const camRef = useRef({ stream: null });
 
   // detection bookkeeping
@@ -2488,80 +2330,6 @@ export default function App() {
     );
   }
 
-  function LevelMeter({
-    levelDbfs = -60,
-    thresholdDbfs = -45,
-    bars = 20,
-    height = 18,
-  }) {
-    const norm = (db, min = -60, max = -20) => {
-      const x = (db - min) / (max - min);
-      return Math.min(1, Math.max(0, x));
-    };
-    const fill = norm(levelDbfs);
-    const tpos = norm(thresholdDbfs);
-    return (
-      <div
-        style={{
-          position: "relative",
-          background: "#0a0a0a",
-          padding: "10px 12px",
-          borderRadius: 10,
-        }}
-      >
-        <div style={{ color: "#9ef99f", fontWeight: 600, marginBottom: 6 }}>
-          Volume
-        </div>
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: `repeat(${bars}, 1fr)`,
-            gap: 4,
-          }}
-        >
-          {Array.from({ length: bars }).map((_, i) => {
-            const lit = i / (bars - 1) <= fill;
-            return (
-              <div
-                key={i}
-                style={{
-                  height,
-                  borderRadius: 4,
-                  background: lit ? "#22c55e" : "#184a1d",
-                  transition: "background 80ms linear",
-                }}
-              />
-            );
-          })}
-        </div>
-        <div
-          style={{
-            position: "absolute",
-            left: `${tpos * 100}%`,
-            top: 34,
-            transform: "translateX(0%)",
-            display: "flex",
-            alignItems: "center",
-            gap: 6,
-            pointerEvents: "none",
-          }}
-        >
-          <div
-            style={{
-              width: 6,
-              height: height + 10,
-              background: "#9ef99f",
-              borderRadius: 2,
-              opacity: 0.9,
-            }}
-          />
-          <div style={{ color: "#9ef99f", fontSize: 12, opacity: 0.9 }}>
-            {Math.round(thresholdDbfs)} dB
-          </div>
-        </div>
-      </div>
-    );
-  }
 
   /* ---------- Camera sizing + intrinsics (fx/fy) updates ---------- */
   useEffect(() => {
@@ -2664,7 +2432,6 @@ export default function App() {
 
     return () => {
       cancelled = true;
-      userMicOffRef.current = true;
       stopAll({ reason: "unmount" });
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2799,8 +2566,6 @@ export default function App() {
       try {
         const vId = localStorage.getItem("ika:videoId") || "";
         if (vId) setVideoId(vId);
-        const aId = localStorage.getItem("ika:audioId") || "";
-        if (aId) setAudioId(aId);
         const gm =
           localStorage.getItem(`ika:greenMaxM:${vId || "default"}`) ??
           localStorage.getItem("ika:greenMaxM");
@@ -2812,7 +2577,6 @@ export default function App() {
       } catch { }
       try {
         const list = await navigator.mediaDevices.enumerateDevices();
-        setAudioDevs(list.filter((d) => d.kind === "audioinput"));
         setVideoDevs(list.filter((d) => d.kind === "videoinput"));
       } catch { }
     })();
@@ -2892,7 +2656,6 @@ export default function App() {
     const onChange = async () => {
       try {
         const list = await navigator.mediaDevices.enumerateDevices();
-        setAudioDevs(list.filter((d) => d.kind === "audioinput"));
         setVideoDevs(list.filter((d) => d.kind === "videoinput"));
       } catch { }
     };
@@ -2921,13 +2684,11 @@ export default function App() {
   useEffect(() => {
     const onVisibility = () => {
       if (document.hidden && !keepBgOnRef.current) {
-        userMicOffRef.current = true;
         stopAll({ reason: "visibility" });
       }
     };
     const onPageHide = () => {
       // Page is actually leaving (navigate/close) → always stop
-      userMicOffRef.current = true;
       stopAll({ reason: "pagehide" });
     };
     const onBeforeUnload = () => {
@@ -2942,412 +2703,6 @@ export default function App() {
       window.removeEventListener("beforeunload", onBeforeUnload);
     };
   }, []);
-
-  /* ---------- STT hook (called after utterance upload) ---------- */
-  async function handleTranscriptResult(resp) {
-    const txt = (resp?.text ?? "").trim();
-    if (!txt || txt.length < MIN_NONEMPTY_CHARS) {
-      setEmptyTranscripts((c) => {
-        const next = c + 1;
-        if (autoDetectOn && next >= MAX_EMPTY_BEFORE_AUTOCAL) {
-          setTimeout(() => setEmptyTranscripts(0), 0);
-          maybeAutoCalibrate();
-        }
-        return next;
-      });
-      return;
-    }
-    setEmptyTranscripts(0);
-    try {
-      server.sendText(txt);
-    } catch { }
-  }
-
-  /* ---------- Auto-calibrate ---------- */
-  const autoCalibrate = useCallback(async () => {
-    const a = audioRef.current;
-    if (!a?.analyser || a.analyser.fftSize <= 0) return;
-    const analyser = a.analyser;
-    const origSmoothing = analyser.smoothingTimeConstant ?? 0;
-    analyser.smoothingTimeConstant = 0;
-
-    const buf = new Float32Array(analyser.fftSize || 2048);
-    const start = performance.now();
-    const windowMs = 2000;
-    const readings = [];
-
-    while (performance.now() - start < windowMs) {
-      analyser.getFloatTimeDomainData(buf);
-      let sum = 0;
-      for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-      const rms = Math.sqrt(sum / buf.length) || 0.0000001;
-      let d = 20 * Math.log10(rms);
-      if (!isFinite(d)) d = -120;
-      readings.push(d);
-      await new Promise((r) => requestAnimationFrame(r));
-    }
-
-    readings.sort((x, y) => x - y);
-    const keep = Math.max(1, Math.floor(readings.length * 0.35));
-    const lowSlice = readings.slice(0, keep);
-    const mid = lowSlice[Math.floor(lowSlice.length / 2)] ?? -60;
-    const target = Math.max(-60, Math.min(-20, mid + 3));
-    setThreshold(Math.round(target));
-
-    analyser.smoothingTimeConstant = origSmoothing;
-  }, []);
-  async function maybeAutoCalibrate() {
-    if (!autoDetectOnRef.current) return;
-    if (!micOnRef.current) return;
-    const isRecording = !!audioRef.current?.vad?.recording;
-    if (isRecording) return;
-    const now = Date.now();
-    if (now - lastAutoCalRef.current < AUTO_CAL_MIN_GAP_MS) return;
-    lastAutoCalRef.current = now;
-    setIsPressed(true);
-    try {
-      await autoCalibrate();
-    } finally {
-      setTimeout(() => setIsPressed(false), 250);
-    }
-  }
-
-  /* ---------- Mic control & VAD ---------- */
-  async function stopMic() {
-    if (!audioRef.current?.stream && !micOn) {
-      setMicOn(false);
-      setDbfs(-60);
-
-      // schedule standby after MIC_IDLE_MS
-      if (micIdleToStandbyTimerRef.current)
-        clearTimeout(micIdleToStandbyTimerRef.current);
-      micIdleToStandbyTimerRef.current = setTimeout(() => {
-        if (!micOnRef.current && isCamLive()) {
-          setSessionStatus("STANDBY");
-        }
-        micIdleToStandbyTimerRef.current = null;
-      }, MIC_IDLE_MS);
-
-      return;
-    }
-    try {
-      if (audioRef.current.raf) cancelAnimationFrame(audioRef.current.raf);
-    } catch { }
-    try {
-      const rec = audioRef.current?.vad?.recorder;
-      if (rec && rec.state === "recording") {
-        try {
-          rec.requestData?.();
-        } catch { }
-        try {
-          rec.stop();
-        } catch { }
-      }
-    } catch { }
-    try {
-      audioRef.current.stream?.getTracks()?.forEach((t) => t.stop());
-    } catch { }
-    try {
-      await audioRef.current.ctx?.close();
-    } catch { }
-    try {
-      audioRef.current.source?.disconnect?.();
-    } catch { }
-    try {
-      audioRef.current.analyser?.disconnect?.();
-    } catch { }
-
-    audioRef.current = {
-      ctx: null,
-      stream: null,
-      source: null,
-      analyser: null,
-      raf: 0,
-      deviceId: "",
-      vad: {
-        highSince: 0,
-        lowSince: 0,
-        recording: false,
-        recorder: null,
-        chunks: [],
-        startTs: 0,
-        failedStarts: 0,
-      },
-    };
-    setMicOn(false);
-    setDbfs(-60);
-
-    // schedule standby after MIC_IDLE_MS
-    if (micIdleToStandbyTimerRef.current)
-      clearTimeout(micIdleToStandbyTimerRef.current);
-    micIdleToStandbyTimerRef.current = setTimeout(() => {
-      if (!micOnRef.current && isCamLive()) {
-        setSessionStatus("STANDBY");
-      }
-      micIdleToStandbyTimerRef.current = null;
-    }, MIC_IDLE_MS);
-  }
-
-  async function startMic(id = audioId, { force = false } = {}) {
-    // 👉 if a standby timer was queued by stopMic, cancel it now
-    if (micIdleToStandbyTimerRef.current) {
-      clearTimeout(micIdleToStandbyTimerRef.current);
-      micIdleToStandbyTimerRef.current = null;
-    }
-
-    if (audioRef.current?.stream) {
-      const same = (id || "") === (audioRef.current.deviceId || "");
-      if (!force && same) {
-        console.log("[Mic] already running");
-        // ensure status reflects live mic
-        setSessionStatus(isCamLive() ? "ACTIVE" : "STANDBY");
-        return;
-      }
-      await stopMic();
-    }
-
-    // stream
-    let stream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          deviceId: id ? { exact: id } : undefined,
-          noiseSuppression: true,
-          echoCancellation: true,
-          autoGainControl: true,
-          channelCount: 1,
-          sampleRate: 48000,
-          sampleSize: 16,
-        },
-        video: false,
-      });
-    } catch (e) {
-      console.error("[Mic] permission/error:", e);
-      setMicOn(false);
-      return;
-    }
-
-    // audio graph
-    const ctx = new (window.AudioContext || window.webkitAudioContext)({
-      sampleRate: 48000,
-      latencyHint: "interactive",
-    });
-    try {
-      await ctx.resume();
-    } catch { }
-    const source = ctx.createMediaStreamSource(stream);
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 512;
-    source.connect(analyser);
-
-    audioRef.current = {
-      ctx,
-      stream,
-      source,
-      analyser,
-      raf: 0,
-      deviceId: id || "",
-      vad: {
-        highSince: 0,
-        lowSince: 0,
-        recording: false,
-        recorder: null,
-        chunks: [],
-        startTs: 0,
-        failedStarts: 0,
-      },
-    };
-    setMicOn(true);
-    setSessionStatus(isCamLive() ? "ACTIVE" : "STANDBY");
-
-    // optional initial auto-cal
-    if (autoDetectOnRef.current && !speakingRef.current) {
-      setTimeout(async () => {
-        if (!audioRef.current?.stream || !audioRef.current?.analyser) return;
-        setIsPressed(true);
-        try {
-          await autoCalibrate();
-          lastAutoCalRef.current = Date.now();
-        } finally {
-          setTimeout(() => setIsPressed(false), 250);
-        }
-      }, 350);
-    }
-
-    // choose MediaRecorder MIME
-    let mimeType = "";
-    if (typeof MediaRecorder !== "undefined") {
-      const prefs = [
-        "audio/webm;codecs=opus",
-        "audio/webm",
-        "audio/ogg;codecs=opus",
-        "audio/mp4",
-      ];
-      mimeType = prefs.find((t) => MediaRecorder.isTypeSupported(t)) || "";
-    }
-
-    // meter & VAD
-    const buf = new Float32Array(analyser.fftSize);
-    const EMA = 0.25;
-    let smooth = -60;
-
-    const tick = () => {
-      analyser.getFloatTimeDomainData(buf);
-      let sum = 0;
-      for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-      const rms = Math.sqrt(sum / buf.length) || 0.0000001;
-      let d = 20 * Math.log10(rms);
-      if (!isFinite(d)) d = -120;
-
-      smooth = smooth === -60 ? d : EMA * d + (1 - EMA) * smooth;
-      setDbfs(smooth);
-
-      const vad = audioRef.current.vad;
-      const nowTs = performance.now();
-
-      const thr = thresholdLiveRef.current;
-      const minKeepMs = Math.max(400, listenMsLiveRef.current);
-      const silenceDur = silenceMsLiveRef.current;
-
-      const edgeLevel = d;
-      const isLoud = edgeLevel >= thr;
-
-      // pause VAD when bot is talking
-      if (speakingRef.current) {
-        if (vad.recording) {
-          const rec = vad.recorder;
-          if (rec && rec.state === "recording") {
-            try {
-              rec.requestData?.();
-            } catch { }
-            try {
-              rec.stop();
-            } catch { }
-          }
-          vad.recording = false;
-          vad.recorder = null;
-          vad.chunks = [];
-          vad.startTs = 0;
-        }
-        audioRef.current.raf = requestAnimationFrame(tick);
-        return;
-      }
-
-      const HYSTERESIS_DB = 2;
-      const QUICK_STOP_DB = 8;
-      const QUICK_STOP_MS = 220;
-      const riseEdge = edgeLevel >= thr;
-      const fallEdge = edgeLevel < thr - HYSTERESIS_DB;
-      if (isLoud && !vad.highSince) {
-        vad.highSince = nowTs;
-        vad.lowSince = 0;
-      }
-
-      // START
-      if (riseEdge && !vad.recording) {
-        try {
-          if (typeof MediaRecorder !== "undefined") {
-            const rec = new MediaRecorder(
-              stream,
-              mimeType ? { mimeType } : undefined
-            );
-            vad.recorder = rec;
-            vad.chunks = [];
-            vad.startTs = nowTs;
-            vad.recording = true;
-            vad.lowSince = 0;
-
-            rec.ondataavailable = (e) => {
-              if (e.data?.size) vad.chunks.push(e.data);
-            };
-            rec.onstop = async () => {
-              try {
-                const blob = new Blob(vad.chunks, {
-                  type: rec.mimeType || mimeType || "audio/webm",
-                });
-                const dur = performance.now() - vad.startTs;
-                if (dur < minKeepMs) {
-                  vad.failedStarts = (vad.failedStarts || 0) + 1;
-                  if (
-                    autoDetectOnRef.current &&
-                    vad.failedStarts >= FAILED_STARTS_BEFORE_AUTOCAL
-                  ) {
-                    vad.failedStarts = 0;
-                    maybeAutoCalibrate();
-                  }
-                  return;
-                }
-                vad.failedStarts = 0;
-
-                // TODO: Upload to your STT endpoint; for now simulate
-                handleTranscriptResult({ text: "(utterance)" });
-              } catch (e) {
-                console.error("[STT] onstop error:", e);
-              } finally {
-                vad.recording = false;
-                vad.recorder = null;
-                vad.chunks = [];
-                vad.startTs = 0;
-              }
-            };
-            try {
-              rec.start(250);
-            } catch {
-              rec.start();
-            }
-          }
-        } catch (e) {
-          console.error("[VAD] start failed:", e);
-        }
-      }
-
-      // STOP
-      if (vad.recording) {
-        const utterMs = nowTs - vad.startTs;
-        if (fallEdge) {
-          vad.lowSince = vad.lowSince || nowTs;
-          const lowDur = nowTs - vad.lowSince;
-          if (lowDur >= silenceDur || (edgeLevel < thr - 8 && lowDur >= 220)) {
-            const rec = vad.recorder;
-            if (rec && rec.state === "recording") {
-              try {
-                rec.requestData?.();
-              } catch { }
-              try {
-                rec.stop();
-              } catch { }
-            }
-          }
-        } else {
-          vad.lowSince = 0;
-        }
-        const MAX_UTTER_MS = 15_000;
-        if (utterMs >= MAX_UTTER_MS) {
-          const rec = vad.recorder;
-          if (rec && rec.state === "recording") {
-            try {
-              rec.requestData?.();
-            } catch { }
-            try {
-              rec.stop();
-            } catch { }
-          }
-        }
-      } else {
-        if (!isLoud) {
-          vad.lowSince = vad.lowSince || nowTs;
-          vad.highSince = 0;
-        } else {
-          if (!vad.highSince) vad.highSince = nowTs;
-          vad.lowSince = 0;
-        }
-      }
-
-      audioRef.current.raf = requestAnimationFrame(tick);
-    };
-
-    audioRef.current.raf = requestAnimationFrame(tick);
-  }
 
   /* ---------- Camera ---------- */
   async function startCamera(id = videoId) {
@@ -3400,7 +2755,6 @@ export default function App() {
 
     try {
       const onCamGone = () => {
-        userMicOffRef.current = true;
         stopAll({ reset: true });
       };
       const vTracks = stream.getVideoTracks();
@@ -3473,7 +2827,6 @@ export default function App() {
 
     try {
       const list = await navigator.mediaDevices.enumerateDevices();
-      setAudioDevs(list.filter((d) => d.kind === "audioinput"));
       setVideoDevs(list.filter((d) => d.kind === "videoinput"));
     } catch { }
   }
@@ -3607,7 +2960,6 @@ export default function App() {
       )
         return;
       frameCount++;
-      if (audioRef.current?.vad?.recording && frameCount % 2 === 0) return;
       lastRun = now;
 
       detecting = true;
@@ -3718,7 +3070,7 @@ export default function App() {
           candidates.push({ i, det, box, dist, zone });
         }
 
-        // Totals for status/mic policy (all visible faces within cutoff)
+        // Totals for status policy (all visible faces within cutoff)
         total = candidates.length;
         green = candidates.filter((c) => c.zone === "green").length;
         red = total - green;
@@ -4174,25 +3526,6 @@ export default function App() {
         } else {
           focusIndexRef.current = -1;
           focusTargetRef.current = null;
-        }
-
-        // Mic policy with grace
-        const shouldListen = total > 0 && green === total; // unchanged: all visible faces must be green
-        const nowMs = performance.now();
-        if (shouldListen) {
-          lastAllGreenRef.current = nowMs;
-          if (!micOnRef.current) {
-            userMicOffRef.current = false;
-            startMic().catch(() => {});
-            setSessionStatus("ACTIVE");
-            if (!sessionId) setSessionId(uuid());
-          }
-        } else {
-          const sinceAllGreen = nowMs - (lastAllGreenRef.current || 0);
-          if (micOnRef.current && sinceAllGreen >= MIC_STOP_GRACE_MS) {
-            userMicOffRef.current = true;
-            stopMic().catch(() => {});
-          }
         }
 
         // Always render 5 rows max; pad if fewer tracked
@@ -5012,11 +4345,6 @@ export default function App() {
 
       // When tab is hidden and keepBgOn is true, skip idle enforcement
       if (document.hidden && keepBgOnRef.current) return;
-      // Mic idle: stop listening
-      if (ago > MIC_IDLE_MS && micOnRef.current) {
-        userMicOffRef.current = true;
-        stopMic().catch(() => { });
-      }
       // Camera idle: stop everything, including LLM
       if (ago > CAM_IDLE_MS) {
         stopAll({ reset: true });
@@ -5035,17 +4363,6 @@ export default function App() {
 
   // hard stop everything
   async function stopAll({ reset = true } = {}) {
-    setDbfs(-60);
-
-    // 👉 kill any pending “mic→standby” transition
-    if (micIdleToStandbyTimerRef.current) {
-      clearTimeout(micIdleToStandbyTimerRef.current);
-      micIdleToStandbyTimerRef.current = null;
-    }
-
-    try {
-      await stopMic();
-    } catch { }
     try {
       camRef.current.stream?.getTracks()?.forEach((t) => t.stop());
     } catch { }
@@ -5055,15 +4372,16 @@ export default function App() {
     S.current = { id: null, seenFrames: 0, lastFaceTs: 0, lastSnapshotTs: 0 };
 
     try {
-      //socketRef.current?.emit?.("close_session", { sessionId });
       SendWebsockCommandToServer(MSG_TYPE.SessionEnd, { sessionId });
     } catch { }
     setSessionId(null);
-    setSessionStatus("IDLE"); // full idle immediately
+    setSessionStatus("IDLE");
     recentMapRef.current = {};
 
     if (reset) bump("stop");
   }
+
+
 
   /* ====================== RIGHT-PANEL STATE (Gemini / ElevenLabs) ====================== */
   const MODEL_OPTIONS = [
@@ -5297,15 +4615,7 @@ export default function App() {
       response_modalities:
         ttsProviderQuick === "elevenlabs" ? ["TEXT"] : ["AUDIO", "TEXT"],
 
-      mic_input: true,
       enable_affective_dialog: enableAffectiveQuick,
-      disable_mic_during_response: false,
-
-      // Live AAD knobs
-      start_of_speech_sensitivity: sosQuick,
-      end_of_speech_sensitivity: eosQuick,
-      prefix_padding_ms: prefixPadQuick,
-      silence_duration_ms: silenceDurQuick,
 
       temperature: temperatureQuick,
       proactive_audio: proactiveAudioQuick,
@@ -5327,15 +4637,11 @@ export default function App() {
     systemInstruction,
     ttsProviderQuick,
     enableAffectiveQuick,
-    sosQuick,
-    eosQuick,
-    prefixPadQuick,
-    silenceDurQuick,
     temperatureQuick,
     proactiveAudioQuick,
   ]);
 
-  // hot update (also sends current Live AAD values from Mic panel)
+  // hot update
   const onHotUpdate = useCallback(() => {
     server.updateSettings({
       temperature: temperatureQuick,
@@ -5346,11 +4652,6 @@ export default function App() {
       function_calling: functionCallingQuick,
       auto_function_response: autoFunctionResponseQuick,
       grounding: groundingQuick,
-
-      start_of_speech_sensitivity: sosQuick,
-      end_of_speech_sensitivity: eosQuick,
-      prefix_padding_ms: prefixPadQuick,
-      silence_duration_ms: silenceDurQuick,
     });
   }, [
     server,
@@ -5361,19 +4662,24 @@ export default function App() {
     functionCallingQuick,
     autoFunctionResponseQuick,
     groundingQuick,
-    sosQuick,
-    eosQuick,
-    prefixPadQuick,
-    silenceDurQuick,
   ]);
 
   /* ====================== UI ====================== */
   return (
     <main className="app">
-      <div className="page2">
-        {/* ===== LEFT COLUMN ===== */}
-        <div className="leftcol">
-          {/* Row 1: CAMERA/STATUS | MIC */}
+      <div
+        className="app-body"
+        style={{
+          display: "flex",
+          justifyContent: "center",
+          width: "100%",
+        }}
+      >
+        <div
+          className="main-column"
+          style={{ margin: "0 auto", width: "100%", maxWidth: 1280 }}
+        >
+          {/* Row 1: CAMERA/STATUS */}
           <div className="left-top2">
             {/* CAMERA / STATUS (compact, grouped) */}
             <div className="panel compact">
@@ -5432,17 +4738,15 @@ export default function App() {
                   ) : null}
 
                   {/* Device binding */}
-
-                  {/* Device binding */}
                   <div className="kv">
                     <b>Device:</b>&nbsp;{deviceId.slice(0, 8)}…
                     <span className="muted">
                       &nbsp;
                       {serverInfo.boundDeviceId
                         ? `(bound ${String(serverInfo.boundDeviceId).slice(
-                          0,
-                          8
-                        )}…)`
+                            0,
+                            8
+                          )}…)`
                         : `(not bound)`}
                     </span>
                   </div>
@@ -5494,208 +4798,177 @@ export default function App() {
                 </div>
               </div>
             </div>
-
-            {/* MIC */}
-            <div className="panel">
-              <div className="row" style={{ gap: 12 }}>
-                <span className={`dot ${micOn ? "ok" : "err"}`} />
-                <b>Mic:</b>&nbsp;{micOn ? "listening" : "idle"}
-                <label className="checkbox" style={{ marginLeft: "auto" }}>
-                  <input
-                    type="checkbox"
-                    checked={autoDetectOn}
-                    onChange={(e) => setAutoDetectOn(e.target.checked)}
-                  />
-                  <span>Auto-calibrate</span>
-                </label>
-                <button
-                  className="btn"
-                  data-active={micOn ? "true" : "false"}
-                  onClick={async () => {
-                    userMicOffRef.current = false;
-                    await startMic();
-                  }}
-                >
-                  Start
-                </button>
-                <button
-                  className="btn"
-                  data-active={!micOn ? "true" : "false"}
-                  onClick={async () => {
-                    userMicOffRef.current = true;
-                    await stopMic();
-                  }}
-                >
-                  Stop
-                </button>
-                <button
-                  className="btn"
-                  data-active={isPressed ? "true" : "false"}
-                  disabled={!micOn}
-                  title="Sample 2s room noise and set threshold"
-                  onClick={autoCalibrate}
-                  onMouseDown={() => setIsPressed(true)}
-                  onMouseUp={() => setIsPressed(false)}
-                  onMouseLeave={() => setIsPressed(false)}
-                  onTouchStart={() => setIsPressed(true)}
-                  onTouchEnd={() => setIsPressed(false)}
-                >
-                  Calibrate
-                </button>
-              </div>
-
-              <LevelMeter levelDbfs={dbfs} thresholdDbfs={threshold} />
-
-              <div>
-                <label className="label">Noise Threshold (dBFS)</label>
-                <input
-                  className="range"
-                  type="range"
-                  min="-60"
-                  max="-20"
-                  step="1"
-                  value={threshold}
-                  onChange={(e) => setThreshold(Number(e.target.value))}
-                />
-              </div>
-
-              <div className="row" style={{ gap: 16 }}>
-                <div className="flex1">
-                  <label className="label">Listen</label>
-                  <input
-                    className="range"
-                    type="range"
-                    min="0"
-                    max="5000"
-                    step="100"
-                    value={listenMs}
-                    onChange={(e) => setListenMs(Number(e.target.value))}
-                  />
-                  <div className="help">{Math.round(listenMs / 100) / 10}s</div>
+            <div
+              className="left-top-side"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: 12,
+                minWidth: 300,
+                flex: "0 0 auto",
+              }}
+            >
+              {/* Save/Export Settings */}
+              <section className="panel">
+                <h3 className="section-title">settings backup</h3>
+                <div className="row" style={{ gap: 8 }}>
+                  <button className="btn" onClick={exportSettings}>
+                    Export to file
+                  </button>
+                  <button className="btn" onClick={importSettings}>
+                    Import from file
+                  </button>
+                  <button className="btn" onClick={resetSettings}>
+                    Reset all
+                  </button>
                 </div>
-                <div className="flex1">
-                  <label className="label">Silence</label>
+    
+              </section>
+
+              {/* Server connection */}
+              <section className="panel">
+                <h3 className="section-title">server connection</h3>
+                <div className="row" style={{ gap: 8 }}>
                   <input
-                    className="range"
-                    type="range"
-                    min="0"
-                    max="5000"
-                    step="100"
-                    value={silenceMs}
-                    onChange={(e) => setSilenceMs(Number(e.target.value))}
+                    className="input bigpad"
+                    placeholder="(same-origin) or http://PC-IP:PORT"
+                    value={serverUrlDraft}
+                    onChange={(e) => setServerUrlDraft(e.target.value)}
+                    autoCorrect="off"
+                    autoCapitalize="off"
+                    spellCheck={false}
                   />
-                  <div className="help">
-                    {Math.round(silenceMs / 100) / 10}s
+                  <button
+                    className="btn"
+                    disabled={serverUrlDraft.trim() === (serverUrl || "")}
+                    onClick={() => setServerUrl(serverUrlDraft.trim())}
+                  >
+                    Apply & reconnect
+                  </button>
+                  <button
+                    className="btn"
+                    onClick={() => {
+                      setServerUrl("");
+                      setServerUrlDraft(window.location.origin);
+                    }}
+                  >
+                    Use same-origin
+                  </button>
+                </div>
+                <div className="help" style={{ marginTop: 6 }}>
+                  Config:{" "}
+                  {serverUrl && serverUrl.trim() ? serverUrl : "(same-origin)"} ·
+                  Effective: {effectiveUrl}
+                  <br />
+                  Status: {serverInfo.connected ? "connected" : "disconnected"}
+                </div>
+              </section>
+
+              {/* Performance */}
+              <section className="panel">
+                <h3 className="section-title">performance</h3>
+                <div className="row" style={{ gap: 12, alignItems: "center" }}>
+                  <label className="checkbox">
+                    <input
+                      type="checkbox"
+                      checked={gesturesOn}
+                      onChange={(e) => setGesturesOn(e.target.checked)}
+                    />
+                    <span>Gestures</span>
+                  </label>
+                  <div
+                    className="row"
+                    style={{ gap: 8, alignItems: "center", marginLeft: 8 }}
+                  >
+                    <label className="label" style={{ margin: 0 }}>
+                      Targets
+                    </label>
+                    <select
+                      className="select"
+                      value={gestureTargets}
+                      onChange={(e) =>
+                        setGestureTargets(
+                          parseInt(e.target.value, 10) === 1 ? 1 : 2
+                        )
+                      }
+                      disabled={!gesturesOn}
+                      title="Limit gesture tracking to 1 or 2 people"
+                    >
+                      <option value={1}>1 person</option>
+                      <option value={2}>2 people</option>
+                    </select>
                   </div>
                 </div>
-              </div>
+                <div className="help" style={{ marginTop: 6 }}>
+                  Turn off on low-power devices (Android/Edge) to improve FPS.
+                </div>
+                <div
+                  className="row"
+                  style={{ gap: 12, alignItems: "center", marginTop: 8 }}
+                >
+                  <label className="checkbox">
+                    <input
+                      type="checkbox"
+                      checked={keepBgOn}
+                      onChange={(e) => setKeepBgOn(e.target.checked)}
+                    />
+                    <span>Keep running in background</span>
+                  </label>
+                </div>
+              </section>
+            </div>
+          </div>
 
-              {/* Gemini AAD knobs */}
-              <div className="row" style={{ gap: 16 }}>
-                <div className="flex1">
-                  <label className="label">Start of speech sensitivity</label>
-                  <input
-                    className="range"
-                    type="range"
-                    min="0"
-                    max="1"
-                    step="0.05"
-                    value={sosQuick}
-                    onChange={(e) => setSosQuick(Number(e.target.value))}
-                  />
-                  <div className="help">{sosQuick.toFixed(2)}</div>
-                </div>
-                <div className="flex1">
-                  <label className="label">End of speech sensitivity</label>
-                  <input
-                    className="range"
-                    type="range"
-                    min="0"
-                    max="1"
-                    step="0.05"
-                    value={eosQuick}
-                    onChange={(e) => setEosQuick(Number(e.target.value))}
-                  />
-                  <div className="help">{eosQuick.toFixed(2)}</div>
-                </div>
-              </div>
-
-              <div className="row" style={{ gap: 16 }}>
-                <div className="flex1">
-                  <label className="label">Prefix padding (ms)</label>
-                  <input
-                    className="range"
-                    type="range"
-                    min="0"
-                    max="400"
-                    step="10"
-                    value={prefixPadQuick}
-                    onChange={(e) => setPrefixPadQuick(Number(e.target.value))}
-                  />
-                  <div className="help">{prefixPadQuick} ms</div>
-                </div>
-                <div className="flex1">
-                  <label className="label">Silence duration (ms)</label>
-                  <input
-                    className="range"
-                    type="range"
-                    min="200"
-                    max="2000"
-                    step="50"
-                    value={silenceDurQuick}
-                    onChange={(e) => setSilenceDurQuick(Number(e.target.value))}
-                  />
-                  <div className="help">{silenceDurQuick} ms</div>
-                </div>
-              </div>
-
-              {/* Devices */}
-              <div className="row" style={{ gap: 12 }}>
-                <div className="flex1">
-                  <label className="label">Microphone</label>
-                  <select
-                    className="select big"
-                    value={audioId}
-                    onChange={async (e) => {
-                      const next = e.target.value;
-                      setAudioId(next);
-                      try {
-                        localStorage.setItem("ika:audioId", next);
-                      } catch { }
-                      await startMic(next, { force: true });
-                    }}
-                  >
-                    <option value="">(Default)</option>
-                    {audioDevs.map((d) => (
-                      <option key={d.deviceId} value={d.deviceId}>
-                        {d.label || "Microphone"}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="flex1">
-                  <label className="label">Camera</label>
-                  <select
-                    className="select big"
-                    value={videoId}
-                    onChange={async (e) => {
-                      const next = e.target.value;
-                      setVideoId(next);
-                      try {
-                        localStorage.setItem("ika:videoId", next);
-                      } catch { }
-                      await startCamera(next);
-                    }}
-                  >
-                    <option value="">(Default)</option>
-                    {videoDevs.map((d) => (
-                      <option key={d.deviceId} value={d.deviceId}>
-                        {d.label || "Camera"}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
+          {/* Devices */}
+          <div className="panel">
+            <label className="label">Camera</label>
+            <select
+              className="select big"
+              value={videoId}
+              onChange={async (e) => {
+                const next = e.target.value;
+                setVideoId(next);
+                try {
+                  localStorage.setItem("ika:videoId", next);
+                } catch {}
+                await startCamera(next);
+              }}
+            >
+              <option value="">(Default)</option>
+              {videoDevs.map((d) => (
+                <option key={d.deviceId} value={d.deviceId}>
+                  {d.label || "Camera"}
+                </option>
+              ))}
+            </select>
+            <div
+              className="row"
+              style={{ gap: 12, marginTop: 12, flexWrap: "wrap" }}
+            >
+              <button
+                className="btn"
+                onClick={() => {
+                  startCamera().catch((err) =>
+                    console.warn("[Cam] restart failed", err)
+                  );
+                }}
+              >
+                Restart camera
+              </button>
+              <button
+                className="btn"
+                onClick={() => {
+                  stopAll({ reset: true }).catch((err) =>
+                    console.warn("[Cam] stop failed", err)
+                  );
+                }}
+              >
+                Stop camera
+              </button>
+            </div>
+            <div className="help" style={{ marginTop: 6 }}>
+              Use restart after plugging in a new webcam or if autoplay was
+              blocked by the browser.
             </div>
           </div>
 
@@ -5997,330 +5270,6 @@ export default function App() {
               </tbody>
             </table>
           </div>
-        </div>
-
-        {/* ===== RIGHT COLUMN ===== */}
-        <div
-          className="rightcol"
-          style={{
-            position: "sticky",
-            top: 12,
-            alignSelf: "start",
-            zIndex: 1000,
-          }}
-        >
-          {/* Save/Export Settings */}
-          <section
-            className="panel"
-            style={{ pointerEvents: "auto", zIndex: 1001 }}
-          >
-            <h3 className="section-title">settings backup</h3>
-            <div className="row" style={{ gap: 8 }}>
-              <button className="btn" onClick={exportSettings}>
-                Export to file
-              </button>
-              <button className="btn" onClick={importSettings}>
-                Import from file
-              </button>
-              <button className="btn" onClick={resetSettings}>
-                Reset all
-              </button>
-            </div>
-            <div className="help" style={{ marginTop: 6 }}>
-              Saves to localStorage; import/export helps migrate to another
-              machine.
-            </div>
-          </section>
-          {/* IP Address */}
-          <section
-            className="panel"
-            style={{ pointerEvents: "auto", zIndex: 1001 }}
-          >
-            <h3 className="section-title">server connection</h3>
-            <div className="row" style={{ gap: 8 }}>
-              <input
-                className="input bigpad"
-                placeholder="(same-origin) or http://PC-IP:PORT"
-                value={serverUrlDraft}
-                onChange={(e) => setServerUrlDraft(e.target.value)}
-                autoCorrect="off"
-                autoCapitalize="off"
-                spellCheck={false}
-              />
-              <button
-                className="btn"
-                disabled={serverUrlDraft.trim() === (serverUrl || "")}
-                onClick={() => setServerUrl(serverUrlDraft.trim())}
-              >
-                Apply & reconnect
-              </button>
-              <button
-                className="btn"
-                onClick={() => {
-                  setServerUrl("");
-                  setServerUrlDraft(window.location.origin);
-                }}
-              >
-                Use same-origin
-              </button>
-            </div>
-            <div className="help" style={{ marginTop: 6 }}>
-              Config:{" "}
-              {serverUrl && serverUrl.trim() ? serverUrl : "(same-origin)"} ·
-              Effective: {effectiveUrl}
-              <br />
-              Status: {serverInfo.connected ? "connected" : "disconnected"}
-            </div>
-          </section>
-          {/* System message */}
-          <section
-            className="panel system-panel"
-            style={{ pointerEvents: "auto", zIndex: 1001 }}
-          >
-            <h3 className="section-title">system message</h3>
-            <textarea
-              className="input multiline bigpad"
-              value={systemInstruction}
-              placeholder="Add/override the system instruction…"
-              onChange={(e) => setSystemInstruction(e.target.value)}
-              autoCorrect="off"
-              autoCapitalize="off"
-              spellCheck={false}
-              id="system-instruction-textarea" // Added ID for accessibility
-            />
-            <label
-              htmlFor="system-instruction-textarea"
-              className="visually-hidden"
-            >
-              System Instruction
-            </label>{" "}
-            {/* Added label for accessibility */}
-          </section>
-
-          <section
-            className="panel"
-            style={{ pointerEvents: "auto", zIndex: 1001 }}
-          >
-            <h3 className="section-title">performance</h3>
-            <div className="row" style={{ gap: 12, alignItems: "center" }}>
-              <label className="checkbox">
-                <input
-                  type="checkbox"
-                  checked={gesturesOn}
-                  onChange={(e) => setGesturesOn(e.target.checked)}
-                />
-                <span>Gestures</span>
-              </label>
-              <div
-                className="row"
-                style={{ gap: 8, alignItems: "center", marginLeft: 8 }}
-              >
-                <label className="label" style={{ margin: 0 }}>
-                  Targets
-                </label>
-                <select
-                  className="select"
-                  value={gestureTargets}
-                  onChange={(e) =>
-                    setGestureTargets(
-                      parseInt(e.target.value, 10) === 1 ? 1 : 2
-                    )
-                  }
-                  disabled={!gesturesOn}
-                  title="Limit gesture tracking to 1 or 2 people"
-                >
-                  <option value={1}>1 person</option>
-                  <option value={2}>2 people</option>
-                </select>
-              </div>
-            </div>
-            <div className="help" style={{ marginTop: 6 }}>
-              Turn off on low-power devices (Android/Edge) to improve FPS.
-            </div>
-            <div
-              className="row"
-              style={{ gap: 12, alignItems: "center", marginTop: 8 }}
-            >
-              <label className="checkbox">
-                <input
-                  type="checkbox"
-                  checked={keepBgOn}
-                  onChange={(e) => setKeepBgOn(e.target.checked)}
-                />
-                <span>Keep running in background</span>
-              </label>
-            </div>
-          </section>
-
-          {/* Gemini */}
-          <section
-            className="panel"
-            style={{ pointerEvents: "auto", zIndex: 1001 }}
-          >
-            <h3 className="section-title">gemini settings</h3>
-            <label className="label" htmlFor="gemini-api-key-input">
-              Gemini API Key
-            </label>{" "}
-            {/* Added htmlFor */}
-            <input
-              className="input bigpad"
-              type="password"
-              inputMode="text"
-              autoComplete="off"
-              placeholder="gsk-…"
-              value={geminiApiKey}
-              onChange={(e) => setGeminiApiKey(e.target.value)}
-              id="gemini-api-key-input" // Added ID
-            />
-            <label className="label" htmlFor="gemini-model-select">
-              Model
-            </label>{" "}
-            {/* Added htmlFor */}
-            <select
-              className="select big"
-              value={modelQuick}
-              onChange={(e) => setModelQuick(e.target.value)}
-              id="gemini-model-select" // Added ID
-            >
-              {MODEL_OPTIONS.map((m) => (
-                <option key={m.value} value={m.value}>
-                  {m.label}
-                </option>
-              ))}
-            </select>
-            <label className="label" htmlFor="gemini-voice-select">
-              Voice
-            </label>{" "}
-            {/* Added htmlFor */}
-            <select
-              className="select big"
-              value={geminiVoiceQuick}
-              onChange={(e) => setGeminiVoiceQuick(e.target.value)}
-              id="gemini-voice-select" // Added ID
-            >
-              {(GEMINI_VOICES[modelKind] || []).map((v) => (
-                <option key={v} value={v}>
-                  {v}
-                </option>
-              ))}
-            </select>
-            <label className="label" htmlFor="gemini-language-select">
-              Language
-            </label>{" "}
-            {/* Added htmlFor */}
-            <select
-              className="select big"
-              value={languageCodeQuick}
-              onChange={(e) => setLanguageCodeQuick(e.target.value)}
-              id="gemini-language-select" // Added ID
-            >
-              {LANGS.map(([label, code]) => (
-                <option key={code} value={code}>
-                  {label}
-                </option>
-              ))}
-            </select>
-            <label className="label" htmlFor="gemini-temperature-range">
-              Temperature
-            </label>{" "}
-            {/* Added htmlFor */}
-            <input
-              className="range"
-              type="range"
-              min="0"
-              max="1"
-              step="0.05"
-              value={temperatureQuick}
-              onChange={(e) => setTemperatureQuick(Number(e.target.value))}
-              id="gemini-temperature-range" // Added ID
-            />
-            <div className="help">{temperatureQuick.toFixed(2)}</div>
-            <div className="row wrap" style={{ gap: 12, marginTop: 8 }}>
-              <label className="checkbox">
-                <input
-                  type="checkbox"
-                  checked={enableAffectiveQuick}
-                  onChange={(e) => setEnableAffectiveQuick(e.target.checked)}
-                  id="checkbox-affective"
-                />
-                <span>Affective dialog</span>
-              </label>{" "}
-              {/* Added ID */}
-              <label className="checkbox">
-                <input
-                  type="checkbox"
-                  checked={proactiveAudioQuick}
-                  onChange={(e) => setProactiveAudioQuick(e.target.checked)}
-                  id="checkbox-proactive"
-                />
-                <span>Proactive dialog</span>
-              </label>{" "}
-              {/* Added ID */}
-              <label className="checkbox">
-                <input
-                  type="checkbox"
-                  checked={functionCallingQuick}
-                  onChange={(e) => setFunctionCallingQuick(e.target.checked)}
-                  id="checkbox-function-calling"
-                />
-                <span>Function calling</span>
-              </label>{" "}
-              {/* Added ID */}
-              <label className="checkbox">
-                <input
-                  type="checkbox"
-                  checked={autoFunctionResponseQuick}
-                  onChange={(e) =>
-                    setAutoFunctionResponseQuick(e.target.checked)
-                  }
-                  id="checkbox-auto-function-response"
-                />
-                <span>Auto function response</span>
-              </label>{" "}
-              {/* Added ID */}
-              <label className="checkbox">
-                <input
-                  type="checkbox"
-                  checked={groundingQuick}
-                  onChange={(e) => setGroundingQuick(e.target.checked)}
-                  id="checkbox-grounding"
-                />
-                <span>Grounding (Search)</span>
-              </label>{" "}
-              {/* Added ID */}
-            </div>
-            <div className="row" style={{ gap: 8, marginTop: 10 }}>
-              <button className="btn stretch" onClick={onCreateSession}>
-                Apply & (re)start Gemini
-              </button>
-              <button className="btn" onClick={onHotUpdate}>
-                Hot update
-              </button>
-            </div>
-            <div className="divider" />
-            <label className="label" htmlFor="tts-provider-select">
-              TTS Provider
-            </label>{" "}
-            {/* Added htmlFor */}
-            <select
-              className="select big"
-              value={ttsProviderQuick}
-              onChange={(e) => setTtsProviderQuick(e.target.value)}
-              id="tts-provider-select" // Added ID
-            >
-              <option value="gemini">Gemini</option>
-              <option value="elevenlabs">ElevenLabs</option>
-            </select>
-          </section>
-
-          {/* ElevenLabs settings — ALWAYS mounted; visibility via CSS */}
-          <section
-            className={`panel elevenlabs-panel ${ttsProviderQuick === "elevenlabs" ? "is-active" : ""
-              }`}
-          >
-            <h3 className="section-title">elevenlabs settings</h3>
-            <ElevenLabsSettings />
-          </section>
         </div>
       </div>
     </main>

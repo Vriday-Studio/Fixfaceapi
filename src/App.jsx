@@ -1,4 +1,4 @@
-// ==== App.jsx — streamlined (Live Preview + Native Audio), neat right sidebar ====
+// ==== App.jsx ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â streamlined (Live Preview + Native Audio), neat right sidebar ====
 // - TFJS + face-api + webcam detection
 // - Socket.IO bridge for Gemini/ElevenLabs audio + text
 // - Right sidebar: system message, Gemini settings, ElevenLabs settings
@@ -20,7 +20,7 @@ function normalizeServerUrl(u) {
   if (!u) return undefined; // same-origin
   let s = String(u || "").trim();
   if (!s) return undefined;
-  if (/^ws(s)?:\/\//i.test(s)) s = s.replace(/^ws/i, "http"); // ws:// → http://, wss:// → https://
+  if (/^ws(s)?:\/\//i.test(s)) s = s.replace(/^ws/i, "http"); // ws:// ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ http://, wss:// ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ https://
   if (!/^https?:\/\//i.test(s)) s = "http://" + s; // allow bare host:port
   return s.replace(/\/+$/, ""); // strip trailing slash
 }
@@ -63,9 +63,9 @@ const SOCKET_URL = undefined; // same-origin
 const USE_SOCKET_SERVER = true;
 
 // --- Attention / greeting policy ---
-const FACING_YAW_MAX_DEG = 9; // how “straight on” horizontally
-const FACING_PITCH_MAX_DEG = 10; // how “straight on” vertically
-const ATTEND_MIN_FRAMES = 5; // require 3–5 consecutive frames
+const FACING_YAW_MAX_DEG = 9; // how ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œstraight onÃƒÂ¢Ã¢â€šÂ¬Ã‚Â horizontally
+const FACING_PITCH_MAX_DEG = 10; // how ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œstraight onÃƒÂ¢Ã¢â€šÂ¬Ã‚Â vertically
+const ATTEND_MIN_FRAMES = 5; // require 3ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“5 consecutive frames
 const GREET_COOLDOWN_MS = 35_000;
 
 // Hard cap per identity
@@ -92,7 +92,7 @@ const HANDS_MODEL_URL = "/mp/hand_landmarker.task";
 const HANDS_MAX_NUM = 2;
 const HANDS_IMAGE_SIDE = 256;
 
-// polite “call over” policy
+// polite ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œcall overÃƒÂ¢Ã¢â€šÂ¬Ã‚Â policy
 const CALL_OVER_MAX_TRIES = 3;
 const CALL_OVER_COOLDOWN_MS = 30_000; // >= 30s between tries
 
@@ -163,7 +163,7 @@ const DEG = Math.PI / 180;
 const RAD = 180 / Math.PI;
 
 function focalFromFov(widthPx, fovDeg) {
-  // clamp FOV to avoid tan(0)/tan(π)
+  // clamp FOV to avoid tan(0)/tan(ÃƒÂÃ¢â€šÂ¬)
   const fov = Math.max(1, Math.min(179, Number(fovDeg || 70)));
   const w = Math.max(1, Number(widthPx) || 1);
   return w / 2 / Math.tan((fov * DEG) / 2);
@@ -249,7 +249,7 @@ function classifyWave(landmarks, now) {
     const amp = Math.max(...xs) - Math.min(...xs); // 0..1 normalized X span
     const vel = recentLateralMotion();
     // ...inside classifyWave, after `const amp = Math.max(...xs) - Math.min(...xs);`...
-    // fast-path A: medium swing with ≥1 flip → lock sooner
+    // fast-path A: medium swing with ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¥1 flip ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ lock sooner
     if (xs.length >= 6 && amp > 0.028 && flips >= 1) {
       return {
         ok: true,
@@ -282,7 +282,7 @@ function classifyWave(landmarks, now) {
   }
 }
 
-// helper: recent lateral motion magnitude (Σ|Δx| over last frames)
+// helper: recent lateral motion magnitude (ÃƒÅ½Ã‚Â£|ÃƒÅ½Ã¢â‚¬Âx| over last frames)
 function recentLateralMotion() {
   const xs = waveHistRef.xs || [];
   if (xs.length < 4) return 0;
@@ -357,11 +357,11 @@ function classifyThumbsUp(landmarks) {
       return { ok: false };
     }
 
-    // Anti-wave gate: if hand is moving side-to-side, don't call 👍
+    // Anti-wave gate: if hand is moving side-to-side, don't call ÃƒÂ°Ã…Â¸Ã¢â‚¬ËœÃ‚Â
     const vel = recentLateralMotion();
     if (vel > 0.08) return { ok: false };
 
-    // Hand axis (wrist → index MCP): want it roughly vertical for 👍
+    // Hand axis (wrist ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ index MCP): want it roughly vertical for ÃƒÂ°Ã…Â¸Ã¢â‚¬ËœÃ‚Â
     const vIdx = v2(indexMcp.x - wrist.x, indexMcp.y - wrist.y);
     const axisLen = Math.hypot(vIdx.x, vIdx.y) || 1e-6;
     const axisCosToVertical = Math.abs(vIdx.y) / axisLen; // 1 = vertical, 0 = horizontal
@@ -392,7 +392,7 @@ function classifyThumbsUp(landmarks) {
     const closedCount = [idxClosed, midClosed, rngClosed, pkyClosed].filter(
       Boolean
     ).length;
-    // Fast path: clear 👍 pose (snappy, anti-false guarded by pose checks)
+    // Fast path: clear ÃƒÂ°Ã…Â¸Ã¢â‚¬ËœÃ‚Â pose (snappy, anti-false guarded by pose checks)
     const otherClosed = closedCount >= 2;
     if (thumbAbove && open && bigEnough && orientedUp && otherClosed) {
       const openness = Math.max(
@@ -413,7 +413,7 @@ function classifyThumbsUp(landmarks) {
         0.3,
         Math.max(0, (axisCosToVertical - 0.82) * 1.6)
       );
-      const stillBoost = Math.min(0.2, Math.max(0, (0.06 - vel) * 3.0)); // vel small → boost
+      const stillBoost = Math.min(0.2, Math.max(0, (0.06 - vel) * 3.0)); // vel small ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ boost
       const s = Math.max(
         0,
         Math.min(1, 0.7 * openness + orientBoost + stillBoost)
@@ -579,7 +579,7 @@ function classifyOnPhone(lm, faces, canvasW, canvasH) {
       thumbTip = lm[MP.THUMB_TIP];
     if (!wrist || !iMcp || !thumbTip) return { ok: false };
 
-    // tiny/ghost hands → skip
+    // tiny/ghost hands ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ skip
     if (palmSpanLen(lm) < 0.02) return { ok: false };
 
     // Use nearest provided face (we pass the assigned one already)
@@ -645,7 +645,7 @@ function classifyOnPhone(lm, faces, canvasW, canvasH) {
     const dEarMin = Math.min(dEarW, dEarT, dEarM);
     const earProx = Math.max(0, 1 - Math.min(1.3, dEarMin)); // 0..1
 
-    // Orientation: accept wrist→index OR wrist→thumb as near-vertical
+    // Orientation: accept wristÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢index OR wristÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢thumb as near-vertical
     const vx1 = iMcp.x - wrist.x,
       vy1 = iMcp.y - wrist.y;
     const vlen1 = Math.hypot(vx1, vy1) || 1e-6;
@@ -676,7 +676,7 @@ function classifyOnPhone(lm, faces, canvasW, canvasH) {
       (closeM.side > 0.1 && closeM.y > 0.1);
 
     // Ear gate: require true near-ear proximity (distance normalized by face size)
-    // 0.62 ≈ within ~62% of face half-extent; tweak 0.58–0.68 if needed
+    // 0.62 ÃƒÂ¢Ã¢â‚¬Â°Ã‹â€  within ~62% of face half-extent; tweak 0.58ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“0.68 if needed
     const passEarStrict = dEarMin <= 0.62;
 
     // Final OK (ear distance is mandatory; band is supportive only)
@@ -689,7 +689,7 @@ function classifyOnPhone(lm, faces, canvasW, canvasH) {
 
     if (!ok) return { ok: false };
 
-    // Fast path: very close to ear + upright-ish → snap
+    // Fast path: very close to ear + upright-ish ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ snap
     if (dEarMin <= 0.48 && cosToVertical > 0.5 && vel <= 0.12) {
       const sFast = Math.min(
         1,
@@ -713,7 +713,7 @@ function classifyOnPhone(lm, faces, canvasW, canvasH) {
       1,
       0.3 * closenessSide +
       0.18 * closenessY +
-      0.4 * earProx + // ← heavier ear weight
+      0.4 * earProx + // ÃƒÂ¢Ã¢â‚¬Â Ã‚Â heavier ear weight
       0.08 * Math.max(0, (cosToVertical - 0.5) * 2.0) +
       0.04 * Math.max(0, 0.22 - wa.amp) + // stillness
       multiPointBonus
@@ -786,7 +786,7 @@ function classifyScissors(lm) {
 }
 
 // --- Gesture stabilizer (wave-first, anti-flicker) ---
-const WAVE_BOOT_MS = 300; // after startup/change, allow wave to “claim” quickly
+const WAVE_BOOT_MS = 300; // after startup/change, allow wave to ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œclaimÃƒÂ¢Ã¢â€šÂ¬Ã‚Â quickly
 const WAVE_GRACE_MS = 550; // how long wave is allowed to win ties/near-ties
 const CHANGE_COOLDOWN_MS = 520; // prevent rapid flip-flops after we lock something
 
@@ -803,7 +803,7 @@ const GESTURE_PRIORITY = [
 ];
 const VOTE_WINDOW = 5; // keep last ~6 frames
 const VOTE_MAX_AGE_MS = 700; // ignore old entries
-const REQUIRE_CONSISTENT = 2; // ≥3 agreeing frames
+const REQUIRE_CONSISTENT = 2; // ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¥3 agreeing frames
 const CLEAR_IF_IDLE_MS = 450; // drop stale gesture after this
 const MIN_SCORE = {
   wave: 0.4,
@@ -822,7 +822,7 @@ function pickStableGesture(now, win, prevStable) {
     .filter((e) => e && now - e.t <= VOTE_MAX_AGE_MS)
     .slice(-VOTE_WINDOW);
 
-  // Nothing new → keep previous a short while, then clear
+  // Nothing new ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ keep previous a short while, then clear
   if (!fresh.length) {
     if (prevStable && now - prevStable.t < CLEAR_IF_IDLE_MS) return prevStable;
     return null;
@@ -846,13 +846,13 @@ function pickStableGesture(now, win, prevStable) {
     byType.set(e.type, rec);
   }
 
-  // Still nothing above thresholds → maybe hold old one briefly
+  // Still nothing above thresholds ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ maybe hold old one briefly
   if (!byType.size) {
     if (prevStable && now - prevStable.t < CLEAR_IF_IDLE_MS) return prevStable;
     return null;
   }
 
-  // 3) Pick best: highest count → priority (wave first) → avg score
+  // 3) Pick best: highest count ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ priority (wave first) ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ avg score
   let best = null;
   for (const [type, stats] of byType.entries()) {
     const cand = {
@@ -908,7 +908,7 @@ function pickStableGesture(now, win, prevStable) {
     }
   }
 
-  // 5) Require some consistency (≥ N frames or ≥60% of fresh window)
+  // 5) Require some consistency (ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¥ N frames or ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¥60% of fresh window)
   const bestScoreVal = byType.get(best.type)?.best ?? 0;
   const strong =
     (bestScoreVal >= 0.68 && best.count >= 2) ||
@@ -927,7 +927,7 @@ function pickStableGesture(now, win, prevStable) {
       : null;
   }
 
-  // 6) Anti-flicker: if we’d switch types too soon, keep the previous briefly
+  // 6) Anti-flicker: if weÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢d switch types too soon, keep the previous briefly
   if (prevStable && prevStable.type !== best.type) {
     if (now - prevStable.t < CHANGE_COOLDOWN_MS) {
       return prevStable;
@@ -955,12 +955,12 @@ function mouthMAR(landmarks68) {
       return Math.hypot(pa.x - pb.x, pa.y - pb.y);
     };
 
-    // Inner mouth: 60–67. Vertical = avg(61–67, 62–66, 63–65), Horizontal = 60–64
+    // Inner mouth: 60ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“67. Vertical = avg(61ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“67, 62ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“66, 63ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“65), Horizontal = 60ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“64
     const V = (dist(61, 67) + dist(62, 66) + dist(63, 65)) / 3;
     const H = dist(60, 64) || 1e-6;
     const mar = V / H;
 
-    // Typical closed MAR ≈ 0.25–0.35. Map to 0..1 for UI.
+    // Typical closed MAR ÃƒÂ¢Ã¢â‚¬Â°Ã‹â€  0.25ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“0.35. Map to 0..1 for UI.
     // Shift + scale, then clamp.
     const norm = Math.max(0, Math.min(1, (mar - 0.3) * 3.0)); // tweak 0.30 & 3.0 to taste
     return norm;
@@ -1022,7 +1022,7 @@ function b64ToU8(b64) {
   return out;
 }
 
-/* ====================== AUDIO CHUNK PLAYER (server → client) ====================== */
+/* ====================== AUDIO CHUNK PLAYER (server ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ client) ====================== */
 class ChunkAudioPlayer {
   constructor({ onStart, onEnd } = {}) {
     this.queue = [];
@@ -1107,7 +1107,7 @@ function ElevenLabsSettings() {
         id="elevenlabs-api-key-input"
         className="input bigpad"
         type="password"
-        placeholder="sk-…"
+        placeholder="sk-ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"
         value={apiKey}
         onChange={(e) => setApiKey(e.target.value)}
         autoComplete="off"
@@ -1185,7 +1185,7 @@ export default function App() {
     } catch { }
   }, [serverUrl]);
 
-  // Pick up ?server=… from query string once
+  // Pick up ?server=ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ from query string once
   useEffect(() => {
     try {
       const u = new URLSearchParams(window.location.search).get("server");
@@ -1204,6 +1204,15 @@ export default function App() {
     boundDeviceId: null,
     ai_speaking: false,
   });
+  const serverInfoRef = useRef(serverInfo);
+  useEffect(() => {
+    serverInfoRef.current = serverInfo;
+  }, [serverInfo]);
+  const [ueConnected, setUeConnected] = useState(false);
+  const ueConnectedRef = useRef(false);
+  useEffect(() => {
+    ueConnectedRef.current = ueConnected;
+  }, [ueConnected]);
 
   const [posts, setPosts] = useState({ start: 0, snapshot: 0, stop: 0 });
   const [lastSent, setLastSent] = useState({
@@ -1234,7 +1243,6 @@ export default function App() {
   const lastLmSeenTsRef = useRef(0); // added: when we last saw landmarks
   const handsFailRef = useRef(0); // added: consecutive VIDEO misses
   const lastCrowdStatSentRef = useRef(0); // throttle for SendWebsockCommandToServer
-  const lastIdCrowdSentRef = useRef(''); // per-id throttles
 
   // downscale buffer for hands
   const handsOffscreenRef = useRef(null);
@@ -1260,16 +1268,28 @@ export default function App() {
     localStorage.getItem("ika:locationLabel") || "Jakarta (Bundaran HI)"
   );
   const [weatherLabel, setWeatherLabel] = useState(
-    localStorage.getItem("ika:weatherLabel") || "Clear 28°C"
+    localStorage.getItem("ika:weatherLabel") || "Clear 28Ãƒâ€šÃ‚Â°C"
   );
   const [clock, setClock] = useState(() => new Date());
   useEffect(() => {
     const t = setInterval(() => setClock(new Date()), 1000);
     return () => clearInterval(t);
   }, []);
+  const clockRef = useRef(clock);
+  useEffect(() => {
+    clockRef.current = clock;
+  }, [clock]);
+  const locationRef = useRef(locationLabel);
+  useEffect(() => {
+    locationRef.current = locationLabel;
+  }, [locationLabel]);
+  const weatherRef = useRef(weatherLabel);
+  useEffect(() => {
+    weatherRef.current = weatherLabel;
+  }, [weatherLabel]);
 
   // device identity
-  const [deviceId] = useState(() => {
+  const [deviceId, setDeviceId] = useState(() => {
     try {
       const k = "ika:deviceId";
       let v = localStorage.getItem(k);
@@ -1282,6 +1302,13 @@ export default function App() {
       return uuid();
     }
   });
+  const [deviceIdDraft, setDeviceIdDraft] = useState("");
+  useEffect(() => {
+    setDeviceIdDraft(deviceId);
+    try {
+      localStorage.setItem("ika:deviceId", deviceId);
+    } catch {}
+  }, [deviceId]);
 
   const exportSettings = async () => {
     try {
@@ -1343,6 +1370,16 @@ export default function App() {
     );
     input.click();
   };
+
+  const applyDeviceId = useCallback(() => {
+    const next = (deviceIdDraft || "").trim();
+    if (!next || next === deviceId) return;
+    setDeviceId(next);
+  }, [deviceIdDraft, deviceId]);
+
+  const randomizeDeviceId = useCallback(() => {
+    setDeviceId(uuid());
+  }, []);
 
   const resetSettings = () => {
     if (!confirm("Reset all saved settings?")) return;
@@ -1734,19 +1771,39 @@ export default function App() {
       setServerInfo((s) => ({ ...s, connected: true }));
 
       wsSocket.current = wsSockObj;
-      wsIsConnected.current = (wsSockObj.readyState === WebSocket.OPEN);
+      wsIsConnected.current = wsSockObj.readyState === WebSocket.OPEN;
     };
 
     wsSockObj.onmessage = function (evt) {
 
-      const jsonObj = JSON.parse(evt.data);
-      console.log("[websocket] message received", jsonObj);
+      try {
+        const jsonObj = JSON.parse(evt.data);
+        console.log("[websocket] message received", jsonObj);
 
-      if (jsonObj != null && jsonObj.hasOwnProperty("ClassName") && jsonObj.ClassName === "SessionData") {
-        let sessData = Object.assign(new SessionData(), jsonObj);
-        setSessionStatus("ACTIVE");
-        //setSessionId(sessData?.MachineId || sessionId || uuid());
-        setMachineId(sessData?.MachineId || uuid());
+        if (jsonObj?.ClassName === "SessionData") {
+          const sessData = Object.assign(new SessionData(), jsonObj);
+          setSessionStatus("ACTIVE");
+          setMachineId(sessData?.MachineId || uuid());
+        } else if (jsonObj?.ClassName === "SessionPresence") {
+          const ueCount =
+            jsonObj.UnrealCount ??
+            jsonObj.UECount ??
+            jsonObj.unrealCount ??
+            0;
+          const webCount =
+            jsonObj.WebCount ??
+            jsonObj.webCount ??
+            jsonObj.WebClients ??
+            serverInfoRef.current.webClients;
+          setUeConnected(ueCount > 0);
+          setServerInfo((state) => ({
+            ...state,
+            ueClients: ueCount,
+            webClients: webCount ?? state.webClients,
+          }));
+        }
+      } catch (err) {
+        console.warn("[websocket] failed to parse message", err);
       }
     };
 
@@ -1757,7 +1814,8 @@ export default function App() {
 
     wsSockObj.onclose = function () {
       setServerInfo((s) => ({ ...s, connected: false }));
-
+      wsIsConnected.current = false;
+      setUeConnected(false);
     };
 
   }
@@ -1777,20 +1835,20 @@ export default function App() {
       connectWebSocket(serverUrl + "/ws", wsSocket.current);
     }
 
-    const customSendData = {
-      MachineId: deviceId,
-      Platform: "web",
-      Custom: inputData ?? {},
+    const payload = {
+      messageType: t,
+      timestamp: new Date().toISOString(),
+      data: {
+        machineId: deviceId,
+        platform: 0,
+        customJsonStringData: inputData ?? {},
+      },
     };
 
-    console.log("[websocket] sending command", t, customSendData);
+    console.log("[websocket] sending command", t, payload.data);
 
     wsSocket.current?.send(
-      JSON.stringify({
-        MessageType: t,
-        TimeStamp: new Date().toISOString(),
-        Data: customSendData,
-      })
+      JSON.stringify(payload)
     );
   }
 
@@ -2014,7 +2072,7 @@ export default function App() {
   const [showAlign, setShowAlign] = useState(
     localStorage.getItem("ika:showAlign") !== "false"
   );
-  const calibMsgRef = useRef(""); // transient overlay message ("3…2…1", "Calibrating…")
+  const calibMsgRef = useRef(""); // transient overlay message ("3ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦2ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦1", "CalibratingÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦")
   const showAlignRef = useRef(true);
   useEffect(() => {
     showAlignRef.current = showAlign;
@@ -2096,6 +2154,73 @@ export default function App() {
     topSince: 0,
   });
 
+  const buildVisitContext = useCallback(
+    (extra = {}) => {
+      const now = clockRef.current || new Date();
+      return {
+        iso: now.toISOString(),
+        dayName: now.toLocaleDateString("id-ID", { weekday: "long" }),
+        dateLabel: now.toLocaleDateString("id-ID", {
+          day: "numeric",
+          month: "long",
+          year: "numeric",
+        }),
+        timeLabel: now.toLocaleTimeString("id-ID", {
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: true,
+        }),
+        time24: now.toLocaleTimeString("id-ID", {
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false,
+        }),
+        location: locationRef.current,
+        weather: weatherRef.current,
+        totals: totalsRef.current,
+        ...extra,
+      };
+    },
+    []
+  );
+
+  const sendPeopleIntent = useCallback(
+    (intent, person, extra = {}) => {
+      if (!wsIsConnected.current || !ueConnectedRef.current) return;
+
+      const payload = {
+        intent,
+        zone: person.zone,
+        name: person.name || null,
+        gid: person.gid || null,
+        gender: person.gender || null,
+        ageGroup: person.ageGroup || null,
+        emotion: person.emotion || null,
+        yawDeg:
+          Number.isFinite(person.yawDeg) && person.yawDeg != null
+            ? +Number(person.yawDeg).toFixed(2)
+            : null,
+        pitchDeg:
+          Number.isFinite(person.pitchDeg) && person.pitchDeg != null
+            ? +Number(person.pitchDeg).toFixed(2)
+            : null,
+        mouthActivity:
+          Number.isFinite(person.mouthActivity) && person.mouthActivity != null
+            ? +Number(person.mouthActivity).toFixed(3)
+            : null,
+        posCam: person.posCam || null,
+        stableKey: person.stableKey || null,
+        slotKey: person.slotKey || null,
+        group: extra.group || null,
+        reason: extra.reason || null,
+        context: buildVisitContext(extra.context || {}),
+      };
+
+      SendWebsockCommandToServer(MSG_TYPE.PeopleData, payload);
+    },
+    [buildVisitContext]
+  );
+
   const lastCrowdSendRef = useRef({ t: 0, sig: "" });
   function emitCrowdThrottled(payload) {
     const now = performance.now();
@@ -2112,7 +2237,10 @@ export default function App() {
     try {
       //server.crowdStatus(payload);
       console.log("[websocket] sending crowd status", payload);
-      SendWebsockCommandToServer(MSG_TYPE.CrowdStat, payload);
+      SendWebsockCommandToServer(MSG_TYPE.CrowdStat, {
+        ...payload,
+        context: buildVisitContext(),
+      });
     } catch { }
     lastCrowdSendRef.current = { t: now, sig };
   }
@@ -2206,6 +2334,10 @@ export default function App() {
     }))
   );
   const [totals, setTotals] = useState({ all: 0, green: 0, red: 0 });
+  const totalsRef = useRef(totals);
+  useEffect(() => {
+    totalsRef.current = totals;
+  }, [totals]);
   const recentMapRef = useRef({});
   const S = useRef({
     id: null,
@@ -2680,7 +2812,7 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  // visibility → stop
+  // visibility ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ stop
   useEffect(() => {
     const onVisibility = () => {
       if (document.hidden && !keepBgOnRef.current) {
@@ -2688,7 +2820,7 @@ export default function App() {
       }
     };
     const onPageHide = () => {
-      // Page is actually leaving (navigate/close) → always stop
+      // Page is actually leaving (navigate/close) ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ always stop
       stopAll({ reason: "pagehide" });
     };
     const onBeforeUnload = () => {
@@ -2801,7 +2933,7 @@ export default function App() {
       const v = videoRef.current;
       v.srcObject = stream;
 
-      // make sure it’s allowed to autoplay on mobile/Safari
+      // make sure itÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢s allowed to autoplay on mobile/Safari
       v.muted = true;
       v.playsInline = true;
       v.autoplay = true;
@@ -2838,7 +2970,7 @@ export default function App() {
     const canvas = canvasRef.current;
     if (!video || !canvas || !video.videoWidth) return;
 
-    calibMsgRef.current = "Stand still… Calibrating";
+    calibMsgRef.current = "Stand stillÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ Calibrating";
     const W = canvas.width,
       H = canvas.height;
     const samples = [];
@@ -2902,7 +3034,7 @@ export default function App() {
     const fovV = 2 * Math.atan(H / 2 / fy) * RAD;
     setFovVdeg(+fovV.toFixed(1));
 
-    // Zero offsets so centered person yields yaw≈0, pitch≈0
+    // Zero offsets so centered person yields yawÃƒÂ¢Ã¢â‚¬Â°Ã‹â€ 0, pitchÃƒÂ¢Ã¢â‚¬Â°Ã‹â€ 0
     setPanOffsetDeg((p) => p - yawMed);
     setTiltOffsetDeg((t) => t - pitchMed);
   }
@@ -2910,12 +3042,12 @@ export default function App() {
   async function runCalCountdown() {
     // Cute 3-2-1 banner in the overlay
     for (const n of [3, 2, 1]) {
-      calibMsgRef.current = `Calibration in ${n}… Stand on the ${calibDistanceM.toFixed(
+      calibMsgRef.current = `Calibration in ${n}ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ Stand on the ${calibDistanceM.toFixed(
         2
       )} m mark`;
       await sleep(500);
     }
-    calibMsgRef.current = "Calibrating…";
+    calibMsgRef.current = "CalibratingÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦";
     await calibrateCameraOneClick();
     calibMsgRef.current = "Done!";
     await sleep(600);
@@ -3025,7 +3157,7 @@ export default function App() {
           ctx.stroke();
           ctx.restore();
 
-          // transient banner (countdown / "Calibrating…")
+          // transient banner (countdown / "CalibratingÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦")
           if (calibMsgRef.current) {
             const msg = calibMsgRef.current;
             ctx.save();
@@ -3233,7 +3365,7 @@ export default function App() {
           ctx.lineWidth = BOX_LINE_WIDTH;
           ctx.strokeRect(dbox.x, dbox.y, dbox.width, dbox.height);
 
-          // Per-face gesture label (no global fallback → true separation)
+          // Per-face gesture label (no global fallback ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ true separation)
           const faceStable = perFaceStableRef.current.get(stableKey);
           const freshFaceGesture =
             gestureAllowedKeys.has(stableKey) &&
@@ -3250,11 +3382,11 @@ export default function App() {
           const ageTxt = Number.isFinite(ageVal)
             ? Math.max(0, Math.round(ageVal))
             : "-";
-          const l1 = `${displayName}${gestureLbl ? " • " + gestureLbl : ""
-            } • ${zone} • ${ageTxt} ${gender} • ${expr}`;
-          const l2 = `yaw ${yawDeg.toFixed(1)}° · pitch ${pitchDeg.toFixed(
+          const l1 = `${displayName}${gestureLbl ? " ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢ " + gestureLbl : ""
+            } ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢ ${zone} ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢ ${ageTxt} ${gender} ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢ ${expr}`;
+          const l2 = `yaw ${yawDeg.toFixed(1)}Ãƒâ€šÃ‚Â° Ãƒâ€šÃ‚Â· pitch ${pitchDeg.toFixed(
             1
-          )}° · mouth ${mouthActivity.toFixed(2)}`;
+          )}Ãƒâ€šÃ‚Â° Ãƒâ€šÃ‚Â· mouth ${mouthActivity.toFixed(2)}`;
 
           // ----- LABEL DRAW (fixed: define color; removed duplicate vars/badges) -----
           const color =
@@ -3374,41 +3506,12 @@ export default function App() {
           gestureEligible: gestureAllowedKeys.has(p.stableKey),
           z: p.posCam?.z ?? null, // NEW: carry depth
         }));
-
-        //#region Send crowd stats to server
-        // Throttle to send only once every 500ms
-        //console.log("now is:", now);
-        const ms = 5000;
-        let doOnce = true;
-        let trackedName = trackedFacesRef.current.at(0)?.name || trackedFacesRef.current.at(0)?.gid;
-
-        if(trackedName !== undefined && trackedName !== null) 
-        {
-          if(lastIdCrowdSentRef.current !== trackedName) 
-          {
-            doOnce = true;
-          }
-          else{
-            doOnce = false;
-          }
-
-          if (doOnce) {
-            doOnce = false;
-
-            let jsonData = {
-              id : trackedName,
-              timestamp: new Date().toISOString(),
-            }
-
-            console.log("Sending crowd stat for id:", trackedName);
-            let id = trackedName;
-            SendWebsockCommandToServer(MSG_TYPE.CrowdStat, JSON.stringify(jsonData));
-            lastIdCrowdSentRef.current = id;
-          }
-        }
-
-       
-        //#endregion
+        const guestSnapshots = peopleForPost.map((p) => ({
+          name: p.name || null,
+          zone: p.zone,
+          gender: p.gender || null,
+          ageGroup: p.ageGroup || null,
+        }));
 
         // Also expose ALL faces (GREEN + RED) for hand proximity (on_phone)
         allFacesRef.current = candidates.map((c) => {
@@ -3443,7 +3546,7 @@ export default function App() {
             ctx.strokeRect(dbox.x, dbox.y, dbox.width, dbox.height);
 
             // Minimal label: zone + distance
-            const l1 = `${zone} · ${dist ? dist.toFixed(2) + " m" : "-"}`;
+            const l1 = `${zone} Ãƒâ€šÃ‚Â· ${dist ? dist.toFixed(2) + " m" : "-"}`;
             const lineH = 18;
             const tw = ctx.measureText(l1).width + LABEL_PAD_X * 2;
             const th = lineH + LABEL_PAD_Y * 2;
@@ -3659,9 +3762,9 @@ export default function App() {
               const facesAll = trackedFacesRef.current || [];
               const faces = facesAll.filter((f) => f.gestureEligible);
               if (!faces.length) {
-                // No eligible faces this tick → keep per-face state; just update global/fallback below
+                // No eligible faces this tick ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ keep per-face state; just update global/fallback below
               } else {
-                // 1) Build hand→face candidate pairs (eligible faces only)
+                // 1) Build handÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢face candidate pairs (eligible faces only)
                 const hands = handsList
                   .map((lm, hi) => {
                     const a = handAnchor(lm);
@@ -3705,7 +3808,7 @@ export default function App() {
                   // final fallback: always assign (handles hands far from faces)
                   if (!contenders.length) {
                     if (faces.length === 1) {
-                      // single eligible face → give it the hand
+                      // single eligible face ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ give it the hand
                       contenders = [faces[0]];
                     } else if (faces.length === 2) {
                       // 2 faces: split by midline (stable left/right assignment)
@@ -3756,7 +3859,7 @@ export default function App() {
                   arr.sort((a, b) => a.d2 - b.d2);
                   const best = arr[0];
                   const second = arr[1];
-                  // size-scaled near-tie (don’t drop unless truly ambiguous)
+                  // size-scaled near-tie (donÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢t drop unless truly ambiguous)
                   const wRef = second
                     ? Math.max(best.face.w || 1, second.face.w || 1)
                     : 1;
@@ -3854,7 +3957,7 @@ export default function App() {
                   const axisLen = Math.hypot(vx, vy) || 1e-6;
                   const cosToVertical = Math.abs(vy) / axisLen; // 1 = vertical, 0 = horizontal
 
-                  // Face-relative proximity for “pose” gestures (prevents random pops)
+                  // Face-relative proximity for ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œposeÃƒÂ¢Ã¢â€šÂ¬Ã‚Â gestures (prevents random pops)
                   let allowNearFace = false,
                     nearX = false,
                     highPalm = false;
@@ -4156,6 +4259,7 @@ export default function App() {
             // group context
             const groupSize = allIdentities.length;
             const hasKid = allIdentities.some((p) => p.ageGroup === "child");
+            const groupInfo = { size: groupSize, hasKid };
 
             // transitions
             const isOnPhone = stableGestureRef.current?.type === "on_phone";
@@ -4176,29 +4280,16 @@ export default function App() {
                   s.tries += 1;
                   s.last = now;
                   callOverStateRef.current.set(p.key, s);
-                  socketRef.current?.emit?.("policy_event", {
-                    deviceId,
-                    sessionId: sessionId || "web-" + deviceId,
-                    type: "call_over",
-                    attempt: s.tries,
-                    target: {
-                      name: p.name || null,
-                      gid: p.gid || null,
-                      gender: p.gender || null,
-                    },
-                    group: { size: groupSize, hasKid },
+                  sendPeopleIntent("call_over", p, {
+                    group: groupInfo,
                     reason: "left_green_zone",
-                    at: Date.now(),
+                    context: { guests: guestSnapshots, attempt: s.tries },
                   });
                 }
               }
 
               // red/unknown -> green => greet (reset tries)
-              if (
-                !isOnPhone &&
-                (prevZ === "red" || prevZ == null) &&
-                p.zone === "green"
-              ) {
+                            if (!isOnPhone && (prevZ === "red" || prevZ == null) && p.zone === "green") {
                 callOverStateRef.current.delete(p.key);
                 const address = p.name
                   ? p.name
@@ -4209,20 +4300,11 @@ export default function App() {
                     : p.gender === "male"
                       ? "sir"
                       : p.gender === "female"
-                        ? "ma’am"
+                        ? "ma'am"
                         : "there";
-                socketRef.current?.emit?.("policy_event", {
-                  deviceId,
-                  sessionId: sessionId || "web-" + deviceId,
-                  type: "greet",
-                  address,
-                  target: {
-                    name: p.name || null,
-                    gid: p.gid || null,
-                    gender: p.gender || null,
-                  },
-                  group: { size: groupSize, hasKid },
-                  at: Date.now(),
+                sendPeopleIntent("greet", p, {
+                  group: { ...groupInfo, address },
+                  context: { guests: guestSnapshots },
                 });
               }
             }
@@ -4254,7 +4336,7 @@ export default function App() {
             lastGroupSetRef.current = curSet;
           } catch { }
 
-          // ---- Speaker focus (1–2s or 3 frames dominance among green tracked) ----
+          // ---- Speaker focus (1ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“2s or 3 frames dominance among green tracked) ----
           try {
             const list = peopleForPost || [];
             if (list.length) {
@@ -4443,7 +4525,7 @@ export default function App() {
 
   const GEMINI_VOICES = { live: LIVE_VOICES, native: NATIVE_VOICES };
 
-  // Language options (label → code)
+  // Language options (label ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ code)
   const LANGS = [
     ["English (US)", "en-US"],
     ["English (UK)", "en-GB"],
@@ -4533,8 +4615,8 @@ export default function App() {
   }, [gameModeOn]);
 
   // Game mode idle/visibility timeouts (ephemeral)
-  const GM_IDLE_TIMEOUT_MS = 90_000; // 1.5 min without activity → exit RPS
-  const GM_NO_FACE_TIMEOUT_MS = 20_000; // 20s with no faces → exit RPS
+  const GM_IDLE_TIMEOUT_MS = 90_000; // 1.5 min without activity ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ exit RPS
+  const GM_NO_FACE_TIMEOUT_MS = 20_000; // 20s with no faces ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ exit RPS
   const lastGameActivityRef = useRef(0);
   useEffect(() => {
     if (gameModeOn) lastGameActivityRef.current = performance.now();
@@ -4602,7 +4684,7 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [modelKind]);
 
-  // apply quick settings → create (or recreate) session
+  // apply quick settings ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ create (or recreate) session
   const onCreateSession = useCallback(() => {
     server.createSession({
       model: modelQuick,
@@ -4622,7 +4704,7 @@ export default function App() {
       transcribe_user_audio: true,
       files_to_upload: null,
 
-      // ✅ ElevenLabs-only fields (used iff tts_provider === "elevenlabs")
+      // ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ ElevenLabs-only fields (used iff tts_provider === "elevenlabs")
       eleven_model:
         localStorage.getItem("ika:11labs:model") || "eleven_turbo_v2_5",
       eleven_voice_id: localStorage.getItem("ika:11labs:voiceId") || "",
@@ -4684,7 +4766,7 @@ export default function App() {
             {/* CAMERA / STATUS (compact, grouped) */}
             <div className="panel compact">
               <div className="statgrid">
-                {/* ——— Section: Environment ——— */}
+                {/* ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â Section: Environment ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â */}
                 <div className="block">
                   <div className="block-title">Environment</div>
                   <div className="kv">
@@ -4700,11 +4782,11 @@ export default function App() {
                     <b>Backend:</b> {backend}
                   </div>
                   <div className="kv">
-                    <b>Models:</b> {ready ? "loaded" : "loading…"}
+                    <b>Models:</b> {ready ? "loaded" : "loadingÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"}
                   </div>
                 </div>
 
-                {/* ——— Section: Live status ——— */}
+                {/* ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â Section: Live status ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â */}
                 <div className="block">
                   <div className="block-title">Live status</div>
 
@@ -4729,30 +4811,35 @@ export default function App() {
                     <b>Server:</b>&nbsp;
                     {serverInfo.connected ? "connected" : "disconnected"}
                   </div>
+                  <div className="kv">
+                    <span className={`dot ${ueConnected ? "ok" : "err"}`} />
+                    <b>UE link:</b>&nbsp;
+                    {ueConnected ? "connected" : "waiting"}
+                  </div>
                   {serverInfo.model || serverInfo.tts ? (
                     <div className="kv muted small">
                       {serverInfo.model ? <>Model: {serverInfo.model}</> : null}
-                      {serverInfo.model && serverInfo.tts ? " · " : null}
+                      {serverInfo.model && serverInfo.tts ? " Ãƒâ€šÃ‚Â· " : null}
                       {serverInfo.tts ? <>TTS: {serverInfo.tts}</> : null}
                     </div>
                   ) : null}
 
                   {/* Device binding */}
                   <div className="kv">
-                    <b>Device:</b>&nbsp;{deviceId.slice(0, 8)}…
+                    <b>Device:</b>&nbsp;{deviceId.slice(0, 8)}ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦
                     <span className="muted">
                       &nbsp;
                       {serverInfo.boundDeviceId
                         ? `(bound ${String(serverInfo.boundDeviceId).slice(
                             0,
                             8
-                          )}…)`
+                          )}ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦)`
                         : `(not bound)`}
                     </span>
                   </div>
                 </div>
 
-                {/* ——— Section: Traffic ——— */}
+                {/* ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â Section: Traffic ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â */}
                 <div className="block">
                   <div className="block-title">Traffic</div>
 
@@ -4857,10 +4944,41 @@ export default function App() {
                 </div>
                 <div className="help" style={{ marginTop: 6 }}>
                   Config:{" "}
-                  {serverUrl && serverUrl.trim() ? serverUrl : "(same-origin)"} ·
+                  {serverUrl && serverUrl.trim() ? serverUrl : "(same-origin)"} Ãƒâ€šÃ‚Â·
                   Effective: {effectiveUrl}
                   <br />
                   Status: {serverInfo.connected ? "connected" : "disconnected"}
+                </div>
+                <div
+                  className="row"
+                  style={{ gap: 8, marginTop: 12, alignItems: "center" }}
+                >
+                  <input
+                    className="input bigpad"
+                    placeholder="Device / session ID (match UE)"
+                    value={deviceIdDraft}
+                    onChange={(e) => setDeviceIdDraft(e.target.value)}
+                    autoCorrect="off"
+                    autoCapitalize="off"
+                    spellCheck={false}
+                  />
+                  <button
+                    className="btn"
+                    disabled={
+                      !deviceIdDraft.trim() ||
+                      deviceIdDraft.trim() === deviceId
+                    }
+                    onClick={applyDeviceId}
+                  >
+                    Apply device ID
+                  </button>
+                  <button className="btn" onClick={randomizeDeviceId}>
+                    New ID
+                  </button>
+                </div>
+                <div className="help" style={{ marginTop: 6 }}>
+                  Stored as <code>ika:deviceId</code>. Use the same value as the
+                  UE client to share a single session.
                 </div>
               </section>
 
@@ -4972,7 +5090,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* Row 2: DISTANCE CONTROLS — two neat panels */}
+          {/* Row 2: DISTANCE CONTROLS ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â two neat panels */}
           <div className="panel">
             {/* GREEN ZONE (interaction range) */}
             <div className="inline-controls">
@@ -5000,7 +5118,7 @@ export default function App() {
                   setGreenMaxM((v) => Math.max(0.3, +(v - 0.1).toFixed(2)))
                 }
               >
-                –0.1
+                ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“0.1
               </button>
               <button
                 className="btn"
@@ -5038,7 +5156,7 @@ export default function App() {
                   setRedCutoffM((v) => Math.max(1.0, +(v - 0.1).toFixed(1)))
                 }
               >
-                –0.1
+                ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“0.1
               </button>
               <button
                 className="btn"
@@ -5113,13 +5231,13 @@ export default function App() {
             </button>
           </div>
 
-          {/* Camera settings — now directly under the camera */}
+          {/* Camera settings ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â now directly under the camera */}
           <div className="panel" style={{ marginTop: 10 }}>
             <h3 className="section-title" style={{ marginTop: 0 }}>
               camera alignment
             </h3>
 
-            <label className="label">Horizontal FOV (°)</label>
+            <label className="label">Horizontal FOV (Ãƒâ€šÃ‚Â°)</label>
             <input
               className="range"
               type="range"
@@ -5129,9 +5247,9 @@ export default function App() {
               value={fovHdeg}
               onChange={(e) => setFovHdeg(Number(e.target.value))}
             />
-            <div className="help">{Math.round(fovHdeg)}°</div>
+            <div className="help">{Math.round(fovHdeg)}Ãƒâ€šÃ‚Â°</div>
 
-            <label className="label">Vertical FOV (°)</label>
+            <label className="label">Vertical FOV (Ãƒâ€šÃ‚Â°)</label>
             <input
               className="range"
               type="range"
@@ -5141,11 +5259,11 @@ export default function App() {
               value={fovVdeg}
               onChange={(e) => setFovVdeg(Number(e.target.value))}
             />
-            <div className="help">{Math.round(fovVdeg)}°</div>
+            <div className="help">{Math.round(fovVdeg)}Ãƒâ€šÃ‚Â°</div>
 
             <div className="row" style={{ gap: 16 }}>
               <div className="flex1">
-                <label className="label">Pan offset (°)</label>
+                <label className="label">Pan offset (Ãƒâ€šÃ‚Â°)</label>
                 <input
                   className="range"
                   type="range"
@@ -5155,10 +5273,10 @@ export default function App() {
                   value={panOffsetDeg}
                   onChange={(e) => setPanOffsetDeg(Number(e.target.value))}
                 />
-                <div className="help">{panOffsetDeg.toFixed(1)}°</div>
+                <div className="help">{panOffsetDeg.toFixed(1)}Ãƒâ€šÃ‚Â°</div>
               </div>
               <div className="flex1">
-                <label className="label">Tilt offset (°)</label>
+                <label className="label">Tilt offset (Ãƒâ€šÃ‚Â°)</label>
                 <input
                   className="range"
                   type="range"
@@ -5168,7 +5286,7 @@ export default function App() {
                   value={tiltOffsetDeg}
                   onChange={(e) => setTiltOffsetDeg(Number(e.target.value))}
                 />
-                <div className="help">{tiltOffsetDeg.toFixed(1)}°</div>
+                <div className="help">{tiltOffsetDeg.toFixed(1)}Ãƒâ€šÃ‚Â°</div>
               </div>
             </div>
 
@@ -5275,3 +5393,12 @@ export default function App() {
     </main>
   );
 }
+
+
+
+
+
+
+
+
+

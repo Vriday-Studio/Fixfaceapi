@@ -1230,7 +1230,7 @@ export default function App() {
   const ageGenderCacheRef = useRef(new Map()); // key -> { age, gender }
 
   const [locationLabel, setLocationLabel] = useState(
-    localStorage.getItem("ika:locationLabel") || "Jakarta (Bundaran HI)"
+    localStorage.getItem("ika:locationLabel") || "Galeri Indonesia Kaya"
   );
   const [weatherLabel, setWeatherLabel] = useState(
     localStorage.getItem("ika:weatherLabel") || "Clear 28°C"

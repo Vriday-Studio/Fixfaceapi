@@ -1269,10 +1269,14 @@ export default function App() {
   // NEW: per-face wave histories (used by wave/velocity gates)
   const waveHistByFaceRef = useRef(new Map());
 
+  // NEW: pending greets map (retry when age/gender available)
+  const pendingGreetsRef = useRef(new Map()); // Map<personKey, { zone, timestamp }>
+
   // --- age/gender stagger + cache ---
   const AGE_SAMPLE_MS = 600;
   const lastAgeSampleRef = useRef(0);
   const ageGenderCacheRef = useRef(new Map()); // key -> { age, gender }
+  const greenEntryRef = useRef(new Map()); // key -> timestamp when entered green zone
 
   const [locationLabel, setLocationLabel] = useState(
     localStorage.getItem("ika:locationLabel") || "Galeri Indonesia Kaya"
@@ -2208,6 +2212,20 @@ export default function App() {
       if (!wsIsConnected.current) {
         console.log("[DEBUG sendPeopleIntent] BLOCKED: WebSocket not connected");
         return;
+      }
+
+      // For greeting, only send PeopleData once we have at least
+      // gender or ageGroup so the backend can build a rich context.
+      if (intent === "greet") {
+        const hasGender = !!person.gender;
+        const hasAgeGroup = !!person.ageGroup;
+        if (!hasGender && !hasAgeGroup) {
+          console.log(
+            "[DEBUG sendPeopleIntent] SKIP greet PeopleData - missing gender/ageGroup for",
+            person.stableKey || person.gid || person.name
+          );
+          return;
+        }
       }
 
       const payload = {
@@ -4283,6 +4301,38 @@ export default function App() {
               const gender = (det.gender || "").toLowerCase();
               const age = Number(det.age);
               const ageGroup = ageGroupOf(age);
+
+              // Cache age/gender when available so we can use them
+              // even if greet/call_over fires a bit later.
+              if (Number.isFinite(age) || gender) {
+                ageGenderCacheRef.current.set(key, {
+                  age,
+                  gender,
+                });
+
+                // Retry pending greet if data becomes available
+                const pendingGreet = pendingGreetsRef.current.get(key);
+                if (pendingGreet && gender) {
+                  console.log(
+                    "[DEBUG Zone Transitions] Retrying pending greet for",
+                    key,
+                    "with gender:",
+                    gender
+                  );
+                  const cached = ageGenderCacheRef.current.get(key) || {};
+                  const retryPerson = {
+                    key,
+                    name: cached.name || key,
+                    gid: key,
+                    gender: cached.gender || gender,
+                    ageGroup: ageGroupOf(cached.age || age),
+                    zone: pendingGreet.zone
+                  };
+                  sendPeopleIntent("greet", retryPerson);
+                  pendingGreetsRef.current.delete(key);
+                }
+              }
+
               return { key, name, gid, gender, age, ageGroup, zone: c.zone };
             });
 
@@ -4327,7 +4377,36 @@ export default function App() {
               // red/unknown -> green => greet (reset tries)
               if (!isOnPhone && (prevZ === "red" || prevZ == null) && p.zone === "green") {
                 console.log(`[DEBUG Zone Transitions] TRIGGER: ${prevZ || 'unknown'}->green transition for ${p.key}`);
+
+                // Add short debounce so we wait before greeting
+                const entry = greenEntryRef.current.get(p.key) || { ts: now };
+                if (now - entry.ts < 700) {
+                  greenEntryRef.current.set(p.key, entry);
+                  console.log("[DEBUG Zone Transitions] Waiting before greet – just entered green zone for", p.key);
+                  continue;
+                }
+
+                // Ensure we have stable age/gender before greeting so backend
+                // can build a rich Catatan konteks (dewasa pria/wanita).
+                const cacheGA = ageGenderCacheRef.current.get(p.key) || {};
+                const effectiveGender = (p.gender || cacheGA.gender || "").toLowerCase();
+                const effectiveAgeGroup = p.ageGroup || ageGroupOf(cacheGA.age);
+
+                // If we still don't know gender at all, defer this greet and wait
+                // for the next stable detection frame (takes ~1–2s).
+                if (!effectiveGender) {
+                  console.log(
+                    "[DEBUG Zone Transitions] Defer greet – gender not ready yet for",
+                    p.key,
+                    "– will retry when data available"
+                  );
+                  pendingGreetsRef.current.set(p.key, { zone: p.zone, timestamp: now });
+                  continue;
+                }
+
+                // Reset call-over tries now that we're about to greet
                 callOverStateRef.current.delete(p.key);
+
                 const address = p.name
                   ? p.name
                   : groupSize > 1
@@ -4339,10 +4418,15 @@ export default function App() {
                       : p.gender === "female"
                         ? "ma'am"
                         : "there";
-                sendPeopleIntent("greet", p, {
+                
+                sendPeopleIntent("greet", { ...p, gender: effectiveGender, ageGroup: effectiveAgeGroup }, {
                   group: { ...groupInfo, address },
                   guests: guestSnapshots,
                 });
+
+                // Clear pending maps after success
+                greenEntryRef.current.delete(p.key);
+                pendingGreetsRef.current.delete(p.key);
               }
             }
 
@@ -4376,6 +4460,15 @@ export default function App() {
                 const lastSeen = rec.lastSeen || 0;
                 if (now - lastSeen > NOT_SEEN_RESET_MS) {
                   greetInviteRef.current.delete(k);
+                }
+              }
+            } catch { }
+
+            // cleanup pending greets for people who left
+            try {
+              for (const k of Array.from(pendingGreetsRef.current.keys())) {
+                if (!curSet.has(k)) {
+                  pendingGreetsRef.current.delete(k);
                 }
               }
             } catch { }

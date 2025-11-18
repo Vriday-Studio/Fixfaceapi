@@ -1271,6 +1271,7 @@ export default function App() {
 
   // NEW: pending greets map (retry when age/gender available)
   const pendingGreetsRef = useRef(new Map()); // Map<personKey, { zone, timestamp }>
+  const pushedGreets = useRef(new Set()); // prevent duplicate retry greets
 
   // --- age/gender stagger + cache ---
   const AGE_SAMPLE_MS = 600;
@@ -4313,23 +4314,28 @@ export default function App() {
                 // Retry pending greet if data becomes available
                 const pendingGreet = pendingGreetsRef.current.get(key);
                 if (pendingGreet && gender) {
-                  console.log(
-                    "[DEBUG Zone Transitions] Retrying pending greet for",
-                    key,
-                    "with gender:",
-                    gender
-                  );
-                  const cached = ageGenderCacheRef.current.get(key) || {};
-                  const retryPerson = {
-                    key,
-                    name: cached.name || key,
-                    gid: key,
-                    gender: cached.gender || gender,
-                    ageGroup: ageGroupOf(cached.age || age),
-                    zone: pendingGreet.zone
-                  };
-                  sendPeopleIntent("greet", retryPerson);
-                  pendingGreetsRef.current.delete(key);
+                  const cacheEntry = ageGenderCacheRef.current.get(key);
+                  const hasValidDemo =
+                    cacheEntry && (cacheEntry.gender || Number.isFinite(cacheEntry.age));
+                  if (pendingGreet && hasValidDemo && !pushedGreets.current.has(key)) {
+                    console.log(
+                      "[DEBUG Zone Transitions] Retrying pending greet for",
+                      key,
+                      "with valid demographics",
+                      cacheEntry
+                    );
+                    const retryPerson = {
+                      key,
+                      name: cacheEntry.name || key,
+                      gid: key,
+                      gender: cacheEntry.gender || gender,
+                      ageGroup: ageGroupOf(cacheEntry.age),
+                      zone: pendingGreet.zone,
+                    };
+                    sendPeopleIntent("greet", retryPerson);
+                    pushedGreets.current.add(key);
+                    pendingGreetsRef.current.delete(key);
+                  }
                 }
               }
 
@@ -4391,6 +4397,18 @@ export default function App() {
                 const cacheGA = ageGenderCacheRef.current.get(p.key) || {};
                 const effectiveGender = (p.gender || cacheGA.gender || "").toLowerCase();
                 const effectiveAgeGroup = p.ageGroup || ageGroupOf(cacheGA.age);
+
+                // Check that demographic data exist in cache before sending
+                const cacheReady = cacheGA && (cacheGA.gender || Number.isFinite(cacheGA.age));
+                if (!cacheReady) {
+                  console.log(
+                    "[DEBUG Zone Transitions] Gender/Age cache not ready yet for",
+                    p.key,
+                    "- waiting before greet"
+                  );
+                  pendingGreetsRef.current.set(p.key, { zone: p.zone, timestamp: now });
+                  continue;
+                }
 
                 // If we still don't know gender at all, defer this greet and wait
                 // for the next stable detection frame (takes ~1–2s).

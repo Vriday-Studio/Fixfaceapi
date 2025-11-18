@@ -1900,6 +1900,41 @@ export default function App() {
   }, [serverUrl]);
   //#endregion
 
+  // === Greet policy coordination via mic reopened event ===
+  useEffect(() => {
+    const ws = wsSocket.current;
+    if (!ws) return;
+    ws.addEventListener("message", (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        if (msg && (msg.Event === "MicOpened" || msg.Event === "MicOpenedAfterGreeting")) {
+          console.log("[PolicySync] Mic opened → initiating PeopleData sync for greet");
+          for (const [key, g] of pendingGreetsRef.current.entries()) {
+            const cached = ageGenderCacheRef.current.get(key);
+            if (cached?.gender) {
+              console.log("[PolicySync] Sending PeopleData for", key, {
+                gender: cached.gender,
+                age: cached.age,
+              });
+              sendPeopleIntent("greet", {
+                key,
+                gender: cached.gender,
+                ageGroup: ageGroupOf(cached.age),
+                zone: g.zone
+              });
+              pendingGreetsRef.current.delete(key);
+            }
+          }
+        }
+      } catch (err) {
+        // ignore parsing or unrelated events
+      }
+    });
+    return () => {
+      ws.removeEventListener?.("message", this);
+    };
+  }, []);
+
   // Auto-reconnect when network comes online or tab becomes visible (no camera impact)
   useEffect(() => {
     const onOnline = () => {
@@ -4437,14 +4472,18 @@ export default function App() {
                         ? "ma'am"
                         : "there";
                 
-                sendPeopleIntent("greet", { ...p, gender: effectiveGender, ageGroup: effectiveAgeGroup }, {
-                  group: { ...groupInfo, address },
-                  guests: guestSnapshots,
-                });
-
-                // Clear pending maps after success
-                greenEntryRef.current.delete(p.key);
-                pendingGreetsRef.current.delete(p.key);
+                // Delay sending PeopleData until after greeting has broadcasted to prevent race conditions
+                const GREET_POLICY_DELAY_MS = 2000; // 2s delay to align with greeting audio playback
+                setTimeout(() => {
+                  console.log("[DEBUG Zone Transitions] Delayed sendPeopleIntent triggered for", p.key);
+                  sendPeopleIntent("greet", { ...p, gender: effectiveGender, ageGroup: effectiveAgeGroup }, {
+                    group: { ...groupInfo, address },
+                    guests: guestSnapshots,
+                  });
+                  // Clear pending maps after success
+                  greenEntryRef.current.delete(p.key);
+                  pendingGreetsRef.current.delete(p.key);
+                }, GREET_POLICY_DELAY_MS);
               }
             }
 

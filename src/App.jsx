@@ -67,7 +67,8 @@ const USE_DIRECT_WEBSOCKET = true; // policy + session pipeline (always on)
 const FACING_YAW_MAX_DEG = 9; // how "straight on" horizontally
 const FACING_PITCH_MAX_DEG = 10; // how "straight on" vertically
 const ATTEND_MIN_FRAMES = 5; // require 3–5 consecutive frames
-const GREET_COOLDOWN_MS = 35_000;
+// Minimum time between greets for the same identity (per p.key)
+const GREET_COOLDOWN_MS = 15_000;
 
 // Hard cap per identity
 const MAX_INVITES_PER_PERSON = 3;
@@ -2239,12 +2240,13 @@ export default function App() {
         intent,
         wsConnected: wsIsConnected.current,
         person: {
+          key: person.key,
           name: person.name,
           gid: person.gid,
-          zone: person.zone
-        }
+          zone: person.zone,
+        },
       });
-      
+
       if (!wsIsConnected.current) {
         console.log("[DEBUG sendPeopleIntent] BLOCKED: WebSocket not connected");
         return;
@@ -2258,11 +2260,43 @@ export default function App() {
         if (!hasGender && !hasAgeGroup) {
           console.log(
             "[DEBUG sendPeopleIntent] SKIP greet PeopleData - missing gender/ageGroup for",
-            person.stableKey || person.gid || person.name
+            person.stableKey || person.key || person.gid || person.name
           );
           return;
         }
+
+        // Per-identity greet cooldown: allow a new greet for the same
+        // person key only if GREET_COOLDOWN_MS has elapsed.
+        const identityKey =
+          person.key || person.stableKey || person.gid || person.name || null;
+        if (identityKey) {
+          const nowMs = performance.now();
+          const rec =
+            greetInviteRef.current.get(identityKey) || {
+              count: 0,
+              last: 0,
+              lastSeen: 0,
+            };
+          const elapsed = nowMs - (rec.last || 0);
+          rec.lastSeen = nowMs;
+
+          if (elapsed < GREET_COOLDOWN_MS) {
+            console.log(
+              `[DEBUG sendPeopleIntent] SKIP greet for ${identityKey} - cooldown ` +
+                `${elapsed.toFixed(0)}ms < ${GREET_COOLDOWN_MS}ms`
+            );
+            greetInviteRef.current.set(identityKey, rec);
+            return;
+          }
+
+          rec.last = nowMs;
+          rec.count = (rec.count || 0) + 1;
+          greetInviteRef.current.set(identityKey, rec);
+        }
       }
+
+      const identityKeyForPayload =
+        person.stableKey || person.key || person.gid || person.name || null;
 
       const payload = {
         intent,
@@ -2285,7 +2319,7 @@ export default function App() {
             ? +Number(person.mouthActivity).toFixed(3)
             : null,
         posCam: person.posCam || null,
-        stableKey: person.stableKey || null,
+        stableKey: identityKeyForPayload,
         slotKey: person.slotKey || null,
         group: extra.group || null,
         reason: extra.reason || null,
@@ -4414,6 +4448,18 @@ export default function App() {
             console.log(`[DEBUG Zone Transitions] Processing ${allIdentities.length} identities, isOnPhone=${isOnPhone}`);
             
             for (const p of allIdentities) {
+              // Track last time we saw this identity in the camera feed
+              try {
+                const rec =
+                  greetInviteRef.current.get(p.key) || {
+                    count: 0,
+                    last: 0,
+                    lastSeen: 0,
+                  };
+                rec.lastSeen = now;
+                greetInviteRef.current.set(p.key, rec);
+              } catch {}
+
               const prevZ = prevZoneMapRef.current.get(p.key);
               const currentZ = p.zone;
               

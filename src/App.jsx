@@ -3216,6 +3216,18 @@ export default function App() {
         //#endregion
 
         console.log(`[DEBUG Face Detection] Detected ${dets.length} faces, wsConnected=${wsIsConnected.current}`);
+
+        // 🔥 FIX: Send PeopleData with zone="none" when no faces detected
+        if (dets.length === 0 && wsIsConnected.current) {
+          console.log(`[DEBUG Face Detection] No faces detected - sending zone="none"`);
+          SendWebsockCommandToServer(MSG_TYPE.PeopleData, {
+            intent: "none",
+            zone: "none",
+            guests: [],
+            context: buildVisitContext(),
+          });
+        }
+
         // ==== drawing + bookkeeping ====
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         // --- alignment overlay: crosshair and banner ---
@@ -4382,108 +4394,124 @@ export default function App() {
             const hasKid = allIdentities.some((p) => p.ageGroup === "child");
             const groupInfo = { size: groupSize, hasKid };
 
+            // 🔥 FIX: Clear prevZoneMapRef for people who haven't been seen recently
+            // This prevents stale "green" state from blocking re-entry greetings
+            const currentKeys = new Set(allIdentities.map(p => p.key));
+            for (const [key, zone] of prevZoneMapRef.current.entries()) {
+              if (!currentKeys.has(key)) {
+                // Person not in current frame - clear after 35 seconds (just after server timeout)
+                const lastSeen = greenEntryRef.current.get(key);
+                if (!lastSeen || (now - lastSeen.ts) > 35000) {
+                  prevZoneMapRef.current.delete(key);
+                  greenEntryRef.current.delete(key);
+                  console.log(`[DEBUG Zone Transitions] Cleared stale zone state for ${key}`);
+                }
+              }
+            }
+
             // transitions
             const isOnPhone = stableGestureRef.current?.type === "on_phone";
             console.log(`[DEBUG Zone Transitions] Processing ${allIdentities.length} identities, isOnPhone=${isOnPhone}`);
             
             for (const p of allIdentities) {
               const prevZ = prevZoneMapRef.current.get(p.key);
-              prevZoneMapRef.current.set(p.key, p.zone);
+              const currentZ = p.zone;
               
-              console.log(`[DEBUG Zone Transitions] Person ${p.key}: prevZone=${prevZ} -> currentZone=${p.zone}`);
+              console.log(`[DEBUG Zone Transitions] Person ${p.key}: prevZone=${prevZ} -> currentZone=${currentZ}`);
 
-              // green -> red => polite call-over (max 3, spaced)
-              if (!isOnPhone && prevZ === "green" && p.zone === "red") {
-                console.log(`[DEBUG Zone Transitions] TRIGGER: green->red transition for ${p.key}`);
-                const s = callOverStateRef.current.get(p.key) || {
-                  tries: 0,
-                  last: 0,
-                };
-                if (
-                  s.tries < CALL_OVER_MAX_TRIES &&
-                  now - (s.last || 0) >= CALL_OVER_COOLDOWN_MS
-                ) {
-                  s.tries += 1;
-                  s.last = now;
-                  callOverStateRef.current.set(p.key, s);
-                  sendPeopleIntent("call_over", p, {
-                    group: groupInfo,
-                    reason: "left_green_zone",
-                    guests: guestSnapshots,
-                    context: { attempt: s.tries },
-                  });
+              // 🔥 FIX: Handle green zone - always send PeopleData for server sync
+              if (currentZ === "green") {
+                // Track when we last saw this person in green
+                if (!greenEntryRef.current.has(p.key)) {
+                  greenEntryRef.current.set(p.key, { ts: now });
                 }
-              }
-
-              // red/unknown -> green => greet (reset tries)
-              if (!isOnPhone && (prevZ === "red" || prevZ == null) && p.zone === "green") {
-                console.log(`[DEBUG Zone Transitions] TRIGGER: ${prevZ || 'unknown'}->green transition for ${p.key}`);
-
-                // Add short debounce so we wait before greeting
-                const entry = greenEntryRef.current.get(p.key) || { ts: now };
-                if (now - entry.ts < 700) {
-                  greenEntryRef.current.set(p.key, entry);
-                  console.log("[DEBUG Zone Transitions] Waiting before greet – just entered green zone for", p.key);
-                  continue;
-                }
-
-                // Ensure we have stable age/gender before greeting so backend
-                // can build a rich Catatan konteks (dewasa pria/wanita).
-                const cacheGA = ageGenderCacheRef.current.get(p.key) || {};
-                const effectiveGender = (p.gender || cacheGA.gender || "").toLowerCase();
-                const effectiveAgeGroup = p.ageGroup || ageGroupOf(cacheGA.age);
-
-                // Check that demographic data exist in cache before sending
-                const cacheReady = cacheGA && (cacheGA.gender || Number.isFinite(cacheGA.age));
-                if (!cacheReady) {
-                  console.log(
-                    "[DEBUG Zone Transitions] Gender/Age cache not ready yet for",
-                    p.key,
-                    "- waiting before greet"
-                  );
-                  pendingGreetsRef.current.set(p.key, { zone: p.zone, timestamp: now });
-                  continue;
-                }
-
-                // If we still don't know gender at all, defer this greet and wait
-                // for the next stable detection frame (takes ~1–2s).
-                if (!effectiveGender) {
-                  console.log(
-                    "[DEBUG Zone Transitions] Defer greet – gender not ready yet for",
-                    p.key,
-                    "– will retry when data available"
-                  );
-                  pendingGreetsRef.current.set(p.key, { zone: p.zone, timestamp: now });
-                  continue;
-                }
-
-                // Reset call-over tries now that we're about to greet
-                callOverStateRef.current.delete(p.key);
-
-                const address = p.name
-                  ? p.name
-                  : groupSize > 1
-                    ? hasKid
-                      ? "family"
-                      : "everyone"
-                    : p.gender === "male"
-                      ? "sir"
-                      : p.gender === "female"
-                        ? "ma'am"
-                        : "there";
                 
-                // Delay sending PeopleData until after greeting has broadcasted to prevent race conditions
-                const GREET_POLICY_DELAY_MS = 2000; // 2s delay to align with greeting audio playback
-                setTimeout(() => {
-                  console.log("[DEBUG Zone Transitions] Delayed sendPeopleIntent triggered for", p.key);
+                // Determine if this is a zone transition (none/red -> green)
+                const isTransitionToGreen = prevZ !== "green";
+                
+                // Update previous zone for next iteration
+                prevZoneMapRef.current.set(p.key, currentZ);
+                
+                if (isTransitionToGreen && !isOnPhone) {
+                  console.log(`[DEBUG Zone Transitions] TRIGGER: ${prevZ || 'none'}->green transition for ${p.key}`);
+
+                  // Get cached demographics
+                  const cacheGA = ageGenderCacheRef.current.get(p.key) || {};
+                  const effectiveGender = (p.gender || cacheGA.gender || "").toLowerCase();
+                  const effectiveAgeGroup = p.ageGroup || ageGroupOf(cacheGA.age);
+
+                  // Check that demographic data exist in cache before sending
+                  const cacheReady = cacheGA && (cacheGA.gender || Number.isFinite(cacheGA.age));
+                  if (!cacheReady || !effectiveGender) {
+                    console.log(
+                      "[DEBUG Zone Transitions] Gender/Age cache not ready yet for",
+                      p.key,
+                      "- deferring greet"
+                    );
+                    pendingGreetsRef.current.set(p.key, { zone: p.zone, timestamp: now });
+                    continue;
+                  }
+
+                  // Reset call-over tries now that we're about to greet
+                  callOverStateRef.current.delete(p.key);
+
+                  const address = p.name
+                    ? p.name
+                    : groupSize > 1
+                      ? hasKid
+                        ? "family"
+                        : "everyone"
+                      : p.gender === "male"
+                        ? "sir"
+                        : p.gender === "female"
+                          ? "ma'am"
+                          : "there";
+                  
+                  console.log("[DEBUG Zone Transitions] Sending greet intent for", p.key);
                   sendPeopleIntent("greet", { ...p, gender: effectiveGender, ageGroup: effectiveAgeGroup }, {
                     group: { ...groupInfo, address },
                     guests: guestSnapshots,
                   });
-                  // Clear pending maps after success
-                  greenEntryRef.current.delete(p.key);
+                  
+                  // Clear pending greet
                   pendingGreetsRef.current.delete(p.key);
-                }, GREET_POLICY_DELAY_MS);
+                }
+              }
+              
+              // Handle green -> red/none transition
+              else if (prevZ === "green" && (currentZ === "red" || currentZ === "none")) {
+                console.log(`[DEBUG Zone Transitions] Person ${p.key}: leaving green -> ${currentZ}`);
+                prevZoneMapRef.current.set(p.key, currentZ);
+                greenEntryRef.current.delete(p.key);
+                
+                // green -> red => polite call-over (max 3, spaced)
+                if (!isOnPhone && currentZ === "red") {
+                  console.log(`[DEBUG Zone Transitions] TRIGGER: green->red transition for ${p.key}`);
+                  const s = callOverStateRef.current.get(p.key) || {
+                    tries: 0,
+                    last: 0,
+                  };
+                  if (
+                    s.tries < CALL_OVER_MAX_TRIES &&
+                    now - (s.last || 0) >= CALL_OVER_COOLDOWN_MS
+                  ) {
+                    s.tries += 1;
+                    s.last = now;
+                    callOverStateRef.current.set(p.key, s);
+                    sendPeopleIntent("call_over", p, {
+                      group: groupInfo,
+                      reason: "left_green_zone",
+                      guests: guestSnapshots,
+                      context: { attempt: s.tries },
+                    });
+                  }
+                }
+              }
+              
+              // Handle red/none (just update tracking)
+              else {
+                prevZoneMapRef.current.set(p.key, currentZ);
+                console.log(`[DEBUG Zone Transitions] Person ${p.key}: ${prevZ || 'none'} -> ${currentZ} (no action)`);
               }
             }
 

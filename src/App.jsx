@@ -2196,7 +2196,8 @@ export default function App() {
 
   // ---- Policy + speaker state ----
   const prevZoneMapRef = useRef(new Map()); // key -> "green" | "red"
-  const callOverStateRef = useRef(new Map()); // key -> { tries, last }\n  const greetInviteRef = useRef(new Map()); // key -> { count, last, lastSeen }\n
+  const callOverStateRef = useRef(new Map()); // key -> { tries, last }
+  const greetInviteRef = useRef(new Map()); // key -> { count, last, lastSeen }
   const lastGroupSetRef = useRef(new Set()); // Set(keys) of last frame
   const lastGroupAskTsRef = useRef(0);
   const speakerRef = useRef({
@@ -2267,42 +2268,6 @@ export default function App() {
             person.stableKey || person.key || person.gid || person.name
           );
           return;
-        }
-
-        if (intent === "greet") {
-          // Per-identity greet cooldown: delegate main spam protection to the
-          // server, but keep a lightweight tracker for diagnostics.
-          const identityKey =
-            person.key || person.stableKey || person.gid || person.name || null;
-          if (identityKey) {
-            const nowMs = performance.now();
-            const rec =
-              greetInviteRef.current.get(identityKey) || {
-                count: 0,
-                last: 0,
-                lastSeen: 0,
-              };
-            const elapsed = nowMs - (rec.last || 0);
-            rec.lastSeen = nowMs;
-
-            if (elapsed < GREET_COOLDOWN_MS) {
-              console.log(
-                `[DEBUG sendPeopleIntent] SKIP greet for ${identityKey} - cooldown ` +
-                  `${elapsed.toFixed(0)}ms < ${GREET_COOLDOWN_MS}ms`
-              );
-              // NOTE: do *not* early-return here. We still send PeopleData
-              // with intent="greet" so the server can:
-              //   - see the fresh GREEN transition via ZoneMonitor, and
-              //   - decide whether to play greeting audio or just open mic
-              //     based on its own per-identity cooldown.
-              // This prevents the "no greet, mic stays closed" bug.
-            } else {
-              rec.last = nowMs;
-              rec.count = (rec.count || 0) + 1;
-            }
-
-            greetInviteRef.current.set(identityKey, rec);
-          }
         }
       }
 
@@ -2400,6 +2365,8 @@ export default function App() {
   }, []);
 
   const lastFrameTsRef = useRef(0);
+  const lastHadFacesRef = useRef(false);
+  const lastNonePeopleSentRef = useRef(0);
   // Frame cadence (battery saver)
   const loopStepMsRef = useRef(LOOP_STEP_ACTIVE_MS);
   const loopIdleStateRef = useRef(false);
@@ -3271,6 +3238,15 @@ export default function App() {
             guests: [],
             context: buildVisitContext(),
           });
+
+          // Reset local zone/greet tracking state when camera sees nobody.
+          try {
+            prevZoneMapRef.current.clear();
+            greenEntryRef.current.clear();
+            callOverStateRef.current.clear();
+            pendingGreetsRef.current.clear();
+            console.log("[DEBUG Zone Transitions] Cleared zone/greet state (no faces present)");
+          } catch {}
         }
 
         // ==== drawing + bookkeeping ====
@@ -4398,6 +4374,16 @@ export default function App() {
               // Cache age/gender when available so we can use them
               // even if greet/call_over fires a bit later.
               if (Number.isFinite(age) || gender) {
+                const prevGA = ageGenderCacheRef.current.get(key);
+                if (!prevGA || prevGA.age !== age || prevGA.gender !== gender) {
+                  console.log("[DEBUG AgeGenderCache] update for", key, {
+                    rawGender: det.gender,
+                    rawAge: det.age,
+                    gender,
+                    age,
+                    ageGroup,
+                  });
+                }
                 ageGenderCacheRef.current.set(key, {
                   age,
                   gender,
@@ -4513,8 +4499,11 @@ export default function App() {
                 // Only greet once per continuous green presence, after stabilization,
                 // with all GREEN faces fully characterized, and not on-phone.
                 if (!isStablyInGreen || !everyoneReady || entry.greetedOnceInThisGreen || isOnPhone) {
+                  console.log("[DEBUG Zone Transitions] Skipping greet",
+                    { isStablyInGreen, everyoneReady, greetedOnce: entry.greetedOnceInThisGreen, isOnPhone });
                   continue;
                 }
+
 
                 console.log(
                   `[DEBUG Zone Transitions] TRIGGER: stable green (${inGreenMs.toFixed(

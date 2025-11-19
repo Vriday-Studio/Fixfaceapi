@@ -47,6 +47,8 @@ const LOOP_STEP_IDLE_MAX_MS = 220;
 const MATCH_THRESHOLD = 0.5;
 const MATCH_MARGIN = 0.03;
 const STABILIZE_FRAMES = 5;
+// Require ~5 stable active frames in green before firing greet
+const GREEN_STABLE_MS = STABILIZE_FRAMES * LOOP_STEP_ACTIVE_MS;
 
 const CAM_IDLE_MS = 10000; // cam fully idle after 10s
 
@@ -68,7 +70,7 @@ const FACING_YAW_MAX_DEG = 9; // how "straight on" horizontally
 const FACING_PITCH_MAX_DEG = 10; // how "straight on" vertically
 const ATTEND_MIN_FRAMES = 5; // require 3–5 consecutive frames
 // Minimum time between greets for the same identity (per p.key)
-const GREET_COOLDOWN_MS = 15_000;
+const GREET_COOLDOWN_MS = 20_000;
 
 // Hard cap per identity
 const MAX_INVITES_PER_PERSON = 3;
@@ -1278,7 +1280,8 @@ export default function App() {
   const AGE_SAMPLE_MS = 600;
   const lastAgeSampleRef = useRef(0);
   const ageGenderCacheRef = useRef(new Map()); // key -> { age, gender }
-  const greenEntryRef = useRef(new Map()); // key -> timestamp when entered green zone
+  // key -> { ts: firstGreenTimestamp, greetedOnceInThisGreen: boolean }
+  const greenEntryRef = useRef(new Map());
 
   const [locationLabel, setLocationLabel] = useState(
     localStorage.getItem("ika:locationLabel") || "Galeri Indonesia Kaya"
@@ -2252,46 +2255,54 @@ export default function App() {
         return;
       }
 
-      // For greeting, only send PeopleData once we have at least
-      // gender or ageGroup so the backend can build a rich context.
-      if (intent === "greet") {
+      // For greeting / call_over, only send PeopleData once we have at least
+      // gender or ageGroup so the backend can build a rich context. This also
+      // guarantees we never send greet/call_over without demographics.
+      if (intent === "greet" || intent === "call_over") {
         const hasGender = !!person.gender;
         const hasAgeGroup = !!person.ageGroup;
         if (!hasGender && !hasAgeGroup) {
           console.log(
-            "[DEBUG sendPeopleIntent] SKIP greet PeopleData - missing gender/ageGroup for",
+            "[DEBUG sendPeopleIntent] SKIP PeopleData - missing gender/ageGroup for",
             person.stableKey || person.key || person.gid || person.name
           );
           return;
         }
 
-        // Per-identity greet cooldown: allow a new greet for the same
-        // person key only if GREET_COOLDOWN_MS has elapsed.
-        const identityKey =
-          person.key || person.stableKey || person.gid || person.name || null;
-        if (identityKey) {
-          const nowMs = performance.now();
-          const rec =
-            greetInviteRef.current.get(identityKey) || {
-              count: 0,
-              last: 0,
-              lastSeen: 0,
-            };
-          const elapsed = nowMs - (rec.last || 0);
-          rec.lastSeen = nowMs;
+        if (intent === "greet") {
+          // Per-identity greet cooldown: delegate main spam protection to the
+          // server, but keep a lightweight tracker for diagnostics.
+          const identityKey =
+            person.key || person.stableKey || person.gid || person.name || null;
+          if (identityKey) {
+            const nowMs = performance.now();
+            const rec =
+              greetInviteRef.current.get(identityKey) || {
+                count: 0,
+                last: 0,
+                lastSeen: 0,
+              };
+            const elapsed = nowMs - (rec.last || 0);
+            rec.lastSeen = nowMs;
 
-          if (elapsed < GREET_COOLDOWN_MS) {
-            console.log(
-              `[DEBUG sendPeopleIntent] SKIP greet for ${identityKey} - cooldown ` +
-                `${elapsed.toFixed(0)}ms < ${GREET_COOLDOWN_MS}ms`
-            );
+            if (elapsed < GREET_COOLDOWN_MS) {
+              console.log(
+                `[DEBUG sendPeopleIntent] SKIP greet for ${identityKey} - cooldown ` +
+                  `${elapsed.toFixed(0)}ms < ${GREET_COOLDOWN_MS}ms`
+              );
+              // NOTE: do *not* early-return here. We still send PeopleData
+              // with intent="greet" so the server can:
+              //   - see the fresh GREEN transition via ZoneMonitor, and
+              //   - decide whether to play greeting audio or just open mic
+              //     based on its own per-identity cooldown.
+              // This prevents the "no greet, mic stays closed" bug.
+            } else {
+              rec.last = nowMs;
+              rec.count = (rec.count || 0) + 1;
+            }
+
             greetInviteRef.current.set(identityKey, rec);
-            return;
           }
-
-          rec.last = nowMs;
-          rec.count = (rec.count || 0) + 1;
-          greetInviteRef.current.set(identityKey, rec);
         }
       }
 
@@ -4463,66 +4474,101 @@ export default function App() {
               const prevZ = prevZoneMapRef.current.get(p.key);
               const currentZ = p.zone;
               
-              console.log(`[DEBUG Zone Transitions] Person ${p.key}: prevZone=${prevZ} -> currentZone=${currentZ}`);
+              console.log(
+                `[DEBUG Zone Transitions] Person ${p.key}: prevZone=${prevZ} -> currentZone=${currentZ}`
+              );
 
-              // 🔥 FIX: Handle green zone - always send PeopleData for server sync
+              // Tightened: handle GREEN only after stable presence + demographics
               if (currentZ === "green") {
-                // Track when we last saw this person in green
-                if (!greenEntryRef.current.has(p.key)) {
-                  greenEntryRef.current.set(p.key, { ts: now });
+                // Per-identity green entry & greet state
+                let entry = greenEntryRef.current.get(p.key);
+                if (!entry) {
+                  entry = { ts: now, greetedOnceInThisGreen: false };
+                  greenEntryRef.current.set(p.key, entry);
+                  console.log(
+                    `[DEBUG Zone Transitions] Mark green entry for ${p.key} at ${now.toFixed(0)}ms`
+                  );
                 }
-                
-                // Determine if this is a zone transition (none/red -> green)
-                const isTransitionToGreen = prevZ !== "green";
-                
+
+                const inGreenMs = now - (entry.ts || 0);
+                const isStablyInGreen = inGreenMs >= GREEN_STABLE_MS;
+
+                // Ensure that *all* GREEN faces have demographics + ID
+                const greenPeople = allIdentities.filter((q) => q.zone === "green");
+                const everyoneReady =
+                  greenPeople.length > 0 &&
+                  greenPeople.every((q) => {
+                    const cacheGA = ageGenderCacheRef.current.get(q.key) || {};
+                    const gender = (q.gender || cacheGA.gender || "").toLowerCase();
+                    const ageGroup = q.ageGroup || ageGroupOf(cacheGA.age);
+                    const hasGender = !!gender;
+                    const hasAgeGroup = !!ageGroup;
+                    const hasId = !!(q.name || q.gid || q.key);
+                    return hasGender && hasAgeGroup && hasId;
+                  });
+
                 // Update previous zone for next iteration
                 prevZoneMapRef.current.set(p.key, currentZ);
-                
-                if (isTransitionToGreen && !isOnPhone) {
-                  console.log(`[DEBUG Zone Transitions] TRIGGER: ${prevZ || 'none'}->green transition for ${p.key}`);
 
-                  // Get cached demographics
-                  const cacheGA = ageGenderCacheRef.current.get(p.key) || {};
-                  const effectiveGender = (p.gender || cacheGA.gender || "").toLowerCase();
-                  const effectiveAgeGroup = p.ageGroup || ageGroupOf(cacheGA.age);
+                // Only greet once per continuous green presence, after stabilization,
+                // with all GREEN faces fully characterized, and not on-phone.
+                if (!isStablyInGreen || !everyoneReady || entry.greetedOnceInThisGreen || isOnPhone) {
+                  continue;
+                }
 
-                  // Check that demographic data exist in cache before sending
-                  const cacheReady = cacheGA && (cacheGA.gender || Number.isFinite(cacheGA.age));
-                  if (!cacheReady || !effectiveGender) {
-                    console.log(
-                      "[DEBUG Zone Transitions] Gender/Age cache not ready yet for",
-                      p.key,
-                      "- deferring greet"
-                    );
-                    pendingGreetsRef.current.set(p.key, { zone: p.zone, timestamp: now });
-                    continue;
-                  }
+                console.log(
+                  `[DEBUG Zone Transitions] TRIGGER: stable green (${inGreenMs.toFixed(
+                    0
+                  )}ms) for ${p.key} (all green faces ready)`
+                );
 
-                  // Reset call-over tries now that we're about to greet
-                  callOverStateRef.current.delete(p.key);
+                // Get cached demographics for this primary identity
+                const cacheGA = ageGenderCacheRef.current.get(p.key) || {};
+                const effectiveGender = (p.gender || cacheGA.gender || "").toLowerCase();
+                const effectiveAgeGroup = p.ageGroup || ageGroupOf(cacheGA.age);
 
-                  const address = p.name
-                    ? p.name
-                    : groupSize > 1
-                      ? hasKid
-                        ? "family"
-                        : "everyone"
-                      : p.gender === "male"
-                        ? "sir"
-                        : p.gender === "female"
-                          ? "ma'am"
-                          : "there";
-                  
-                  console.log("[DEBUG Zone Transitions] Sending greet intent for", p.key);
-                  sendPeopleIntent("greet", { ...p, gender: effectiveGender, ageGroup: effectiveAgeGroup }, {
+                // Safety check (should be true if everyoneReady)
+                const cacheReady = cacheGA && (cacheGA.gender || Number.isFinite(cacheGA.age));
+                if (!cacheReady || !effectiveGender) {
+                  console.log(
+                    "[DEBUG Zone Transitions] Gender/Age cache not ready yet for",
+                    p.key,
+                    "- deferring greet"
+                  );
+                  pendingGreetsRef.current.set(p.key, { zone: p.zone, timestamp: now });
+                  continue;
+                }
+
+                // Reset call-over tries now that we're about to greet
+                callOverStateRef.current.delete(p.key);
+
+                const address = p.name
+                  ? p.name
+                  : groupSize > 1
+                  ? hasKid
+                    ? "family"
+                    : "everyone"
+                  : p.gender === "male"
+                  ? "sir"
+                  : p.gender === "female"
+                  ? "ma'am"
+                  : "there";
+
+                console.log("[DEBUG Zone Transitions] Sending greet intent for", p.key);
+                sendPeopleIntent(
+                  "greet",
+                  { ...p, gender: effectiveGender, ageGroup: effectiveAgeGroup },
+                  {
                     group: { ...groupInfo, address },
                     guests: guestSnapshots,
-                  });
-                  
-                  // Clear pending greet
-                  pendingGreetsRef.current.delete(p.key);
-                }
+                  }
+                );
+
+                entry.greetedOnceInThisGreen = true;
+                greenEntryRef.current.set(p.key, entry);
+                pendingGreetsRef.current.delete(p.key);
               }
+
               
               // Handle green -> red/none transition
               else if (prevZ === "green" && (currentZ === "red" || currentZ === "none")) {

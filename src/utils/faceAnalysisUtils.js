@@ -132,7 +132,8 @@ export function calculateCenterNorm(cx, cy, canvas) {
 }
 
 // Helper function to shrink bounding box (shared with drawing utils)
-function shrinkBox(box, factor = 0.7) {
+// Slightly less shrink to keep faces considered present when off-center.
+function shrinkBox(box, factor = 0.8) {
   const w = box.width * factor;
   const h = box.height * factor;
   return {
@@ -211,7 +212,8 @@ function topExpression(expressions) {
 /* ====================== FACE ATTENTION DETECTION ====================== */
 
 // Check if face is looking at camera (within angle thresholds)
-export function isFacingCamera(yawDeg, pitchDeg, maxYaw = 9, maxPitch = 10) {
+// Loosened to tolerate head turns while still treating as present.
+export function isFacingCamera(yawDeg, pitchDeg, maxYaw = 35, maxPitch = 25) {
   return Math.abs(yawDeg) <= maxYaw && Math.abs(pitchDeg) <= maxPitch;
 }
 

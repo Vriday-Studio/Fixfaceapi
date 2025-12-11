@@ -66,8 +66,9 @@ const USE_SOCKET_BRIDGE = false; // legacy Socket.IO bridge (remote controls / t
 const USE_DIRECT_WEBSOCKET = true; // policy + session pipeline (always on)
 
 // --- Attention / greeting policy ---
-const FACING_YAW_MAX_DEG = 9; // how "straight on" horizontally
-const FACING_PITCH_MAX_DEG = 10; // how "straight on" vertically
+// Loosen thresholds so slight head turns don't drop to NONE.
+const FACING_YAW_MAX_DEG = 35; // how "straight on" horizontally
+const FACING_PITCH_MAX_DEG = 25; // how "straight on" vertically
 const ATTEND_MIN_FRAMES = 5; // require 3–5 consecutive frames
 // Minimum time between greets for the same identity (per p.key)
 const GREET_COOLDOWN_MS = 20_000;

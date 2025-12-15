@@ -108,6 +108,10 @@ const SPEAKER_STABLE_MS = 1200;
 // group ask cooldown
 const GROUP_ASK_COOLDOWN_MS = 20_000;
 
+// RED zone call-over policy (NONE -> RED transition detection)
+const RED_ZONE_STABLE_FRAMES = 5; // Require 5 consecutive RED frames before sending
+const RED_ZONE_NONE_RESET_FRAMES = 15; // Require 15 consecutive NONE frames to reset
+
 /* ====================== SMALL UTILS ====================== */
 
 // Distance estimate from face box width (pixels) via pinhole camera
@@ -3323,6 +3327,69 @@ export default function App() {
         green = candidates.filter((c) => c.zone === "green").length;
         red = total - green;
 
+        // === RED ZONE CALL-OVER DETECTION (NONE -> RED) ===
+        // This runs every frame to detect NONE->RED transitions with stabilization
+        try {
+          const hasRedOnly = red > 0 && green === 0; // People in RED zone, none in GREEN
+          const hasNone = total === 0; // Nobody detected at all
+
+          if (hasNone) {
+            // Increment NONE counter, reset RED counter
+            noneZoneCounterRef.current += 1;
+            redZoneCounterRef.current = 0; // STRICT: Any flicker resets RED counter
+            if (noneZoneCounterRef.current <= 3 || noneZoneCounterRef.current === RED_ZONE_NONE_RESET_FRAMES) {
+              console.log(`[RED Zone] NONE frame ${noneZoneCounterRef.current}/${RED_ZONE_NONE_RESET_FRAMES} (total=${total})`);
+            }
+
+            // After 15 consecutive NONE frames, allow RED zone to trigger again
+            if (noneZoneCounterRef.current >= RED_ZONE_NONE_RESET_FRAMES) {
+              if (redZoneTriggeredRef.current) {
+                console.log(`[RED Zone] Reset after ${RED_ZONE_NONE_RESET_FRAMES} NONE frames`);
+                redZoneTriggeredRef.current = false;
+              }
+            }
+          } else if (hasRedOnly) {
+            // Increment RED counter, reset NONE counter
+            redZoneCounterRef.current += 1;
+            noneZoneCounterRef.current = 0; // STRICT: Any flicker resets NONE counter
+            console.log(`[RED Zone] Frame ${redZoneCounterRef.current}/${RED_ZONE_STABLE_FRAMES} (red=${red}, green=${green})`);
+
+            // Send PeopleData on EVERY RED frame (server ZoneMonitor needs continuous frames)
+            if (wsIsConnected.current) {
+              const redPayload = {
+                intent: "none", // No specific intent, just zone data
+                zone: "red",
+                guests: Array.from({ length: red }, (_, i) => ({
+                  gid: `RedGuest${i + 1}`,
+                  name: null,
+                  gender: null,
+                  ageGroup: null,
+                  zone: "red"
+                })),
+                context: buildVisitContext()
+              };
+
+              // Log only on first send and every 5th frame
+              if (redZoneCounterRef.current === 1 || redZoneCounterRef.current % 5 === 0) {
+                console.log(`[RED Zone] Sending PeopleData frame ${redZoneCounterRef.current}:`, redPayload);
+              }
+              SendWebsockCommandToServer(MSG_TYPE.PeopleData, redPayload);
+
+              // Mark as triggered after first stable detection (for any future logic)
+              if (redZoneCounterRef.current >= RED_ZONE_STABLE_FRAMES && !redZoneTriggeredRef.current) {
+                console.log(`[RED Zone] ✅ STABLE: ${redZoneCounterRef.current} consecutive RED frames detected`);
+                redZoneTriggeredRef.current = true;
+              }
+            }
+          } else {
+            // Mixed GREEN + RED, or just GREEN - reset both counters
+            redZoneCounterRef.current = 0;
+            noneZoneCounterRef.current = 0;
+          }
+        } catch (err) {
+          console.error("[RED Zone] Error in detection logic:", err);
+        }
+
         // 2) Only TRACK up to 5 people in the GREEN zone, nearest first
         const greenCandidates = candidates
           .filter((c) => c.zone === "green" && Number.isFinite(c.dist))
@@ -4936,6 +5003,11 @@ export default function App() {
   // Focus shared across blocks (used by gesture events and crowd payload)
   const focusIndexRef = useRef(-1);
   const focusTargetRef = useRef(null);
+
+  // RED zone stabilization tracking
+  const redZoneCounterRef = useRef(0); // Counts consecutive RED frames
+  const noneZoneCounterRef = useRef(0); // Counts consecutive NONE frames
+  const redZoneTriggeredRef = useRef(false); // Prevents re-triggering until reset
 
   // API keys (stored locally; server may read)
   const [geminiApiKey, setGeminiApiKey] = useState(

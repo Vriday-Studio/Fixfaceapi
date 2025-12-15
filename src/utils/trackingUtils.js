@@ -14,8 +14,8 @@ export const MATCH_MARGIN = 0.03;
 export const STABILIZE_FRAMES = 5;
 
 // zones
-export const DEFAULT_GREEN_MAX_M = 0.8;
-export const DEFAULT_RED_CUTOFF_M = 3.5;
+export const DEFAULT_GREEN_MAX_M = 1.0;
+export const DEFAULT_RED_CUTOFF_M = 3.0;
 
 /* ====================== UTILITY FUNCTIONS ====================== */
 
@@ -29,11 +29,26 @@ export const ageGroup = (a) => {
   return "child";
 };
 
-// Green/Red zone classification
-export const zoneOf = (d, greenMaxM) =>
-  Number.isFinite(d) && Number.isFinite(greenMaxM) && d <= greenMaxM
-    ? "green"
-    : "red";
+// Green/Red zone classification with center-frame requirement
+// Green zone requires: distance <= greenMaxM AND face in center third of frame
+export const zoneOf = (d, greenMaxM, faceCenterX, frameWidth) => {
+  // Distance check
+  if (!Number.isFinite(d) || !Number.isFinite(greenMaxM) || d > greenMaxM) {
+    return "red";
+  }
+
+  // Center-frame check (middle third of frame width)
+  if (Number.isFinite(faceCenterX) && Number.isFinite(frameWidth) && frameWidth > 0) {
+    const leftBoundary = frameWidth / 3;
+    const rightBoundary = (frameWidth * 2) / 3;
+    const isInCenter = faceCenterX >= leftBoundary && faceCenterX <= rightBoundary;
+
+    return isInCenter ? "green" : "red";
+  }
+
+  // Fallback if position data not available (distance-only)
+  return "green";
+};
 
 // Best-scoring expression label
 export const topExpression = (e) => {
@@ -163,11 +178,15 @@ export function processFaceDetections(detections, canvas, redCutoffM, greenMaxM)
     const det = resized[i];
     const box = det.detection.box;
     const dist = estimateDistanceMpx(box.width);
-    
+
     // Skip faces that are too far
     if (dist != null && dist > cutoff) continue;
-    
-    const zone = zoneOf(dist, greenMaxM);
+
+    // Calculate face center X position for center-frame filtering
+    const faceCenterX = box.x + box.width / 2;
+    const frameWidth = canvas.width;
+    const zone = zoneOf(dist, greenMaxM, faceCenterX, frameWidth);
+
     candidates.push({ i, det, box, dist, zone });
   }
   

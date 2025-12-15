@@ -127,11 +127,26 @@ const ageGroupOf = (age) => {
   return "child";
 };
 
-// Green/Red zone helper
-const zoneOf = (d, greenMaxM) =>
-  Number.isFinite(d) && Number.isFinite(greenMaxM) && d <= greenMaxM
-    ? "green"
-    : "red";
+// Green/Red zone classification with center-frame requirement
+// Green zone requires: distance <= greenMaxM AND face in center third of frame
+const zoneOf = (d, greenMaxM, faceCenterX, frameWidth) => {
+  // Distance check
+  if (!Number.isFinite(d) || !Number.isFinite(greenMaxM) || d > greenMaxM) {
+    return "red";
+  }
+
+  // Center-frame check (middle third of frame width)
+  if (Number.isFinite(faceCenterX) && Number.isFinite(frameWidth) && frameWidth > 0) {
+    const leftBoundary = frameWidth / 3;
+    const rightBoundary = (frameWidth * 2) / 3;
+    const isInCenter = faceCenterX >= leftBoundary && faceCenterX <= rightBoundary;
+
+    return isInCenter ? "green" : "red";
+  }
+
+  // Fallback if position data not available (distance-only)
+  return "green";
+};
 
 // Best-scoring expression label
 const topExpression = (e) => {
@@ -2394,7 +2409,7 @@ export default function App() {
   }, [greenMaxM]);
 
   // === Red Zone Cutoff (ignore faces beyond this) ===
-  const DEFAULT_RED_CUTOFF_M = 3.5;
+  const DEFAULT_RED_CUTOFF_M = 3.0;
   const [redCutoffM, setRedCutoffM] = useState(() => {
     const raw = localStorage.getItem("ika:redCutoffM");
     const v = raw == null ? DEFAULT_RED_CUTOFF_M : parseFloat(raw);
@@ -3316,8 +3331,16 @@ export default function App() {
           const box = det.detection.box;
           const dist = estimateDistanceMpx(box.width);
           if (dist != null && dist > cutoff) continue; // skip way too far
-          const zone = zoneOf(dist, greenMaxMRef.current);
-          console.log(`[DEBUG Face Detection] Face ${i}: dist=${dist?.toFixed(2)}m, zone=${zone}, greenMax=${greenMaxMRef.current}`);
+
+          // Calculate face center X position for center-frame filtering
+          const faceCenterX = box.x + box.width / 2;
+          const frameWidth = canvas.width;
+          const leftBoundary = frameWidth / 3;
+          const rightBoundary = (frameWidth * 2) / 3;
+          const isInCenter = faceCenterX >= leftBoundary && faceCenterX <= rightBoundary;
+          const zone = zoneOf(dist, greenMaxMRef.current, faceCenterX, frameWidth);
+
+          console.log(`[DEBUG Face Detection] Face ${i}: dist=${dist?.toFixed(2)}m, centerX=${faceCenterX.toFixed(0)}/${frameWidth} (L:${leftBoundary.toFixed(0)} R:${rightBoundary.toFixed(0)}), inCenter=${isInCenter}, zone=${zone}, greenMax=${greenMaxMRef.current}`);
           candidates.push({ i, det, box, dist, zone });
         }
         frameCandidates = candidates;
@@ -3743,6 +3766,31 @@ export default function App() {
             ctx.fillText(l1, lx + LABEL_PAD_X, ly + LABEL_PAD_Y);
             ctx.restore();
           }
+        } catch {}
+
+        // Draw center-frame guide lines (middle third for GREEN zone)
+        try {
+          const leftBoundary = canvas.width / 3;
+          const rightBoundary = (canvas.width * 2) / 3;
+
+          ctx.save();
+          ctx.strokeStyle = "rgba(34, 197, 94, 0.5)"; // Semi-transparent green
+          ctx.lineWidth = 2;
+          ctx.setLineDash([10, 10]); // Dashed line
+
+          // Left boundary
+          ctx.beginPath();
+          ctx.moveTo(leftBoundary, 0);
+          ctx.lineTo(leftBoundary, canvas.height);
+          ctx.stroke();
+
+          // Right boundary
+          ctx.beginPath();
+          ctx.moveTo(rightBoundary, 0);
+          ctx.lineTo(rightBoundary, canvas.height);
+          ctx.stroke();
+
+          ctx.restore();
         } catch {}
 
         // prune only faces that are no longer tracked (preserve history for tracked-but-not-eligible)
@@ -5613,7 +5661,7 @@ export default function App() {
                 className="range"
                 type="range"
                 min="1.0"
-                max="6.0"
+                max="4.0"
                 step="0.1"
                 value={redCutoffM}
                 onChange={(e) => setRedCutoffM(Number(e.target.value))}
@@ -5637,7 +5685,7 @@ export default function App() {
               <button
                 className="btn"
                 onClick={() =>
-                  setRedCutoffM((v) => Math.min(6.0, +(v + 0.1).toFixed(1)))
+                  setRedCutoffM((v) => Math.min(4.0, +(v + 0.1).toFixed(1)))
                 }
               >
                 +0.1

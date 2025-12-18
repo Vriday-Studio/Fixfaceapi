@@ -137,8 +137,9 @@ const zoneOf = (d, greenMaxM, faceCenterX, frameWidth) => {
 
   // Center-frame check (middle third of frame width)
   if (Number.isFinite(faceCenterX) && Number.isFinite(frameWidth) && frameWidth > 0) {
-    const leftBoundary = frameWidth / 3;
-    const rightBoundary = (frameWidth * 2) / 3;
+    // Expand green zone horizontally by ~1/8 frame on each side
+    const leftBoundary = frameWidth * (1 / 3 - 1 / 8);   // ~0.208w
+    const rightBoundary = frameWidth * (2 / 3 + 1 / 8);  // ~0.792w
     const isInCenter = faceCenterX >= leftBoundary && faceCenterX <= rightBoundary;
 
     return isInCenter ? "green" : "red";
@@ -3335,8 +3336,8 @@ export default function App() {
           // Calculate face center X position for center-frame filtering
           const faceCenterX = box.x + box.width / 2;
           const frameWidth = canvas.width;
-          const leftBoundary = frameWidth / 3;
-          const rightBoundary = (frameWidth * 2) / 3;
+          const leftBoundary = frameWidth * (1 / 3 - 1 / 8); // match widened green zone (~0.208w)
+          const rightBoundary = frameWidth * (2 / 3 + 1 / 8); // match widened green zone (~0.792w)
           const isInCenter = faceCenterX >= leftBoundary && faceCenterX <= rightBoundary;
           const zone = zoneOf(dist, greenMaxMRef.current, faceCenterX, frameWidth);
 
@@ -3770,8 +3771,8 @@ export default function App() {
 
         // Draw center-frame guide lines (middle third for GREEN zone)
         try {
-          const leftBoundary = canvas.width / 3;
-          const rightBoundary = (canvas.width * 2) / 3;
+          const leftBoundary = canvas.width * (1 / 3 - 1 / 8); // match widened green zone (~0.208w)
+          const rightBoundary = canvas.width * (2 / 3 + 1 / 8); // match widened green zone (~0.792w)
 
           ctx.save();
           ctx.strokeStyle = "rgba(34, 197, 94, 0.5)"; // Semi-transparent green
@@ -5917,9 +5918,6 @@ export default function App() {
     </main>
   );
 }
-
-
-
 
 
 

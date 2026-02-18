@@ -468,8 +468,11 @@ export default function App() {
       p.pitchDeg,
       Math.round((p.mouthActivity || 0) * 1000),
     ]);
+    
     const sig = JSON.stringify([payload.focusIndex, ppl]);
+    
     if (now - state.t < MIN_MS && sig === state.sig) return;
+
     try {
       sendWsCommand(MSG_TYPE.CrowdStat, {
         ...payload,
@@ -477,6 +480,55 @@ export default function App() {
       });
     } catch {}
     lastCrowdSendRef.current = { t: now, sig };
+  }
+
+
+  function emitCrowdByGid(payload){
+    const now = performance.now();
+    const MIN_MS = 1000;
+    const state = lastCrowdSendRef.current;
+    const ppl = (payload.people || []).map((p) => [
+      p.gid
+    ]);
+
+    if ((now - state.t) <= MIN_MS) 
+      return;
+    
+    const peopleCandidate = payload.people || [];
+    if(peopleCandidate.length == 0) return;
+
+    //send all data iterating by gid
+    for(const p of peopleCandidate){
+      if(p.gid == null) continue;
+      try 
+      {
+        /*
+        sendWsCommand(MSG_TYPE.CrowdStat, {
+          ...payload,
+          context: buildVisitContext(),
+        });*/
+
+        const dataToSend = {
+          deviceId : payload.deviceId,
+          timestamp : payload.timeISO,
+          sessionId : payload.sessionId,
+          gesture : (p.gesture || null),
+          context : buildVisitContext(),
+          people: p
+
+        };
+        
+        sendWsCommand(MSG_TYPE.CrowdStat, dataToSend);
+      } 
+      catch 
+      {
+        continue;
+      }
+    }
+    
+    //const sig = JSON.stringify([ppl]);
+    lastCrowdSendRef.current = { t: now };
+    
   }
 
   // Camera + detection state
@@ -1689,6 +1741,7 @@ export default function App() {
             LABEL_PAD_X * 2;
           const th = lineH * lines + LABEL_PAD_Y * 2;
 
+          //general location of the face
           const lx = Math.max(0, Math.min(dbox.x, canvas.width - tw));
           const ly = Math.max(0, dbox.y - th - 4);
 
@@ -1758,6 +1811,7 @@ export default function App() {
             distance: dist ? dist.toFixed(2) + " m" : "-",
           });
 
+          //gathering all green zone 
           peopleForPost.push({
             gender,
             ageGroup: ageGroupOf(ageVal),
@@ -1794,6 +1848,8 @@ export default function App() {
           gestureEligible: gestureAllowedKeys.has(p.stableKey),
           z: p.posCam?.z ?? null, // NEW: carry depth
         }));
+
+        
         guestSnapshots = peopleForPost.map((p) => ({
           name: p.name || null,
           zone: p.zone,
@@ -1802,7 +1858,8 @@ export default function App() {
         }));
 
         // Also expose ALL faces (GREEN + RED) for hand proximity (on_phone)
-        allFacesRef.current = candidates.map((c) => {
+        allFacesRef.current = candidates.map((c) => 
+        {
           const d = shrinkBox(c.box);
           return {
             cx: d.x + d.width * 0.5,
@@ -1944,6 +2001,34 @@ export default function App() {
           focusTargetRef.current = null;
         }
 
+        if(cand.length > 0){
+          //emit all green face here
+          console.log(`[EMIT] Crowd data: ${JSON.stringify(cand)}`);
+          /*
+          emitCrowdThrottled({
+                  deviceId,
+                  sessionId: sessionId || "web-" + deviceId,
+                  timeISO: new Date().toISOString(),
+                  backend,
+                  totals: green,
+                  gesture: gesturesOnRef.current ? fresh : null,
+                  focusIndex: focusIndexRef.current,
+                  focusTarget: focusTargetRef.current,
+                  people: cand
+                });*/
+
+          emitCrowdByGid({deviceId,
+                  sessionId: sessionId || "web-" + deviceId,
+                  timeISO: new Date().toISOString(),
+                  backend,
+                  totals: green,
+                  gesture: gesturesOnRef.current ? fresh : null,
+                  focusIndex: focusIndexRef.current,
+                  focusTarget: focusTargetRef.current,
+                  people: cand
+                });
+        }
+
         // Always render 5 rows max; pad if fewer tracked
         while (rows.length < 5) {
           rows.push({
@@ -2013,10 +2098,9 @@ export default function App() {
             ? GM_HANDS_IDLE_MS
             : HANDS_IDLE_MS;
 
-        if (
-          handsEligible &&
-          now - (lastHandsRunTsRef.current || 0) >= handsDesiredStep
-        ) {
+        //test apakah tangan terdeteksi, kmd kirim data ke server, hanya untuk gesture
+        if (handsEligible && now - (lastHandsRunTsRef.current || 0) >= handsDesiredStep) 
+        {
           lastHandsRunTsRef.current = now;
           try {
             const handsList = await detectHandsOnce(video);
@@ -2485,14 +2569,13 @@ export default function App() {
             }
 
             // AFTER hands: emit snapshot with up-to-date gesture
-            {
-              const g = gesturesOnRef.current ? stableGestureRef.current : null;
+            const g = gesturesOnRef.current ? stableGestureRef.current : null;
               const fresh =
                 g && now - g.t <= HANDS_CACHE_MS
                   ? { type: g.type, score: g.score }
                   : null;
 
-                  console.log("emiting crowds");
+              console.log("emiting crowds");
               //emit crowd snapshot
               emitCrowdThrottled({
                 deviceId,
@@ -2520,7 +2603,6 @@ export default function App() {
                   posCam: p.posCam,
                 })),
               });
-            }
           } catch (e) {
             // ignore hand pipeline hiccups so the frame loop keeps running
           }

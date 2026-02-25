@@ -75,6 +75,12 @@ DerivedDataCache/*
 
 # Node modules
 node_modules/
+#node vite
+node_modules/.vite/
+#node vite deps
+node_modules/.vite/deps/
+#node vite cache
+node_modules/.cache/vite/
 
 # Build output
 dist/

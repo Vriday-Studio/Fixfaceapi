@@ -1681,6 +1681,8 @@ export default function App() {
 
           // mouth EMA with hold (avoid 0-drops)
           let mouthActivity = 0;
+          const lmBox = det.detection?.box;
+
           try {
             const lm = det.landmarks;
             const key = stableKey;
@@ -1726,7 +1728,7 @@ export default function App() {
             }  |  ${zone}  |  ${ageTxt} ${gender}  |  ${expr}`;
           const l2 = `yaw ${yawDeg.toFixed(1)} deg | pitch ${pitchDeg.toFixed(
             1
-          )} deg | mouth ${mouthActivity.toFixed(2)}`;
+          )} deg | mouth ${mouthActivity.toFixed(2)} | landmarks :${lmBox.x}`;
 
           // ----- LABEL DRAW (fixed: define color; removed duplicate vars/badges) -----
           const color =
@@ -1830,7 +1832,11 @@ export default function App() {
             _cy: cy,
             _w: dbox.width,
             _h: dbox.height,
+            _can_w : canvas.width,
+            _can_h : canvas.height,
           });
+
+          console.log(`canvas width :${canvas.width} | height :${canvas.height}`);
         }
 
         // remember face centers for click-to-zero + per-face hands mapping

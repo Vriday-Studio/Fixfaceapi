@@ -23,6 +23,8 @@ export function useDirectWebSocket({
   setServerInfo,
   setSessionStatus,
   setSessionId,
+  setMachineId,
+  setUeConnected,
   enabled = true,
 }) {
   const wsSocket = useRef(null);
@@ -57,20 +59,39 @@ export function useDirectWebSocket({
         const jsonObj = JSON.parse(evt.data);
         if (jsonObj?.ClassName === "SessionData") {
           setSessionStatus?.("ACTIVE");
-          if (jsonObj?.SessionId) setSessionId?.(jsonObj.SessionId);
+          if (jsonObj?.MachineId) {
+            setMachineId?.(jsonObj.MachineId);
+            setSessionId?.(jsonObj.MachineId);
+          }
+        }
+        if (jsonObj?.ClassName === "SessionPresence") {
+          const hasUnreal =
+            !!jsonObj?.HasUnreal || Number(jsonObj?.UnrealCount || 0) > 0;
+          setUeConnected?.(hasUnreal);
         }
       } catch {}
     };
 
     ws.onerror = () => {
       wsIsConnected.current = false;
+      setUeConnected?.(false);
     };
 
     ws.onclose = () => {
       wsIsConnected.current = false;
       setServerInfo?.((s) => ({ ...s, connected: false }));
+      setUeConnected?.(false);
     };
-  }, [deviceId, enabled, serverUrl, setServerInfo, setSessionId, setSessionStatus]);
+  }, [
+    deviceId,
+    enabled,
+    serverUrl,
+    setMachineId,
+    setServerInfo,
+    setSessionId,
+    setSessionStatus,
+    setUeConnected,
+  ]);
 
   const sendCommand = useCallback(
     (messageType, inputData = null) => {

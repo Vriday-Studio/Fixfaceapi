@@ -279,6 +279,8 @@ export default function App() {
     setServerInfo,
     setSessionStatus,
     setSessionId,
+    setMachineId,
+    setUeConnected,
     enabled: USE_DIRECT_WEBSOCKET,
   });
 
@@ -412,14 +414,6 @@ export default function App() {
         return;
       }
 
-      if (intent === "greet" || intent === "call_over") {
-        const hasGender = !!person.gender;
-        const hasAgeGroup = !!person.ageGroup;
-        if (!hasGender && !hasAgeGroup) {
-          return;
-        }
-      }
-
       const identityKeyForPayload =
         person.stableKey || person.key || person.gid || person.name || null;
 
@@ -459,6 +453,7 @@ export default function App() {
   );
 
   const lastCrowdSendRef = useRef({ t: 0, sig: "" });
+  const lastPeopleSnapshotSentRef = useRef(0);
   function emitCrowdThrottled(payload) {
     const now = performance.now();
     const MIN_MS = 66;
@@ -2008,6 +2003,28 @@ export default function App() {
         }
 
         if(cand.length > 0){
+          if (wsIsConnected.current) {
+            const ts = performance.now();
+            if (ts - (lastPeopleSnapshotSentRef.current || 0) >= 200) {
+              const guests = cand.map((p) => ({
+                gid: p.gid || null,
+                name: p.name || null,
+                gender: p.gender || null,
+                ageGroup: p.ageGroup || null,
+                zone: "green",
+              }));
+
+              sendWsCommand(MSG_TYPE.PeopleData, {
+                intent: "none",
+                zone: "green",
+                guests,
+                context: buildVisitContext(),
+              });
+
+              lastPeopleSnapshotSentRef.current = ts;
+            }
+          }
+
           //emit all green face here
           console.log(`[EMIT] Crowd data: ${JSON.stringify(cand)}`);
           /*
@@ -3081,9 +3098,8 @@ export default function App() {
       }
     } else {
       autoSessionPendingRef.current = false;
-      if (sessionStatus === "ACTIVE") {
-        handleStopSession();
-      }
+      // Keep session alive; do not auto-send SessionEnd on transient disconnects.
+      // Camera/zone policy on server controls mic open/close safely.
     }
   }, [
     autoSession,
@@ -3091,7 +3107,6 @@ export default function App() {
     ueConnected,
     sessionStatus,
     handleStartSession,
-    handleStopSession,
   ]);
 
   const onHotUpdate = useCallback(() => {
@@ -3131,6 +3146,12 @@ export default function App() {
           className="main-column"
           style={{ margin: "0 auto", width: "100%", maxWidth: 1280 }}
         >
+          {/* Camera window pinned to top */}
+          <div className="stage">
+            <video ref={videoRef} autoPlay muted playsInline />
+            <canvas ref={canvasRef} />
+          </div>
+
           {/* Row 1: CAMERA/STATUS */}
           <div className="left-top2">
             {/* CAMERA / STATUS (compact, grouped) */}
@@ -3578,12 +3599,6 @@ export default function App() {
                 +0.1
               </button>
             </div>
-          </div>
-
-          {/* Row 3: CAMERA */}
-          <div className="stage">
-            <video ref={videoRef} autoPlay muted playsInline />
-            <canvas ref={canvasRef} />
           </div>
 
           {captions && lastText && (

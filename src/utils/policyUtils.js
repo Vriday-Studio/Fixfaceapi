@@ -85,13 +85,8 @@ export function handleZoneTransitions({
       const everyoneReady =
         greenPeople.length > 0 &&
         greenPeople.every((q) => {
-          const cacheGA = ageGenderCacheRef.current.get(q.key) || {};
-          const gender = (q.gender || cacheGA.gender || "").toLowerCase();
-          const ageGroup = q.ageGroup || ageGroupOf(cacheGA.age);
-          const hasGender = !!gender;
-          const hasAgeGroup = !!ageGroup;
           const hasId = !!(q.name || q.gid || q.key);
-          return hasGender && hasAgeGroup && hasId;
+          return hasId;
         });
 
       prevZoneMapRef.current.set(p.key, currentZ);
@@ -120,21 +115,6 @@ export function handleZoneTransitions({
       const cacheGA = ageGenderCacheRef.current.get(p.key) || {};
       const effectiveGender = (p.gender || cacheGA.gender || "").toLowerCase();
       const effectiveAgeGroup = p.ageGroup || ageGroupOf(cacheGA.age);
-
-      const cacheReady =
-        cacheGA && (cacheGA.gender || Number.isFinite(cacheGA.age));
-      if (!cacheReady || !effectiveGender) {
-        log(
-          "[DEBUG Zone Transitions] Gender/Age cache not ready yet for",
-          p.key,
-          "- deferring greet"
-        );
-        pendingGreetsRef.current.set(p.key, {
-          zone: p.zone,
-          timestamp: now,
-        });
-        continue;
-      }
 
       callOverStateRef.current.delete(p.key);
 

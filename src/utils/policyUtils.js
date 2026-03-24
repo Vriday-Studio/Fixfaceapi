@@ -31,12 +31,17 @@ export function handleZoneTransitions({
   const log = logZone || (() => {});
 
   const currentKeys = new Set(allIdentities.map((p) => p.key));
+  const greenPeople = allIdentities.filter((p) => p.zone === "green");
+  const primaryGreenKey = greenPeople[0]?.key || null;
   for (const [key] of prevZoneMapRef.current.entries()) {
     if (!currentKeys.has(key)) {
-      const lastSeen = greenEntryRef.current.get(key);
-      if (!lastSeen || now - lastSeen.ts > 35000) {
+      const seenMeta = greetInviteRef.current.get(key);
+      const lastSeenAt = seenMeta?.lastSeen || 0;
+      if (!lastSeenAt || now - lastSeenAt > 35000) {
         prevZoneMapRef.current.delete(key);
         greenEntryRef.current.delete(key);
+        callOverStateRef.current.delete(key);
+        pendingGreetsRef.current.delete(key);
         log(`[DEBUG Zone Transitions] Cleared stale zone state for ${key}`);
       }
     }
@@ -67,6 +72,14 @@ export function handleZoneTransitions({
     );
 
     if (currentZ === "green") {
+      if (primaryGreenKey && p.key !== primaryGreenKey) {
+        prevZoneMapRef.current.set(p.key, currentZ);
+        log(
+          `[DEBUG Zone Transitions] Person ${p.key}: non-primary green ignored (primary=${primaryGreenKey})`
+        );
+        continue;
+      }
+
       let entry = greenEntryRef.current.get(p.key);
       if (!entry) {
         entry = { ts: now, greetedOnceInThisGreen: false };
@@ -81,7 +94,6 @@ export function handleZoneTransitions({
       const inGreenMs = now - (entry.ts || 0);
       const isStablyInGreen = inGreenMs >= GREEN_STABLE_MS;
 
-      const greenPeople = allIdentities.filter((q) => q.zone === "green");
       const everyoneReady =
         greenPeople.length > 0 &&
         greenPeople.every((q) => {
@@ -172,6 +184,12 @@ export function handleZoneTransitions({
             context: { attempt: s.tries },
           });
         }
+      } else if (currentZ === "none") {
+        sendPeopleIntent("none", { ...p, zone: "none" }, {
+          group: groupInfo,
+          reason: "left_green_zone",
+          guests: guestSnapshots,
+        });
       }
     } else {
       prevZoneMapRef.current.set(p.key, currentZ);
@@ -242,3 +260,4 @@ export function handleZoneTransitions({
 
   lastGroupSetRef.current = curSet;
 }
+

@@ -27,31 +27,17 @@ import {
   shrinkBox,
 } from "./utils/faceMath";
 import {
-  MP,
-  palmSpanLen,
-  recentLateralMotion,
-  setWaveHistory,
-  waveActivity,
-  classifyWave,
-  classifyThumbsUp,
-  classifyPeace,
-  classifyRaiseHand,
-  classifyOnPhone,
-  classifyPaper,
-  classifyRock,
-  classifyScissors,
-  pickStableGesture,
-  VOTE_WINDOW,
-} from "./utils/gestureUtils";
-import {
   getStoredNumber,
   encodeDescFloat32ToU8,
   decodeDescU8ToFloat32,
   u8ToB64,
   b64ToU8,
 } from "./utils/storageUtils";
-import ToggleSwitch from "./components/ToggleSwitch";
-import PeopleTable from "./components/PeopleTable";
+import StatusOverviewPanel from "./components/StatusOverviewPanel";
+import CameraStagePanel from "./components/CameraStagePanel";
+import ControlSidebarPanel from "./components/ControlSidebarPanel";
+import CameraControlsPanel from "./components/CameraControlsPanel";
+import GuestTablePanel from "./components/GuestTablePanel";
 import {
   DEFAULT_GUEST_STORE_KEY,
   dayKey,
@@ -65,14 +51,16 @@ import {
   maybeRotateSession,
 } from "./utils/sessionRotation";
 import { MSG_TYPE, useDirectWebSocket } from "./hooks/useDirectWebSocket";
-import { buildVisitContext as buildVisitContextUtil } from "./utils/visitContext";
-import {
-  exportSettings as exportSettingsUtil,
-  importSettings as importSettingsUtil,
-  resetSettings as resetSettingsUtil,
-} from "./utils/settingsUtils";
 import { useCamera } from "./hooks/useCamera";
-import { handleZoneTransitions } from "./utils/policyUtils";
+import { useControlActions } from "./hooks/useControlActions";
+import { useSessionPolicy } from "./hooks/useSessionPolicy";
+import { useServerBridge } from "./hooks/useServerBridge";
+import { useTelemetryEmitters } from "./hooks/useTelemetryEmitters";
+import { useFrameOutput } from "./hooks/useFrameOutput";
+import { usePresencePolicy } from "./hooks/usePresencePolicy";
+import { useGesturePipeline } from "./hooks/useGesturePipeline";
+import { useFaceCandidates } from "./hooks/useFaceCandidates";
+import { useFocusSelection } from "./hooks/useFocusSelection";
 
 /* ====================== CONSTANTS / CONFIG ====================== */
 const MODEL_URL = "/models";
@@ -92,9 +80,9 @@ const LOOP_STEP_IDLE_MAX_MS = 220;
 // recognition
 const MATCH_THRESHOLD = 0.5;
 const MATCH_MARGIN = 0.03;
-const STABILIZE_FRAMES = 3;
+const STABILIZE_FRAMES = 5;
 // Require ~5 stable active frames in green before firing greet
-const GREEN_STABLE_MS = STABILIZE_FRAMES * LOOP_STEP_ACTIVE_MS;
+const GREEN_STABLE_MS = 240;
 
 const CAM_IDLE_MS = 10000; // cam fully idle after 10s
 
@@ -114,15 +102,19 @@ const USE_DIRECT_WEBSOCKET = true; // policy + session pipeline (always on)
 // Loosen thresholds so slight head turns don't drop to NONE.
 const FACING_YAW_MAX_DEG = 35; // how "straight on" horizontally
 const FACING_PITCH_MAX_DEG = 25; // how "straight on" vertically
-const ATTEND_MIN_FRAMES = 3; // require 3-5 consecutive frames
+const ATTEND_MIN_FRAMES = 5; // require 3-5 consecutive frames
 const DEBUG_FACE_LOGS = false;
 const DEBUG_ZONE_LOGS = false;
+const DEBUG_PERF_LOGS = false;
 
 const logFace = (...args) => {
   if (DEBUG_FACE_LOGS) console.log(...args);
 };
 const logZone = (...args) => {
   if (DEBUG_ZONE_LOGS) console.log(...args);
+};
+const logPerf = (...args) => {
+  if (DEBUG_PERF_LOGS) console.log(...args);
 };
 // Minimum time between greets for the same identity (per p.key)
 const GREET_COOLDOWN_MS = 20_000;
@@ -139,12 +131,14 @@ const HANDS_ENABLED = true;
 // runtime & cadence
 const HANDS_FAST_MS = 66;
 const HANDS_IDLE_MS = 180;
+const HANDS_NO_TARGET_MS = 350;
 const HANDS_CACHE_MS = 1000;
 const HANDS_SEND_MS = 600;
 
 // Game mode cadence (snappier)
 const GM_HANDS_FAST_MS = 40;
 const GM_HANDS_IDLE_MS = 120;
+const GM_HANDS_NO_TARGET_MS = 220;
 
 // Hand constants
 const HANDS_MODEL_URL = "/mp/hand_landmarker.task";
@@ -204,7 +198,6 @@ export default function App() {
   const [autoSession, setAutoSession] = useState(
     localStorage.getItem("ika:autoSession") !== "false"
   );
-  const autoSessionPendingRef = useRef(false);
   useEffect(() => {
     try {
       localStorage.setItem("ika:autoSession", String(autoSession));
@@ -273,6 +266,111 @@ export default function App() {
     } catch {}
   }, [deviceId]);
 
+  /* ====================== RIGHT-PANEL STATE (Gemini / ElevenLabs) ====================== */
+  const MODEL_OPTIONS = [
+    {
+      value: "gemini-2.5-flash-live-preview",
+      label: "Gemini 2.5 Flash Live Preview (realtime)",
+      kind: "live",
+    },
+    {
+      value: "gemini-2.5-flash-preview-native-audio",
+      label: "Gemini 2.5 Flash Preview Native Audio (dialog)",
+      kind: "native",
+    },
+  ];
+
+  const LIVE_VOICES = [
+    "Puck",
+    "Charon",
+    "Kore",
+    "Fenrir",
+    "Aoede",
+    "Leda",
+    "Orus",
+    "Zephyr",
+  ];
+  const NATIVE_VOICES = [
+    "Zephyr",
+    "Puck",
+    "Charon",
+    "Kore",
+    "Fenrir",
+    "Leda",
+    "Orus",
+    "Aoede",
+    "Callirrhoe",
+    "Autonoe",
+    "Enceladus",
+    "Iapetus",
+    "Umbriel",
+    "Algieba",
+    "Despina",
+    "Erinome",
+    "Algenib",
+    "Rasalgethi",
+    "Laomedia",
+    "Achernar",
+    "Alnilam",
+    "Schedar",
+    "Gacrux",
+    "Pulcherrima",
+    "Achird",
+    "Zubenelgenubi",
+    "Vindemiatrix",
+    "Sadachbia",
+    "Sadaltager",
+  ];
+
+  const GEMINI_VOICES = { live: LIVE_VOICES, native: NATIVE_VOICES };
+
+  const [systemInstruction, setSystemInstruction] = useState(
+    () =>
+      localStorage.getItem("ika:systemInstruction") ||
+      "You are a friendly, concise on-site concierge."
+  );
+  const [modelQuick, setModelQuick] = useState(
+    () => localStorage.getItem("ika:model") || "gemini-2.5-flash-live-preview"
+  );
+  const modelKind = useMemo(
+    () => MODEL_OPTIONS.find((m) => m.value === modelQuick)?.kind || "live",
+    [modelQuick]
+  );
+  const voicesForKind = GEMINI_VOICES[modelKind] || LIVE_VOICES;
+
+  const [geminiVoiceQuick, setGeminiVoiceQuick] = useState(
+    () => localStorage.getItem("ika:voice") || "Puck"
+  );
+  const [languageCodeQuick, setLanguageCodeQuick] = useState(
+    () => localStorage.getItem("ika:langCode") || "en-US"
+  );
+  const [temperatureQuick, setTemperatureQuick] = useState(() =>
+    Number(localStorage.getItem("ika:temperature") ?? 0.6)
+  );
+
+  const [enableAffectiveQuick, setEnableAffectiveQuick] = useState(
+    () => localStorage.getItem("ika:enableAffective") === "true"
+  );
+  const [proactiveAudioQuick, setProactiveAudioQuick] = useState(
+    () => localStorage.getItem("ika:proactiveAudio") === "true"
+  );
+  const [functionCallingQuick, setFunctionCallingQuick] = useState(
+    () => localStorage.getItem("ika:functionCalling") === "true"
+  );
+  const [autoFunctionResponseQuick, setAutoFunctionResponseQuick] = useState(
+    () => localStorage.getItem("ika:autoFunctionResponse") === "true"
+  );
+  const [groundingQuick, setGroundingQuick] = useState(
+    () => localStorage.getItem("ika:grounding") === "true"
+  );
+
+  const [ttsProviderQuick, setTtsProviderQuick] = useState(() =>
+    (localStorage.getItem("ika:ttsProvider") || "gemini").toLowerCase()
+  );
+  const [elevenVoiceIdQuick, setElevenVoiceIdQuick] = useState(
+    () => localStorage.getItem("ika:11labs:voiceId") || ""
+  );
+
   const { wsIsConnected, sendCommand: sendWsCommand } = useDirectWebSocket({
     serverUrl: effectiveUrl,
     deviceId,
@@ -284,53 +382,27 @@ export default function App() {
     enabled: USE_DIRECT_WEBSOCKET,
   });
 
-  const createServerSession = useCallback(
-    (preset = {}) => {
-      sendWsCommand(MSG_TYPE.SessionStart, {
-        ...preset,
-        deviceId,
-        sessionId: sessionId || "web-" + deviceId,
-      });
-      bump("start");
-      setSessionStatus("ACTIVE");
-      setSessionId((id) => id || uuid());
-    },
-    [bump, deviceId, sendWsCommand, sessionId]
-  );
-
-  const updateServerSettings = useCallback(
-    (fields = {}) => {
-      socketRef.current?.emit?.("update_settings", fields);
-    },
-    []
-  );
-
-  const sendTextPrompt = useCallback((text) => {
-    if (!text) return;
-    socketRef.current?.emit?.("send_text_prompt", { text });
-  }, []);
-
-  const emitCrowdStatus = useCallback(
-    (payload) => {
-      socketRef.current?.emit?.("crowd_status", {
-        deviceId,
-        sessionId: sessionId || "web-" + deviceId,
-        ...payload,
-      });
-      bump("snapshot");
-    },
-    [bump, deviceId, sessionId]
-  );
-
-  const server = useMemo(
-    () => ({
-      createSession: createServerSession,
-      updateSettings: updateServerSettings,
-      sendText: sendTextPrompt,
-      crowdStatus: emitCrowdStatus,
-    }),
-    [createServerSession, emitCrowdStatus, sendTextPrompt, updateServerSettings]
-  );
+  const { server, onCreateSession, onHotUpdate } = useServerBridge({
+    socketRef,
+    sendWsCommand,
+    deviceId,
+    sessionId,
+    bump,
+    setSessionStatus,
+    setSessionId,
+    modelQuick,
+    geminiVoiceQuick,
+    languageCodeQuick,
+    systemInstruction,
+    ttsProviderQuick,
+    enableAffectiveQuick,
+    temperatureQuick,
+    proactiveAudioQuick,
+    captions,
+    functionCallingQuick,
+    autoFunctionResponseQuick,
+    groundingQuick,
+  });
 
   // Per-identity attention counting & cooldown
   const attentionMapRef = useRef(new Map());
@@ -348,17 +420,6 @@ export default function App() {
   // downscale buffer for hands
   const handsOffscreenRef = useRef(null);
   const handsCtxRef = useRef(null);
-
-  // last gesture memory
-  const stableGestureRef = useRef(null); // { type, score, t }
-
-  // NEW: Per-face gesture windows and stable picks
-  const perFaceGestureWinRef = useRef(new Map()); // key -> [{type,score,t}, ...]
-  const perFaceStableRef = useRef(new Map()); // key -> {type,score,t}
-  const lastGestureSentPerFaceRef = useRef(new Map()); // key -> lastTs
-
-  // NEW: per-face wave histories (used by wave/velocity gates)
-  const waveHistByFaceRef = useRef(new Map());
 
   // NEW: pending greets map (retry when age/gender available)
   const pendingGreetsRef = useRef(new Map()); // Map<personKey, { zone, timestamp }>
@@ -396,135 +457,20 @@ export default function App() {
   }, [weatherLabel]);
   const totalsRef = useRef({ all: 0, green: 0, red: 0 });
 
-  const buildVisitContext = useCallback(
-    (extra = {}) =>
-      buildVisitContextUtil({
-        clockRef,
-        locationRef,
-        weatherRef,
-        totalsRef,
-        extra,
-      }),
-    [clockRef, locationRef, weatherRef, totalsRef]
-  );
-
-  const sendPeopleIntent = useCallback(
-    (intent, person, extra = {}) => {
-      if (!wsIsConnected.current) {
-        return;
-      }
-
-      const identityKeyForPayload =
-        person.stableKey || person.key || person.gid || person.name || null;
-
-      const payload = {
-        intent,
-        zone: person.zone,
-        name: person.name || null,
-        gid: person.gid || null,
-        gender: person.gender || null,
-        ageGroup: person.ageGroup || null,
-        emotion: person.emotion || null,
-        yawDeg:
-          Number.isFinite(person.yawDeg) && person.yawDeg != null
-            ? +Number(person.yawDeg).toFixed(2)
-            : null,
-        pitchDeg:
-          Number.isFinite(person.pitchDeg) && person.pitchDeg != null
-            ? +Number(person.pitchDeg).toFixed(2)
-            : null,
-        mouthActivity:
-          Number.isFinite(person.mouthActivity) &&
-          person.mouthActivity != null
-            ? +Number(person.mouthActivity).toFixed(3)
-            : null,
-        posCam: person.posCam || null,
-        stableKey: identityKeyForPayload,
-        slotKey: person.slotKey || null,
-        group: extra.group || null,
-        reason: extra.reason || null,
-        guests: extra.guests || null,
-        context: buildVisitContext(extra.context || {}),
-      };
-
-      sendWsCommand(MSG_TYPE.PeopleData, payload);
-    },
-    [buildVisitContext, sendWsCommand, wsIsConnected]
-  );
-
-  const lastCrowdSendRef = useRef({ t: 0, sig: "" });
-  const lastPeopleSnapshotSentRef = useRef(0);
-  function emitCrowdThrottled(payload) {
-    const now = performance.now();
-    const MIN_MS = 66;
-    const state = lastCrowdSendRef.current;
-    const ppl = (payload.people || []).map((p) => [
-      p.yawDeg,
-      p.pitchDeg,
-      Math.round((p.mouthActivity || 0) * 1000),
-    ]);
-    
-    const sig = JSON.stringify([payload.focusIndex, ppl]);
-    
-    if (now - state.t < MIN_MS && sig === state.sig) return;
-
-    try {
-      sendWsCommand(MSG_TYPE.CrowdStat, {
-        ...payload,
-        context: buildVisitContext(),
-      });
-    } catch {}
-    lastCrowdSendRef.current = { t: now, sig };
-  }
-
-
-  function emitCrowdByGid(payload){
-    const now = performance.now();
-    const MIN_MS = 1000;
-    const state = lastCrowdSendRef.current;
-    const ppl = (payload.people || []).map((p) => [
-      p.gid
-    ]);
-
-    if ((now - state.t) <= MIN_MS) 
-      return;
-    
-    const peopleCandidate = payload.people || [];
-    if(peopleCandidate.length == 0) return;
-
-    //send all data iterating by gid
-    for(const p of peopleCandidate){
-      if(p.gid == null) continue;
-      try 
-      {
-        /*
-        sendWsCommand(MSG_TYPE.CrowdStat, {
-          ...payload,
-          context: buildVisitContext(),
-        });*/
-
-        const dataToSend = {
-          deviceId : payload.deviceId,
-          timestamp : payload.timeISO,
-          sessionId : payload.sessionId,
-          gesture : (p.gesture || null),
-          context : buildVisitContext(),
-          people: p
-
-        };
-        
-        sendWsCommand(MSG_TYPE.CrowdStat, dataToSend);
-      } 
-      catch 
-      {
-        continue;
-      }
-    }
-    
-    //const sig = JSON.stringify([ppl]);
-    lastCrowdSendRef.current = { t: now };
-    
-  }
+  const {
+    buildVisitContext,
+    sendPeopleIntent,
+    emitCrowdThrottled,
+    emitCrowdByGid,
+    sendGreenSnapshot,
+  } = useTelemetryEmitters({
+    clockRef,
+    locationRef,
+    weatherRef,
+    totalsRef,
+    sendWsCommand,
+    wsIsConnected,
+  });
 
   // Camera + detection state
   const videoRef = useRef(null);
@@ -603,6 +549,7 @@ export default function App() {
 
   const prevZoneMapRef = useRef(new Map());
   const callOverStateRef = useRef(new Map());
+  const greetInviteRef = useRef(new Map());
   const lastGroupSetRef = useRef(new Set());
   const lastGroupAskTsRef = useRef(0);
   const speakerRef = useRef({
@@ -675,6 +622,41 @@ export default function App() {
   const faceMatcherRef = useRef(null);
   const [knownCount, setKnownCount] = useState(0);
 
+  const preloadFaceMatcher = useCallback(async () => {
+    const res = await fetch(LABELS_URL, { cache: "no-store" });
+    const data = await res.json();
+
+    const entries = Array.isArray(data)
+      ? data
+      : Object.entries(data).map(([label, descriptors]) => ({
+          label,
+          descriptors,
+        }));
+
+    const labeled = await Promise.all(
+      entries.map(async (e) => {
+        let descs = [];
+        if (Array.isArray(e.descriptors_b64)) {
+          descs = e.descriptors_b64.map((b64) =>
+            decodeDescU8ToFloat32(b64ToU8(b64))
+          );
+        } else if (Array.isArray(e.descriptors)) {
+          descs = e.descriptors.map((arr) =>
+            arr instanceof Float32Array ? arr : new Float32Array(arr)
+          );
+        }
+        descs = descs.filter((d) => d && d.length === 128);
+        return new faceapi.LabeledFaceDescriptors(e.label, descs);
+      })
+    );
+
+    const usable = labeled.filter((l) => l.descriptors?.length);
+    const matcher = new faceapi.FaceMatcher(usable, MATCH_THRESHOLD);
+    const count = usable.reduce((acc, l) => acc + l.descriptors.length, 0);
+
+    return { matcher, count };
+  }, []);
+
   const guestSeqRef = useRef(1);
   const guestMemRef = useRef([]);
   const GUEST_TOL = 0.6;
@@ -728,21 +710,27 @@ export default function App() {
     onCameraGone: (opts) => stopAll(opts),
   });
 
-  const exportSettings = () => exportSettingsUtil("ika:");
-
-  const importSettings = () => importSettingsUtil("ika:");
-
-  const applyDeviceId = useCallback(() => {
-    const next = (deviceIdDraft || "").trim();
-    if (!next || next === deviceId) return;
-    setDeviceId(next);
-  }, [deviceIdDraft, deviceId]);
-
-  const randomizeDeviceId = useCallback(() => {
-    setDeviceId(uuid());
-  }, []);
-
-  const resetSettings = () => resetSettingsUtil("ika:");
+  const {
+    exportSettings,
+    importSettings,
+    resetSettings,
+    applyDeviceId,
+    randomizeDeviceId,
+    handleClearGuests,
+    handleVideoChange,
+    handleRestartCamera,
+    handleStopCamera,
+  } = useControlActions({
+    deviceIdDraft,
+    deviceId,
+    setDeviceId,
+    guestSeqRef,
+    guestMemRef,
+    saveGuestMemSafe,
+    setVideoId,
+    startCamera,
+    stopAll,
+  });
 
   // HANDS: detect with VIDEO first, fallback to IMAGE if needed ----
   const detectHandsOnce = useCallback(async (videoEl) => {
@@ -827,19 +815,6 @@ export default function App() {
     () => localStorage.getItem("ika:gesturesOn") === "true"
   );
   const gesturesOnRef = useRef(false);
-  useEffect(() => {
-    gesturesOnRef.current = gesturesOn;
-    try {
-      localStorage.setItem("ika:gesturesOn", String(gesturesOn));
-    } catch { }
-    if (!gesturesOn) {
-      // clear per-face gesture state immediately
-      perFaceGestureWinRef.current = new Map();
-      perFaceStableRef.current = new Map();
-      lastGestureSentPerFaceRef.current = new Map();
-      stableGestureRef.current = null;
-    }
-  }, [gesturesOn]);
 
   // Keep camera alive when tab is in background (Windows fix)
   const [keepBgOn, setKeepBgOn] = useState(
@@ -980,12 +955,22 @@ export default function App() {
         setBackend(backendNameRef.current); // keep your UI/backend label in sync
         backendReadyRef.current = Promise.resolve();
 
-        await Promise.all([
+        const [_, preloadedMatcher] = await Promise.all([
           faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
           faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
           faceapi.nets.ageGenderNet.loadFromUri(MODEL_URL),
           faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
+          preloadFaceMatcher().catch((err) => {
+            console.warn("[labels] preload failed:", err);
+            return null;
+          }),
         ]);
+
+        if (!cancelled && preloadedMatcher) {
+          faceMatcherRef.current = preloadedMatcher.matcher;
+          setKnownCount(preloadedMatcher.count);
+          console.log("[labels] preloaded matcher:", preloadedMatcher.count);
+        }
 
         console.log("[models] loaded:", {
           tiny: !!faceapi.nets.tinyFaceDetector?.isLoaded,
@@ -1022,7 +1007,7 @@ export default function App() {
       stopAll({ reason: "unmount" });
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [preloadFaceMatcher]);
 
   // --- HandLandmarker (force CPU, IMAGE mode for smoke test) ---
   useEffect(() => {
@@ -1095,44 +1080,15 @@ export default function App() {
   /* ---------- Labels + matcher ---------- */
   useEffect(() => {
     if (!ready) return;
+    if (faceMatcherRef.current) return;
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch(LABELS_URL, { cache: "no-store" });
-        const data = await res.json();
-
-        const entries = Array.isArray(data)
-          ? data
-          : Object.entries(data).map(([label, descriptors]) => ({
-            label,
-            descriptors,
-          }));
-
-        const labeled = await Promise.all(
-          entries.map(async (e) => {
-            let descs = [];
-            if (Array.isArray(e.descriptors_b64)) {
-              descs = e.descriptors_b64.map((b64) =>
-                decodeDescU8ToFloat32(b64ToU8(b64))
-              );
-            } else if (Array.isArray(e.descriptors)) {
-              descs = e.descriptors.map((arr) =>
-                arr instanceof Float32Array ? arr : new Float32Array(arr)
-              );
-            }
-            descs = descs.filter((d) => d && d.length === 128);
-            return new faceapi.LabeledFaceDescriptors(e.label, descs);
-          })
-        );
-
-        const usable = labeled.filter((l) => l.descriptors?.length);
-        const matcher = new faceapi.FaceMatcher(usable, MATCH_THRESHOLD);
+        const { matcher, count } = await preloadFaceMatcher();
 
         if (!cancelled) {
           faceMatcherRef.current = matcher;
-          setKnownCount(
-            usable.reduce((acc, l) => acc + l.descriptors.length, 0)
-          );
+          setKnownCount(count);
         }
       } catch (err) {
         console.warn("[labels] failed:", err);
@@ -1145,7 +1101,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [ready]);
+  }, [preloadFaceMatcher, ready]);
 
   /* ---------- Preferences & devices ---------- */
   useEffect(() => {
@@ -1234,7 +1190,9 @@ export default function App() {
   // load per-camera greenMaxM
   useEffect(() => {
     try {
-      const gm = localStorage.getItem(`ika:greenMaxM:${videoId || "default"}`);
+      const gm =
+        localStorage.getItem(`ika:greenMaxM:${videoId || "default"}`) ??
+        localStorage.getItem("ika:greenMaxM");
       if (gm != null) {
         const v = parseFloat(gm);
         if (Number.isFinite(v)) setGreenMaxM(Math.min(2.0, Math.max(0.3, v)));
@@ -1338,6 +1296,7 @@ export default function App() {
       detecting = true;
       let frameCandidates = [];
       let guestSnapshots = [];
+      const perf = { frameStart: now, detectMs: 0, buildMs: 0, drawMs: 0, handsMs: 0, policyMs: 0 };
       try {
         if (isCamLive()) {
           lastFrameTsRef.current = performance.now();
@@ -1360,6 +1319,7 @@ export default function App() {
 
         //#region detection chain
         let dets = [];
+        const detectStart = performance.now();
         try {
           let chain = faceapi.detectAllFaces(video, tinyOptsRef.current);
           if (faceapi.nets.faceLandmark68Net?.isLoaded)
@@ -1375,27 +1335,13 @@ export default function App() {
         }
 
         //#endregion
+        perf.detectMs = performance.now() - detectStart;
 
         logFace(`[DEBUG Face Detection] Detected ${dets.length} faces, wsConnected=${wsIsConnected.current}`);
 
         //  FIX: Send PeopleData with zone="none" when no faces detected
         if (dets.length === 0 && wsIsConnected.current) {
-          logFace(`[DEBUG Face Detection] No faces detected - sending zone="none"`);
-          sendWsCommand(MSG_TYPE.PeopleData, {
-            intent: "none",
-            zone: "none",
-            guests: [],
-            context: buildVisitContext(),
-          });
-
-          // Reset local zone/greet tracking state when camera sees nobody.
-          try {
-            prevZoneMapRef.current.clear();
-            greenEntryRef.current.clear();
-            callOverStateRef.current.clear();
-            pendingGreetsRef.current.clear();
-            logZone("[DEBUG Zone Transitions] Cleared zone/greet state (no faces present)");
-          } catch {}
+          handleNoFaceDetected();
         }
 
         // ==== drawing + bookkeeping ====
@@ -1445,108 +1391,33 @@ export default function App() {
           .resizeResults(dets, { width: canvas.width, height: canvas.height })
           .sort((a, b) => a.detection.box.x - b.detection.box.x);
 
-        const matcher = faceMatcherRef.current;
-        const rows = [];
-        const peopleForPost = [];
-        let total = 0,
-          green = 0,
-          red = 0;
-
-        // build candidates (same as before)
-        const cutoff = Number.isFinite(redCutoffM) ? redCutoffM : Infinity;
-        const candidates = [];
-        for (let i = 0; i < resized.length; i++) {
-          const det = resized[i];
-          const box = det.detection.box;
-          const dist = estimateDistanceMpx(box.width);
-          if (dist != null && dist > cutoff) continue; // skip way too far
-
-          // Calculate face center X position for center-frame filtering
-          const faceCenterX = box.x + box.width / 2;
-          const frameWidth = canvas.width;
-          const leftBoundary = frameWidth * (1 / 3 - 1 / 8); // match widened green zone (~0.208w)
-          const rightBoundary = frameWidth * (2 / 3 + 1 / 8); // match widened green zone (~0.792w)
-          const isInCenter = faceCenterX >= leftBoundary && faceCenterX <= rightBoundary;
-          const zone = zoneOf(dist, greenMaxMRef.current, faceCenterX, frameWidth);
-
-          logFace(`[DEBUG Face Detection] Face ${i}: dist=${dist?.toFixed(2)}m, centerX=${faceCenterX.toFixed(0)}/${frameWidth} (L:${leftBoundary.toFixed(0)} R:${rightBoundary.toFixed(0)}), inCenter=${isInCenter}, zone=${zone}, greenMax=${greenMaxMRef.current}`);
-          candidates.push({ i, det, box, dist, zone });
-        }
+        const buildStart = performance.now();
+        const {
+          rows,
+          peopleForPost,
+          gestureAllowedKeys,
+          tracked,
+          candidates,
+          total,
+          green,
+          red,
+          guestSnapshots: frameGuestSnapshots,
+        } = buildFaceFrameData({
+          resized,
+          canvas,
+          ctx,
+          now,
+          redCutoffM,
+          showAlign: showAlignRef.current,
+        });
         frameCandidates = candidates;
-
-        // Totals for status policy (all visible faces within cutoff)
-        total = candidates.length;
-        green = candidates.filter((c) => c.zone === "green").length;
-        red = total - green;
+        guestSnapshots = frameGuestSnapshots;
+        perf.buildMs = performance.now() - buildStart;
 
         // === RED ZONE CALL-OVER DETECTION (NONE -> RED) ===
         // This runs every frame to detect NONE->RED transitions with stabilization
-        try {
-          const hasRedOnly = red > 0 && green === 0; // People in RED zone, none in GREEN
-          const hasNone = total === 0; // Nobody detected at all
-
-          if (hasNone) {
-            // Increment NONE counter, reset RED counter
-            noneZoneCounterRef.current += 1;
-            redZoneCounterRef.current = 0; // STRICT: Any flicker resets RED counter
-            if (noneZoneCounterRef.current <= 3 || noneZoneCounterRef.current === RED_ZONE_NONE_RESET_FRAMES) {
-              logZone(`[RED Zone] NONE frame ${noneZoneCounterRef.current}/${RED_ZONE_NONE_RESET_FRAMES} (total=${total})`);
-            }
-
-            // After 15 consecutive NONE frames, allow RED zone to trigger again
-            if (noneZoneCounterRef.current >= RED_ZONE_NONE_RESET_FRAMES) {
-              if (redZoneTriggeredRef.current) {
-                logZone(`[RED Zone] Reset after ${RED_ZONE_NONE_RESET_FRAMES} NONE frames`);
-                redZoneTriggeredRef.current = false;
-              }
-            }
-          } else if (hasRedOnly) {
-            // Increment RED counter, reset NONE counter
-            redZoneCounterRef.current += 1;
-            noneZoneCounterRef.current = 0; // STRICT: Any flicker resets NONE counter
-            logZone(`[RED Zone] Frame ${redZoneCounterRef.current}/${RED_ZONE_STABLE_FRAMES} (red=${red}, green=${green})`);
-
-            // Send PeopleData on EVERY RED frame (server ZoneMonitor needs continuous frames)
-            if (wsIsConnected.current) {
-              const redPayload = {
-                intent: "none", // No specific intent, just zone data
-                zone: "red",
-                guests: Array.from({ length: red }, (_, i) => ({
-                  gid: `RedGuest${i + 1}`,
-                  name: null,
-                  gender: null,
-                  ageGroup: null,
-                  zone: "red"
-                })),
-                context: buildVisitContext()
-              };
-
-              // Log only on first send and every 5th frame
-              if (redZoneCounterRef.current === 1 || redZoneCounterRef.current % 5 === 0) {
-                logZone(`[RED Zone] Sending PeopleData frame ${redZoneCounterRef.current}:`, redPayload);
-              }
-              sendWsCommand(MSG_TYPE.PeopleData, redPayload);
-
-              // Mark as triggered after first stable detection (for any future logic)
-              if (redZoneCounterRef.current >= RED_ZONE_STABLE_FRAMES && !redZoneTriggeredRef.current) {
-                logZone(`[RED Zone] OK STABLE: ${redZoneCounterRef.current} consecutive RED frames detected`);
-                redZoneTriggeredRef.current = true;
-              }
-            }
-          } else {
-            // Mixed GREEN + RED, or just GREEN - reset both counters
-            redZoneCounterRef.current = 0;
-            noneZoneCounterRef.current = 0;
-          }
-        } catch (err) {
-          console.error("[RED Zone] Error in detection logic:", err);
-        }
-
-        // 2) Only TRACK up to 5 people in the GREEN zone, nearest first
-        const greenCandidates = candidates
-          .filter((c) => c.zone === "green" && Number.isFinite(c.dist))
-          .sort((a, b) => a.dist - b.dist);
-        const tracked = greenCandidates.slice(0, 5);
+        const drawStart = performance.now();
+        processRedZoneState({ total, green, red });
 
         if (tracked.length) {
           ctx.save();
@@ -1559,316 +1430,6 @@ export default function App() {
           ctx.fillText(msg, 15, 24);
           ctx.restore();
         }
-
-        // Define per-frame gesture eligibility set (top-2 will be added below)
-        const gestureAllowedKeys = new Set();
-
-        // 3) Draw + identify only the tracked subset (stable by name/gid)
-        const tracks = recentMapRef.current;
-        for (let k = 0; k < tracked.length; k++) {
-          const { i, det, box, dist, zone } = tracked[k];
-
-          // --- recognition (fast path + small margin check) ---
-          const matcher = faceMatcherRef.current;
-          let name = null;
-          if (matcher && det.descriptor) {
-            
-            const best = matcher.findBestMatch(det.descriptor);
-            if (
-              best &&
-              best.label !== "unknown" &&
-              best.distance <= MATCH_THRESHOLD
-            ) {
-              name = best.label;
-            } else if (
-              best &&
-              best.label !== "unknown" &&
-              best.distance <= MATCH_THRESHOLD + 0.03
-            ) {
-              // Lightweight margin check vs next-best label
-              const bestLabel = best.label;
-              const bestDist = best.distance;
-              let second = 1;
-              for (const ld of matcher.labeledDescriptors) {
-                if (ld.label === bestLabel) continue;
-                for (const d of ld.descriptors) {
-                  const dd = faceapi.euclideanDistance(det.descriptor, d);
-                  if (dd < second) second = dd;
-                }
-              }
-              if (second - bestDist >= MATCH_MARGIN) name = bestLabel;
-            }
-          }
-
-          // --- guest id & display name ---
-          let guestId = null;
-          if (!name) guestId = assignGuestIdFor(det.descriptor);
-          let displayName = name || guestId || "Guest";
-
-          // --- stabilization keyed by stable identity (name or gid), not by index ---
-          const stableKey = (name || guestId) ?? `tmp-${i}`;
-
-          // Slot key (stable within this frame order; decouples from identity collisions)
-          const slotKey = `slot-${k}`;
-
-          // Mark top-2 by distance as gesture-eligible
-          if (gesturesOnRef.current && k < gestureTargetsRef.current)
-            gestureAllowedKeys.add(stableKey);
-
-          const prev = tracks[stableKey];
-          if (prev && prev.name !== displayName) {
-            if ((prev.count || 0) < STABILIZE_FRAMES) {
-              displayName = prev.name;
-              prev.count = (prev.count || 0) + 1;
-            } else {
-              tracks[stableKey] = { name: displayName, count: 0 };
-            }
-          } else {
-            tracks[stableKey] = { name: displayName, count: 0 };
-          }
-
-          // pick gender/age with staggered cache
-          const cacheGA = ageGenderCacheRef.current.get(stableKey) || {};
-          const genderRaw = det.gender ?? cacheGA.gender ?? "";
-          const gender = String(genderRaw || "").toLowerCase();
-          const ageVal = Number.isFinite(det.age)
-            ? det.age
-            : Number.isFinite(cacheGA.age)
-              ? cacheGA.age
-              : null;
-          if (heavyAgeNow && (Number.isFinite(det.age) || det.gender)) {
-            ageGenderCacheRef.current.set(stableKey, {
-              age: det.age,
-              gender: det.gender,
-            });
-          }
-          const expr = topExpression(det.expressions);
-
-          // === angles / position / mouth activity / draw ===
-          const dbox = shrinkBox(box);
-          const cx = dbox.x + dbox.width * 0.5;
-          const cy = dbox.y + dbox.height * 0.45;
-
-          const fx = camFxRef.current,
-            fy = camFyRef.current;
-          const cx0 = canvas.width * 0.5,
-            cy0 = canvas.height * 0.5;
-
-          const { yaw, pitch } = anglesFromPixel(cx, cy, fx, fy, cx0, cy0);
-          let yawDeg = yaw * RAD + panOffRef.current;
-          let pitchDeg = pitch * RAD + tiltOffRef.current;
-
-          const Z = Number.isFinite(dist) ? dist : null;
-          const pos =
-            Z != null
-              ? posFromPixel(cx, cy, fx, fy, cx0, cy0, Z)
-              : { x: null, y: null, z: null };
-
-          const normX = Math.min(
-            1,
-            Math.abs((cx - cx0) / (canvas.width * 0.5))
-          );
-          const normY = Math.min(
-            1,
-            Math.abs((cy - cy0) / (canvas.height * 0.5))
-          );
-          const centerNorm = Math.min(1, Math.hypot(normX, normY));
-
-          // mouth EMA with hold (avoid 0-drops)
-          let mouthActivity = 0;
-          const lmBox = det.detection?.box;
-
-          try {
-            const lm = det.landmarks;
-            const key = stableKey;
-            const rec = mouthMapRef.current.get(key) || { ema: 0.3, t: now };
-            const level = mouthMAR(lm);
-            if (!Number.isFinite(level) || level <= 0) {
-              // hold previous with gentle decay toward neutral 0.3
-              rec.ema = 0.98 * rec.ema + 0.02 * 0.3;
-            } else {
-              rec.ema = rec.ema ? 0.7 * rec.ema + 0.3 * level : level;
-            }
-            rec.t = now;
-            mouthMapRef.current.set(key, rec);
-            mouthActivity = Math.max(0, Math.min(1, rec.ema));
-          } catch {
-            const rec = mouthMapRef.current.get(stableKey);
-            if (rec) mouthActivity = rec.ema; // hold last
-          }
-
-          // draw box
-          ctx.strokeStyle = "#22c55e";
-          ctx.lineWidth = BOX_LINE_WIDTH;
-          ctx.strokeRect(dbox.x, dbox.y, dbox.width, dbox.height);
-
-          // Per-face gesture label (no global fallback -> true separation)
-          const faceStable = perFaceStableRef.current.get(stableKey);
-          const freshFaceGesture =
-            gestureAllowedKeys.has(stableKey) &&
-              faceStable &&
-              now - faceStable.t <= HANDS_CACHE_MS
-              ? faceStable
-              : null;
-
-          const gestureLbl =
-            zone === "green" && freshFaceGesture
-              ? gestureLabelOf(freshFaceGesture)
-              : null;
-
-          const ageTxt = Number.isFinite(ageVal)
-            ? Math.max(0, Math.round(ageVal))
-            : "-";
-          const l1 = `${displayName}${gestureLbl ? "  |  " + gestureLbl : ""
-            }  |  ${zone}  |  ${ageTxt} ${gender}  |  ${expr}`;
-          const l2 = `yaw ${yawDeg.toFixed(1)} deg | pitch ${pitchDeg.toFixed(
-            1
-          )} deg | mouth ${mouthActivity.toFixed(2)} | landmarks :${lmBox.x}`;
-
-          // ----- LABEL DRAW (fixed: define color; removed duplicate vars/badges) -----
-          const color =
-            zone === "green" ? "rgba(34,197,94,0.85)" : "rgba(239,68,68,0.85)";
-          const lineH = 18;
-          const lines = showAlignRef.current ? 2 : 1;
-          const tw =
-            Math.max(
-              ctx.measureText(l1).width,
-              showAlignRef.current ? ctx.measureText(l2).width : 0
-            ) +
-            LABEL_PAD_X * 2;
-          const th = lineH * lines + LABEL_PAD_Y * 2;
-
-          //general location of the face
-          const lx = Math.max(0, Math.min(dbox.x, canvas.width - tw));
-          const ly = Math.max(0, dbox.y - th - 4);
-
-          // pill background
-          ctx.fillStyle = color;
-          ctx.fillRect(lx, ly, tw, th);
-
-          // text
-          ctx.fillStyle = "#fff";
-          ctx.fillText(l1, lx + LABEL_PAD_X, ly + LABEL_PAD_Y);
-          if (showAlignRef.current) {
-            ctx.fillStyle = "#e9ffef";
-            ctx.fillText(l2, lx + LABEL_PAD_X, ly + LABEL_PAD_Y + lineH);
-          }
-
-          // tiny mouth bar
-          if (showAlignRef.current) {
-            const barW = 64,
-              barH = 5,
-              gap = 3;
-            const bx = lx,
-              by = ly + th + gap;
-            ctx.fillStyle = "rgba(255,255,255,0.15)";
-            ctx.fillRect(bx, by, barW, barH);
-            ctx.fillStyle = "#22c55e";
-            ctx.fillRect(
-              bx,
-              by,
-              barW * Math.min(1, Math.max(0, mouthActivity)),
-              barH
-            );
-          }
-
-          // Per-face gesture text badge on box (keep only this one)
-          if (freshFaceGesture && zone === "green") {
-            const gtxt = gestureLabelOf(freshFaceGesture);
-            if (gtxt) {
-              ctx.save();
-              ctx.font =
-                "bold 14px system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif";
-              const padX = 6,
-                padY = 4;
-              const tw2 = ctx.measureText(gtxt).width + padX * 2;
-              const th2 = 18 + padY * 2;
-              const gx = Math.max(
-                0,
-                Math.min(dbox.x + dbox.width - tw2 - 4, canvas.width - tw2)
-              );
-              const gy = Math.max(0, dbox.y + 4);
-              ctx.fillStyle = "rgba(34,197,94,0.9)";
-              ctx.fillRect(gx, gy, tw2, th2);
-              ctx.fillStyle = "#fff";
-              ctx.fillText(gtxt, gx + padX, gy + padY);
-              ctx.restore();
-            }
-          }
-
-          // table + server payload
-          rows.push({
-            idx: rows.length + 1,
-            name: displayName,
-            gesture: gestureLbl || "-",
-            emotion: expr || "-",
-            zone,
-            ageGroup: ageGroupOf(ageVal),
-            gender,
-            distance: dist ? dist.toFixed(2) + " m" : "-",
-          });
-
-          //gathering all green zone 
-          peopleForPost.push({
-            gender,
-            ageGroup: ageGroupOf(ageVal),
-            zone,
-            name: name || null,
-            gid: guestId || null,
-            emotion: expr,
-            yawDeg,
-            pitchDeg,
-            posCam: pos,
-            centerNorm,
-            mouthActivity,
-            stableKey, // carry stable identity for hand/gesture mapping
-            slotKey, // optional: keep slot for debug/UI
-            _cx: cx,
-            _cy: cy,
-            _w: dbox.width,
-            _h: dbox.height,
-            _can_w : canvas.width,
-            _can_h : canvas.height,
-          });
-
-          console.log(`canvas width :${canvas.width} | height :${canvas.height}`);
-        }
-
-        // remember face centers for click-to-zero + per-face hands mapping
-        trackedFacesRef.current = peopleForPost.map((p, idx) => ({
-          cx: p._cx,
-          cy: p._cy,
-          w: p._w,
-          h: p._h,
-          yawDeg: p.yawDeg,
-          pitchDeg: p.pitchDeg,
-          key: p.stableKey,
-          name: p.name || null,
-          gid: p.gid || null,
-          index: idx,
-          gestureEligible: gestureAllowedKeys.has(p.stableKey),
-          z: p.posCam?.z ?? null, // NEW: carry depth
-        }));
-
-        
-        guestSnapshots = peopleForPost.map((p) => ({
-          name: p.name || null,
-          zone: p.zone,
-          gender: p.gender || null,
-          ageGroup: p.ageGroup || null,
-        }));
-
-        // Also expose ALL faces (GREEN + RED) for hand proximity (on_phone)
-        allFacesRef.current = candidates.map((c) => 
-        {
-          const d = shrinkBox(c.box);
-          return {
-            cx: d.x + d.width * 0.5,
-            cy: d.y + d.height * 0.45,
-            w: d.width,
-            h: d.height,
-          };
-        });
 
         // --- ALSO draw non-tracked faces so RED is visible ---
         try {
@@ -1933,6 +1494,7 @@ export default function App() {
           ctx.restore();
         } catch {}
 
+        perf.drawMs = performance.now() - drawStart;
         // prune only faces that are no longer tracked (preserve history for tracked-but-not-eligible)
         {
           const keep = new Set(
@@ -1941,142 +1503,35 @@ export default function App() {
           for (const k of Array.from(mouthMapRef.current.keys())) {
             if (!keep.has(k)) mouthMapRef.current.delete(k);
           }
-          for (const k of Array.from(perFaceStableRef.current.keys())) {
-            if (!keep.has(k)) perFaceStableRef.current.delete(k);
-          }
-          for (const k of Array.from(waveHistByFaceRef.current.keys())) {
-            if (!keep.has(k)) waveHistByFaceRef.current.delete(k);
-          }
+          pruneGestureState(keep);
         }
 
         // prune unused track slots (use stable keys: name or gid)
         {
-          const seen = new Set(
-            peopleForPost.map((p) => (p.name || p.gid) ?? "")
-          );
+          const seen = new Set();
+          for (const p of peopleForPost) {
+            seen.add((p.name || p.gid) ?? "");
+          }
           for (const k of Object.keys(recentMapRef.current)) {
             if (k && !seen.has(k)) delete recentMapRef.current[k];
           }
         }
 
-        // === Focus selection (prefer GREEN, fallback to any tracked) ===
-        const pool = peopleForPost.filter((p) => p.zone === "green");
-        const cand = pool.length ? pool : peopleForPost;
-
-        let focusIndex = cand.length ? 0 : -1;
-        let focusScore = -1,
-          focusMeta = null;
-
-        for (let idx = 0; idx < cand.length; idx++) {
-          const p = cand[idx];
-          let sNear = 0;
-          const z = p?.posCam?.z;
-          if (Number.isFinite(z) && z > 0) {
-            sNear = Math.max(
-              0,
-              Math.min(1, (2.0 - Math.min(2.0, Math.max(0.3, z))) / (2.0 - 0.3))
-            );
-          }
-          const sCenter = 1 - Math.max(0, Math.min(1, p.centerNorm ?? 1));
-          const sMouth = Math.max(0, Math.min(1, p.mouthActivity ?? 0));
-          const score = wNear * sNear + wCenter * sCenter + wMouth * sMouth;
-          if (score > focusScore) {
-            focusScore = score;
-            focusIndex = idx;
-            focusMeta = {
-              sNear: +sNear.toFixed(3),
-              sCenter: +sCenter.toFixed(3),
-              sMouth: +sMouth.toFixed(3),
-              score: +score.toFixed(3),
-            };
-          }
-        }
+        const { cand, focusIndex } = selectFocus(peopleForPost);
 
         // Save focus so other blocks (hands/policy) can include it
-        if (focusIndex >= 0) {
-          const p = cand[focusIndex];
-          focusIndexRef.current = peopleForPost.indexOf(p);
-          focusTargetRef.current = { name: p.name || null, gid: p.gid || null };
-        } else {
-          focusIndexRef.current = -1;
-          focusTargetRef.current = null;
-        }
+        updateFocusTarget({ focusIndex, cand, peopleForPost });
+        const fresh = getFreshGesture(now);
 
-        if(cand.length > 0){
-          if (wsIsConnected.current) {
-            const ts = performance.now();
-            if (ts - (lastPeopleSnapshotSentRef.current || 0) >= 200) {
-              const guests = cand.map((p) => ({
-                gid: p.gid || null,
-                name: p.name || null,
-                gender: p.gender || null,
-                ageGroup: p.ageGroup || null,
-                zone: "green",
-              }));
-
-              sendWsCommand(MSG_TYPE.PeopleData, {
-                intent: "none",
-                zone: "green",
-                guests,
-                context: buildVisitContext(),
-              });
-
-              lastPeopleSnapshotSentRef.current = ts;
-            }
-          }
-
-          //emit all green face here
-          console.log(`[EMIT] Crowd data: ${JSON.stringify(cand)}`);
-          /*
-          emitCrowdThrottled({
-                  deviceId,
-                  sessionId: sessionId || "web-" + deviceId,
-                  timeISO: new Date().toISOString(),
-                  backend,
-                  totals: green,
-                  gesture: gesturesOnRef.current ? fresh : null,
-                  focusIndex: focusIndexRef.current,
-                  focusTarget: focusTargetRef.current,
-                  people: cand
-                });*/
-
-          emitCrowdByGid({deviceId,
-                  sessionId: sessionId || "web-" + deviceId,
-                  timeISO: new Date().toISOString(),
-                  backend,
-                  totals: green,
-                  gesture: gesturesOnRef.current ? fresh : null,
-                  focusIndex: focusIndexRef.current,
-                  focusTarget: focusTargetRef.current,
-                  people: cand
-                });
-        }
-
-        // Always render 5 rows max; pad if fewer tracked
-        while (rows.length < 5) {
-          rows.push({
-            idx: rows.length + 1,
-            gender: "-",
-            ageGroup: "-",
-            zone: "-",
-            name: "-",
-            gesture: "-",
-            emotion: "-",
-            distance: "-",
-          });
-        }
-
-        setTable((prev) => {
-          const same =
-            prev.length === rows.length &&
-            prev.every((r, i) => JSON.stringify(r) === JSON.stringify(rows[i]));
-          return same ? prev : rows;
+        commitFrameOutput({
+          cand,
+          peopleForPost,
+          rows,
+          total,
+          green,
+          red,
+          fresh,
         });
-        setTotals((prev) =>
-          prev.all === total && prev.green === green && prev.red === red
-            ? prev
-            : { all: total, green, red }
-        );
 
         // Game mode auto-exit on no-face stretch
         if (gameModeRef.current) {
@@ -2112,8 +1567,15 @@ export default function App() {
         const handsEligible =
           HANDS_ENABLED && handsReadyRef.current && gesturesOnRef.current;
         const gm = !!gameModeRef.current;
+        const hasGestureTargets = trackedFacesRef.current.some(
+          (f) => f.gestureEligible
+        );
         const handsDesiredStep =
-          now - (lastLmSeenTsRef.current || 0) <= 800
+          !hasGestureTargets
+            ? gm
+              ? GM_HANDS_NO_TARGET_MS
+              : HANDS_NO_TARGET_MS
+            : now - (lastLmSeenTsRef.current || 0) <= 800
             ? gm
               ? GM_HANDS_FAST_MS
               : HANDS_FAST_MS
@@ -2122,553 +1584,46 @@ export default function App() {
             : HANDS_IDLE_MS;
 
         //test apakah tangan terdeteksi, kmd kirim data ke server, hanya untuk gesture
-        if (handsEligible && now - (lastHandsRunTsRef.current || 0) >= handsDesiredStep) 
-        {
+        if (handsEligible && now - (lastHandsRunTsRef.current || 0) >= handsDesiredStep) {
           lastHandsRunTsRef.current = now;
+          const handsStart = performance.now();
           try {
             const handsList = await detectHandsOnce(video);
+            const fresh = processHandsFrame({
+              handsList,
+              now,
+              ctx,
+              canvas,
+            });
 
-            if (handsList && handsList.length) {
-              // HUD + wrist dots
-              ctx.save();
-              ctx.font =
-                "bold 14px system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif";
-              const msg = `hands: ${handsList.length}`;
-              const w = ctx.measureText(msg).width + 12;
-              ctx.fillStyle = "rgba(14,165,233,0.85)";
-              ctx.fillRect(10, canvas.height - 62, w, 22);
-              ctx.fillStyle = "#fff";
-              ctx.fillText(msg, 16, canvas.height - 46);
-              ctx.restore();
-
-              for (const lm of handsList) {
-                const wrist = lm[0];
-                const px = wrist.x * canvas.width;
-                const py = wrist.y * canvas.height;
-                ctx.beginPath();
-                ctx.arc(px, py, 5, 0, Math.PI * 2);
-                ctx.fillStyle = "rgba(255,255,0,0.8)";
-                ctx.fill();
-              }
-              const byFace = new Map();
-
-              // helper: anchor near palm base (more stable than wrist alone)
-              const handAnchor = (lm) => {
-                const w = lm[MP.WRIST],
-                  i = lm[MP.INDEX_MCP];
-                if (!w || !i) return null;
-                return { x: (w.x + i.x) * 0.5, y: (w.y + i.y) * 0.5 };
-              };
-
-              // helper: is anchor inside (expanded) face rect
-              const wristInFace = (px, py, f) => {
-                const left = f.cx - f.w * 0.5;
-                const top = f.cy - f.h * 0.45;
-                const right = left + f.w;
-                const bottom = top + f.h;
-                // allow more room above the face (hands raised), keep sides tighter
-                const mx = f.w * 0.09,
-                  myUp = f.h * 0.35,
-                  myDown = f.h * 0.22;
-                return (
-                  px >= left - mx &&
-                  px <= right + mx &&
-                  py >= top - myUp &&
-                  py <= bottom + myDown
-                );
-              };
-
-              // Eligible faces (top-2 closest, marked earlier)
-              const facesAll = trackedFacesRef.current || [];
-              const faces = facesAll.filter((f) => f.gestureEligible);
-              if (!faces.length) {
-                // No eligible faces this tick -> keep per-face state; just update global/fallback below
-              } else {
-                // 1) Build hand->face candidate pairs (eligible faces only)
-                const hands = handsList
-                  .map((lm, hi) => {
-                    const a = handAnchor(lm);
-                    if (!a) return null;
-                    const ax = a.x * canvas.width;
-                    const ay = a.y * canvas.height;
-                    return { lm, hi, ax, ay };
-                  })
-                  .filter((h) => {
-                    if (!(h && Number.isFinite(h.ax) && Number.isFinite(h.ay)))
-                      return false;
-                    // reject tiny/tentative hands (ghosts)
-                    const span = palmSpanLen(h.lm); // normalized 0..1
-                    return span >= 0.02; // ~2% of frame width
-                  });
-
-                const allPairs = [];
-                for (const h of hands) {
-                  // primary: anchor inside face window
-                  let contenders = faces.filter((f) =>
-                    wristInFace(h.ax, h.ay, f)
-                  );
-
-                  // fallback: if none hit, accept nearest face if horizontally aligned and vertically near
-                  if (!contenders.length) {
-                    let best = null,
-                      bestDx = Infinity;
-                    for (const f of faces) {
-                      const dx = Math.abs(h.ax - f.cx);
-                      const withinX = dx <= f.w * 0.45;
-                      const withinY =
-                        h.ay >= f.cy - f.h * 0.6 && h.ay <= f.cy + f.h * 0.2;
-                      if (withinX && withinY && dx < bestDx) {
-                        bestDx = dx;
-                        best = f;
-                      }
-                    }
-                    if (best) contenders = [best];
-                  }
-
-                  // final fallback: always assign (handles hands far from faces)
-                  if (!contenders.length) {
-                    if (faces.length === 1) {
-                      // single eligible face -> give it the hand
-                      contenders = [faces[0]];
-                    } else if (faces.length === 2) {
-                      // 2 faces: split by midline (stable left/right assignment)
-                      const [leftF, rightF] =
-                        faces[0].cx <= faces[1].cx
-                          ? [faces[0], faces[1]]
-                          : [faces[1], faces[0]];
-                      const midX = (leftF.cx + rightF.cx) * 0.5;
-                      contenders = [h.ax <= midX ? leftF : rightF];
-                    } else {
-                      // 3+ faces: nearest center with small vertical penalty
-                      let bestN = null,
-                        bestScore = Infinity;
-                      for (const f of faces) {
-                        const dx = h.ax - f.cx,
-                          dy = h.ay - f.cy;
-                        const score = dx * dx + dy * dy * 0.4;
-                        if (score < bestScore) {
-                          bestScore = score;
-                          bestN = f;
-                        }
-                      }
-                      if (bestN) contenders = [bestN];
-                    }
-                  }
-
-                  for (const f of contenders) {
-                    const dx = h.ax - f.cx,
-                      dy = h.ay - f.cy;
-                    allPairs.push({
-                      hi: h.hi,
-                      lm: h.lm,
-                      face: f,
-                      d2: dx * dx + dy * dy,
-                    });
-                  }
-                }
-
-                // 2) Per-hand filter: keep only best candidate; drop if ambiguous
-                const byHand = new Map(); // hi -> sorted pairs
-                for (const p of allPairs) {
-                  const arr = byHand.get(p.hi) || [];
-                  arr.push(p);
-                  byHand.set(p.hi, arr);
-                }
-                const filtered = [];
-                for (const [hi, arr] of byHand.entries()) {
-                  arr.sort((a, b) => a.d2 - b.d2);
-                  const best = arr[0];
-                  const second = arr[1];
-                  // size-scaled near-tie (don't drop unless truly ambiguous)
-                  const wRef = second
-                    ? Math.max(best.face.w || 1, second.face.w || 1)
-                    : 1;
-                  if (second) {
-                    const nearTie =
-                      Math.abs(best.d2 - second.d2) <=
-                      wRef * 0.15 * (wRef * 0.15);
-                    if (nearTie) {
-                      // depth tiebreak: prefer nearer-Z
-                      const zBest = Number.isFinite(best.face.z)
-                        ? best.face.z
-                        : Infinity;
-                      const zSecond = Number.isFinite(second.face.z)
-                        ? second.face.z
-                        : Infinity;
-                      if (zSecond < zBest - 0.05) {
-                        filtered.push(second);
-                        continue;
-                      }
-                    }
-                  }
-                  filtered.push(best);
-                }
-
-                // 3) Greedy assign without collisions
-                filtered.sort((a, b) => a.d2 - b.d2);
-                const usedHands = new Set();
-                const usedFaces = new Set();
-                const assignments = [];
-                for (const p of filtered) {
-                  if (usedHands.has(p.hi) || usedFaces.has(p.face.key))
-                    continue;
-                  assignments.push(p);
-                  usedHands.add(p.hi);
-                  usedFaces.add(p.face.key);
-                }
-
-                // 4) Classify per assigned face (wave history is per-face)
-                // Game mode runs 4 classifiers (wave + R/P/S); normal runs 5 (wave + peace + raise_hand + on_phone + thumbs_up)
-                for (const { lm, face } of assignments) {
-                  let hist = waveHistByFaceRef.current.get(face.key);
-                  if (!hist) {
-                    hist = { t: 0, xs: [] };
-                    waveHistByFaceRef.current.set(face.key, hist);
-                  }
-                  const xs = hist.xs;
-                  if (now - (hist.t || 0) > 900) xs.length = 0;
-                  hist.t = now;
-
-                  setWaveHistory(xs, hist.t);
-
-                  const a0 = handAnchor(lm);
-                  let allowWave = false;
-                  if (a0) {
-                    const ax0 = a0.x * canvas.width,
-                      ay0 = a0.y * canvas.height;
-                    // near this face box or broadly aligned band
-                    if (wristInFace(ax0, ay0, face)) {
-                      allowWave = true;
-                    } else {
-                      const dx = Math.abs(ax0 - face.cx);
-                      const withinX = dx <= face.w * 0.9;
-                      const withinY =
-                        ay0 >= face.cy - face.h * 1.1 &&
-                        ay0 <= face.cy + face.h * 0.5;
-                      allowWave = withinX && withinY;
-                    }
-                  }
-                  // if far from box but motion clearly wave-y, still allow
-                  if (!allowWave) {
-                    const wa = waveActivity();
-                    if (wa.flips >= 2 && wa.amp > 0.02) allowWave = true;
-                  }
-
-                  // debug ear anchor for assigned face `face` (safe: no undefined refs)
-                  ctx.save();
-                  ctx.fillStyle = "rgba(0,180,255,0.8)";
-                  const handX = a0
-                    ? a0.x * canvas.width
-                    : (lm[MP.WRIST]?.x || 0) * canvas.width;
-                  const sideSignDbg = handX >= face.cx ? +1 : -1;
-                  const earX = face.cx + sideSignDbg * (face.w * 0.5) * 0.78;
-                  const earY = face.cy - face.h * 0.5 * 0.08;
-                  ctx.beginPath();
-                  ctx.arc(earX, earY, 5, 0, Math.PI * 2);
-                  ctx.fill();
-                  ctx.restore();
-
-                  const velNow = recentLateralMotion();
-                  const wrist = lm[MP.WRIST],
-                    iMcp = lm[MP.INDEX_MCP];
-                  const vx = (iMcp?.x ?? 0) - (wrist?.x ?? 0),
-                    vy = (iMcp?.y ?? 0) - (wrist?.y ?? 0);
-                  const axisLen = Math.hypot(vx, vy) || 1e-6;
-                  const cosToVertical = Math.abs(vy) / axisLen; // 1 = vertical, 0 = horizontal
-
-                  // Face-relative proximity for "pose" gestures (prevents random pops)
-                  let allowNearFace = false,
-                    nearX = false,
-                    highPalm = false;
-                  if (a0) {
-                    const ax0 = a0.x * canvas.width,
-                      ay0 = a0.y * canvas.height;
-                    nearX = Math.abs(ax0 - face.cx) <= face.w * 1.0;
-                    // "high palm": above face center by a bit, even if not inside the box
-                    highPalm = ay0 <= face.cy - face.h * 0.05;
-                    const highEnough = ay0 <= face.cy + face.h * 0.25;
-                    allowNearFace =
-                      Math.abs(ax0 - face.cx) <= face.w * 0.85 && highEnough;
-                  }
-
-                  const cand = [];
-                  try {
-                    const w = classifyWave(lm, now);
-                    // Accept always if wave is strong; else require near-face band
-                    if (w.ok && (allowWave || w.score >= 0.62)) {
-                      cand.push({ type: "wave", score: w.score });
-                    }
-                  } catch {}
-
-                  const palm = palmSpanLen(lm);
-
-                  if (gm) {
-                    try {
-                      const r = classifyRock(lm);
-                      if (r.ok) cand.push({ type: "rock", score: r.score });
-                    } catch {}
-                    try {
-                      const s = classifyScissors(lm);
-                      if (s.ok) cand.push({ type: "scissors", score: s.score });
-                    } catch {}
-                    try {
-                      const p = classifyPaper(lm);
-                      // paper: open palm; allow near face OR clearly high & aligned; upright-ish; not swinging
-                      if (
-                        p.ok &&
-                        (allowNearFace || highPalm || palm >= 0.038) &&
-                        velNow <= 0.11 &&
-                        cosToVertical > 0.5 &&
-                        palm >= 0.028
-                      ) {
-                        cand.push({ type: "paper", score: p.score });
-                      }
-                    } catch {}
-                  } else {
-                    try {
-                      const p = classifyPeace(lm);
-                      if (p.ok) cand.push({ type: "peace", score: p.score });
-                    } catch {}
-                    try {
-                      const rh = classifyRaiseHand(lm);
-                      if (rh.ok)
-                        cand.push({ type: "raise_hand", score: rh.score });
-                    } catch {}
-                    // phone stays scoped to this face (already done)
-                    try {
-                      const ph = classifyOnPhone(
-                        lm,
-                        [{ cx: face.cx, cy: face.cy, w: face.w, h: face.h }],
-                        canvas.width,
-                        canvas.height
-                      );
-                      if (ph.ok)
-                        cand.push({ type: "on_phone", score: ph.score });
-                    } catch {}
-                    try {
-                      const t = classifyThumbsUp(lm);
-                      if (t.ok)
-                        cand.push({ type: "thumbs_up", score: t.score });
-                    } catch {}
-                  }
-
-                  // If a strong pose is present, drop weaker wave this frame
-                  {
-                    const poseBest = cand
-                      .filter(
-                        (c) =>
-                          c.type === "thumbs_up" ||
-                          c.type === "peace" ||
-                          c.type === "raise_hand" ||
-                          c.type === "on_phone"
-                      )
-                      .sort((a, b) => b.score - a.score)[0];
-                    const waveIdx = cand.findIndex((c) => c.type === "wave");
-                    if (poseBest && waveIdx >= 0) {
-                      const waveScore = cand[waveIdx].score;
-                      if (waveScore < poseBest.score + 0.12) {
-                        cand.splice(waveIdx, 1);
-                      }
-                    }
-                  }
-
-                  if (!cand.length) continue;
-                  const bestFrame = cand.reduce((a, b) =>
-                    b.score > a.score ? b : a
-                  );
-
-                  const prev = byFace.get(face.key);
-                  const adj =
-                    gm && bestFrame.type === "wave"
-                      ? { type: "paper", score: bestFrame.score }
-                      : gm && bestFrame.type === "thumbs_up"
-                      ? null
-                      : bestFrame;
-                  if (adj && (!prev || adj.score > prev.score))
-                    byFace.set(face.key, adj);
-                }
-
-                // update per-face windows/stable + emit changes
-                const updatedKeys = new Set();
-                for (const [key, frame] of byFace.entries()) {
-                  const win = perFaceGestureWinRef.current.get(key) || [];
-                  win.push({ ...frame, t: now });
-                  if (win.length > VOTE_WINDOW * 2)
-                    win.splice(0, win.length - VOTE_WINDOW * 2);
-                  perFaceGestureWinRef.current.set(key, win);
-
-                  const prevStable = perFaceStableRef.current.get(key) || null;
-                  const nextStable = pickStableGesture(now, win, prevStable);
-                  if (nextStable) {
-                    const changed =
-                      !prevStable || prevStable.type !== nextStable.type;
-                    perFaceStableRef.current.set(key, nextStable);
-                    updatedKeys.add(key);
-                    const lastSent =
-                      lastGestureSentPerFaceRef.current.get(key) || 0;
-                    if (
-                      changed &&
-                      now - lastSent >= HANDS_SEND_MS &&
-                      !speakingRef.current
-                    ) {
-                      const facesMeta = trackedFacesRef.current || [];
-                      const meta = facesMeta.find((f) => f.key === key) || {};
-                      try {
-                        socketRef.current?.emit?.(
-                          gm ? "game_event" : "gesture_event",
-                          gm
-                            ? {
-                                sessionId: sessionId || "web-" + deviceId,
-                                deviceId,
-                                rps: nextStable.type,
-                                at: Date.now(),
-                                focusIndex: meta.index ?? focusIndexRef.current,
-                                focusTarget: {
-                                  name: meta.name || null,
-                                  gid: meta.gid || null,
-                                },
-                              }
-                            : {
-                                sessionId: sessionId || "web-" + deviceId,
-                                deviceId,
-                                gesture: {
-                                  type: nextStable.type,
-                                  score: nextStable.score,
-                                },
-                                at: Date.now(),
-                                focusIndex: meta.index ?? focusIndexRef.current,
-                                focusTarget: {
-                                  name: meta.name || null,
-                                  gid: meta.gid || null,
-                                },
-                              }
-                        );
-                      } catch {}
-                      lastGestureSentPerFaceRef.current.set(key, now);
-                    }
-                  } else {
-                    perFaceStableRef.current.delete(key);
-                  }
-                }
-
-                // Update global stable gesture for legacy HUD/policy (focus face wins)
-                (() => {
-                  const faces = trackedFacesRef.current || [];
-                  const eligible = new Set(
-                    faces.filter((f) => f.gestureEligible).map((f) => f.key)
-                  );
-                  const fi = focusIndexRef.current;
-                  let chosen = null;
-                  if (fi >= 0 && faces[fi] && eligible.has(faces[fi].key)) {
-                    chosen =
-                      perFaceStableRef.current.get(faces[fi].key) || null;
-                  }
-                  if (!chosen) {
-                    for (const [k, g] of perFaceStableRef.current.entries()) {
-                      if (!eligible.has(k)) continue;
-                      if (
-                        now - g.t <= HANDS_CACHE_MS &&
-                        g.type === "on_phone"
-                      ) {
-                        chosen = g;
-                        break;
-                      }
-                    }
-                  }
-                  if (!chosen) {
-                    for (const [k, g] of perFaceStableRef.current.entries()) {
-                      if (!eligible.has(k)) continue;
-                      if (now - g.t <= HANDS_CACHE_MS) {
-                        chosen = g;
-                        break;
-                      }
-                    }
-                  }
-                  stableGestureRef.current = chosen
-                    ? { ...chosen, t: now }
-                    : null;
-                })();
-              }
-            }
-
-            // AFTER hands: emit snapshot with up-to-date gesture
-            const g = gesturesOnRef.current ? stableGestureRef.current : null;
-              const fresh =
-                g && now - g.t <= HANDS_CACHE_MS
-                  ? { type: g.type, score: g.score }
-                  : null;
-
-              console.log("emiting crowds");
-              //emit crowd snapshot
-              emitCrowdThrottled({
-                deviceId,
-                sessionId: sessionId || "web-" + deviceId,
-                timeISO: new Date().toISOString(),
-                aiSpeaking: !!serverInfo.ai_speaking,
-                backend,
-                totals: { all: total, green, red },
-                gesture: gesturesOnRef.current ? fresh : null,
-                focusIndex: focusIndexRef.current,
-                focusTarget: focusTargetRef.current,
-                people: peopleForPost.map((p) => ({
-                  name: p.name || null,
-                  gid: p.gid || null,
-                  gender: p.gender || null,
-                  ageGroup: p.ageGroup || null,
-                  zone: p.zone,
-                  yawDeg: Number.isFinite(p.yawDeg)
-                    ? +p.yawDeg.toFixed(1)
-                    : null,
-                  pitchDeg: Number.isFinite(p.pitchDeg)
-                    ? +p.pitchDeg.toFixed(1)
-                    : null,
-                  mouthActivity: +(p.mouthActivity ?? 0).toFixed(3),
-                  posCam: p.posCam,
-                })),
-              });
+            emitCrowdThrottled({
+              deviceId,
+              sessionId: sessionId || "web-" + deviceId,
+              timeISO: new Date().toISOString(),
+              aiSpeaking: !!serverInfo.ai_speaking,
+              backend,
+              totals: { all: total, green, red },
+              gesture: gesturesOnRef.current ? fresh : null,
+              focusIndex: focusIndexRef.current,
+              focusTarget: focusTargetRef.current,
+              peopleSource: peopleForPost,
+            });
           } catch (e) {
             // ignore hand pipeline hiccups so the frame loop keeps running
           }
-        } // OK properly close inner try before new catch
+          perf.handsMs = performance.now() - handsStart;
+        }
         // handled above; removed extraneous catch
         // ---- Policy: zone transitions -> call-over / greet (candidates include red) ----
         try {
-          handleZoneTransitions({
+          const policyStart = performance.now();
+          dispatchZoneTransitions({
             allIdentities,
             now,
-            logZone,
-            stableGestureRef,
-            prevZoneMapRef,
-            greenEntryRef,
-            callOverStateRef,
-            pendingGreetsRef,
-            pushedGreets,
-            ageGenderCacheRef,
-            greetInviteRef,
-            lastGroupSetRef,
-            lastGroupAskTsRef,
-            sendPeopleIntent,
             groupInfo,
             guestSnapshots,
-            CALL_OVER_MAX_TRIES,
-            CALL_OVER_COOLDOWN_MS,
-            GREEN_STABLE_MS,
-            NOT_SEEN_RESET_MS,
-            GROUP_ASK_COOLDOWN_MS,
-            socketRef,
-            deviceId,
-            sessionId,
-            ageGroupOf,
-            groupSignature,
-            maybeRotateSession,
-            rotateConfig: {
-              refs: { groupSigRef, groupStableSinceRef, lastRotateRef },
-              setSessionId,
-              uuid,
-              stableMs: GROUP_STABLE_MS,
-              cooldownMs: SESSION_ROTATE_COOLDOWN_MS,
-            },
           });
+          perf.policyMs = performance.now() - policyStart;
         } catch (e) {
           console.warn("[policy] zone transition error:", e);
         }
@@ -2734,6 +1689,10 @@ export default function App() {
           } catch (e) {
             console.warn("[speaker] error:", e);
           }
+        if (DEBUG_PERF_LOGS && frameCount % 15 === 0) {
+          const totalMs = performance.now() - perf.frameStart;
+          logPerf(`[perf] frame=${frameCount} total=${totalMs.toFixed(1)}ms detect=${perf.detectMs.toFixed(1)} build=${perf.buildMs.toFixed(1)} draw=${perf.drawMs.toFixed(1)} hands=${perf.handsMs.toFixed(1)} policy=${perf.policyMs.toFixed(1)} faces=${dets.length}`);
+        }
         } catch (e) {
           console.warn("[speaker] error:", e);
         }
@@ -2792,69 +1751,6 @@ export default function App() {
 
     if (reset) bump("stop");
   }
-
-
-
-  /* ====================== RIGHT-PANEL STATE (Gemini / ElevenLabs) ====================== */
-  const MODEL_OPTIONS = [
-    {
-      value: "gemini-2.5-flash-live-preview",
-      label: "Gemini 2.5 Flash Live Preview (realtime)",
-      kind: "live",
-    },
-    {
-      value: "gemini-2.5-flash-preview-native-audio",
-      label: "Gemini 2.5 Flash Preview Native Audio (dialog)",
-      kind: "native",
-    },
-  ];
-
-  // Live Preview voices (as requested)
-  const LIVE_VOICES = [
-    "Puck",
-    "Charon",
-    "Kore",
-    "Fenrir",
-    "Aoede",
-    "Leda",
-    "Orus",
-    "Zephyr",
-  ];
-  // Native Audio dialog voices (list you gave)
-  const NATIVE_VOICES = [
-    "Zephyr",
-    "Puck",
-    "Charon",
-    "Kore",
-    "Fenrir",
-    "Leda",
-    "Orus",
-    "Aoede",
-    "Callirrhoe",
-    "Autonoe",
-    "Enceladus",
-    "Iapetus",
-    "Umbriel",
-    "Algieba",
-    "Despina",
-    "Erinome",
-    "Algenib",
-    "Rasalgethi",
-    "Laomedia",
-    "Achernar",
-    "Alnilam",
-    "Schedar",
-    "Gacrux",
-    "Pulcherrima",
-    "Achird",
-    "Zubenelgenubi",
-    "Vindemiatrix",
-    "Sadachbia",
-    "Sadaltager",
-  ];
-
-  const GEMINI_VOICES = { live: LIVE_VOICES, native: NATIVE_VOICES };
-
   // Language options (label -> code)
   const LANGS = [
     ["English (US)", "en-US"],
@@ -2888,54 +1784,6 @@ export default function App() {
     ["Russian", "ru-RU"],
     ["Thai", "th-TH"],
   ];
-
-  const [systemInstruction, setSystemInstruction] = useState(
-    () =>
-      localStorage.getItem("ika:systemInstruction") ||
-      "You are a friendly, concise on-site concierge."
-  );
-  const [modelQuick, setModelQuick] = useState(
-    () => localStorage.getItem("ika:model") || "gemini-2.5-flash-live-preview"
-  );
-  const modelKind = useMemo(
-    () => MODEL_OPTIONS.find((m) => m.value === modelQuick)?.kind || "live",
-    [modelQuick]
-  );
-  const voicesForKind = GEMINI_VOICES[modelKind] || LIVE_VOICES;
-
-  const [geminiVoiceQuick, setGeminiVoiceQuick] = useState(
-    () => localStorage.getItem("ika:voice") || "Puck"
-  );
-  const [languageCodeQuick, setLanguageCodeQuick] = useState(
-    () => localStorage.getItem("ika:langCode") || "en-US"
-  );
-  const [temperatureQuick, setTemperatureQuick] = useState(() =>
-    Number(localStorage.getItem("ika:temperature") ?? 0.6)
-  );
-
-  // Behavior toggles
-  const [enableAffectiveQuick, setEnableAffectiveQuick] = useState(
-    () => localStorage.getItem("ika:enableAffective") === "true"
-  );
-  const [proactiveAudioQuick, setProactiveAudioQuick] = useState(
-    () => localStorage.getItem("ika:proactiveAudio") === "true"
-  );
-  const [functionCallingQuick, setFunctionCallingQuick] = useState(
-    () => localStorage.getItem("ika:functionCalling") === "true"
-  );
-  const [autoFunctionResponseQuick, setAutoFunctionResponseQuick] = useState(
-    () => localStorage.getItem("ika:autoFunctionResponse") === "true"
-  );
-  const [groundingQuick, setGroundingQuick] = useState(
-    () => localStorage.getItem("ika:grounding") === "true"
-  );
-
-  const [ttsProviderQuick, setTtsProviderQuick] = useState(() =>
-    (localStorage.getItem("ika:ttsProvider") || "gemini").toLowerCase()
-  );
-  const [elevenVoiceIdQuick, setElevenVoiceIdQuick] = useState(
-    () => localStorage.getItem("ika:11labs:voiceId") || ""
-  );
 
   // optional UI toggle elsewhere can flip this; default false
   const gameModeRef = useRef(false);
@@ -3019,117 +1867,135 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [modelKind]);
 
-  // apply quick settings -> create (or recreate) session
-  const onCreateSession = useCallback(() => {
-    server.createSession({
-      model: modelQuick,
-      voice: geminiVoiceQuick,
-      language_code: languageCodeQuick,
-      system_instruction: systemInstruction,
-
-      // route audio: Gemini (AUDIO+TEXT) vs ElevenLabs (TEXT only)
-      tts_provider: ttsProviderQuick, // "gemini" | "elevenlabs"
-      response_modalities:
-        ttsProviderQuick === "elevenlabs" ? ["TEXT"] : ["AUDIO", "TEXT"],
-
-      enable_affective_dialog: enableAffectiveQuick,
-
-      temperature: temperatureQuick,
-      proactive_audio: proactiveAudioQuick,
-      transcribe_user_audio: true,
-      files_to_upload: null,
-
-      // OK ElevenLabs-only fields (used iff tts_provider === "elevenlabs")
-      eleven_model:
-        localStorage.getItem("ika:11labs:model") || "eleven_turbo_v2_5",
-      eleven_voice_id: localStorage.getItem("ika:11labs:voiceId") || "",
-      eleven_api_key: localStorage.getItem("ika:11labs:key") || undefined,
-      eleven_output_format: "pcm_24000",
-    });
-  }, [
-    server,
-    modelQuick,
-    geminiVoiceQuick,
-    languageCodeQuick,
-    systemInstruction,
-    ttsProviderQuick,
-    enableAffectiveQuick,
-    temperatureQuick,
-    proactiveAudioQuick,
-  ]);
-
-  // hot update
-  const handleStartSession = useCallback(() => {
-    try {
-      onCreateSession();
-    } catch (err) {
-      console.warn("[session] start failed:", err);
-    }
-  }, [onCreateSession]);
-
-  const handleStopSession = useCallback(() => {
-    try {
-      sendWsCommand(MSG_TYPE.SessionEnd, {
-        sessionId: sessionId || "web-" + deviceId,
-      });
-      setSessionStatus("IDLE");
-      setSessionId(null);
-    } catch (err) {
-      console.warn("[session] stop failed:", err);
-    }
-  }, [sessionId, deviceId]);
-
-  useEffect(() => {
-    if (sessionStatus === "ACTIVE" || sessionStatus === "IDLE") {
-      autoSessionPendingRef.current = false;
-    }
-  }, [sessionStatus]);
-
-  useEffect(() => {
-    if (!autoSession) return;
-
-    const serverUp = !!serverInfo.connected;
-    const ueUp = !!ueConnected;
-
-    if (serverUp && ueUp) {
-      if (sessionStatus !== "ACTIVE" && !autoSessionPendingRef.current) {
-        autoSessionPendingRef.current = true;
-        handleStartSession();
-      }
-    } else {
-      autoSessionPendingRef.current = false;
-      // Keep session alive; do not auto-send SessionEnd on transient disconnects.
-      // Camera/zone policy on server controls mic open/close safely.
-    }
-  }, [
+  const { handleStartSession, handleStopSession } = useSessionPolicy({
     autoSession,
-    serverInfo.connected,
-    ueConnected,
+    serverConnected: !!serverInfo.connected,
+    ueConnected: !!ueConnected,
     sessionStatus,
-    handleStartSession,
-  ]);
-
-  const onHotUpdate = useCallback(() => {
-    server.updateSettings({
-      temperature: temperatureQuick,
-      captions,
-
-      enable_affective_dialog: enableAffectiveQuick,
-      proactive_audio: proactiveAudioQuick,
-      function_calling: functionCallingQuick,
-      auto_function_response: autoFunctionResponseQuick,
-      grounding: groundingQuick,
-    });
-  }, [
-    server,
-    temperatureQuick,
-    captions,
-    enableAffectiveQuick,
-    proactiveAudioQuick,
-    functionCallingQuick,
-    autoFunctionResponseQuick,
-    groundingQuick,
-  ]);
+    sessionId,
+    deviceId,
+    onCreateSession,
+    sendWsCommand,
+    setSessionStatus,
+    setSessionId,
+  });
+  const { commitFrameOutput, updateFocusTarget } = useFrameOutput({
+    focusIndexRef,
+    focusTargetRef,
+    sendGreenSnapshot,
+    emitCrowdByGid,
+    setTable,
+    setTotals,
+    gesturesOnRef,
+    deviceId,
+    sessionId,
+    backend,
+  });
+  const {
+    stableGestureRef,
+    perFaceStableRef,
+    processHandsFrame,
+    getFreshGesture,
+    pruneGestureState,
+  } = useGesturePipeline({
+    gesturesOn,
+    gesturesOnRef,
+    socketRef,
+    deviceId,
+    sessionId,
+    speakingRef,
+    focusIndexRef,
+    focusTargetRef,
+    trackedFacesRef,
+    gameModeRef,
+    handsCacheMs: HANDS_CACHE_MS,
+    handsSendMs: HANDS_SEND_MS,
+  });
+  const {
+    handleNoFaceDetected,
+    processRedZoneState,
+    dispatchZoneTransitions,
+  } = usePresencePolicy({
+    wsIsConnected,
+    sendWsCommand,
+    buildVisitContext,
+    logFace,
+    logZone,
+    prevZoneMapRef,
+    greenEntryRef,
+    callOverStateRef,
+    pendingGreetsRef,
+    redZoneCounterRef,
+    noneZoneCounterRef,
+    redZoneTriggeredRef,
+    stableGestureRef,
+    pushedGreets,
+    ageGenderCacheRef,
+    greetInviteRef,
+    lastGroupSetRef,
+    lastGroupAskTsRef,
+    sendPeopleIntent,
+    socketRef,
+    deviceId,
+    sessionId,
+    ageGroupOf,
+    groupSignature,
+    maybeRotateSession,
+    rotateConfig: {
+      refs: { groupSigRef, groupStableSinceRef, lastRotateRef },
+      setSessionId,
+      uuid,
+      stableMs: GROUP_STABLE_MS,
+      cooldownMs: SESSION_ROTATE_COOLDOWN_MS,
+    },
+    callOverMaxTries: CALL_OVER_MAX_TRIES,
+    callOverCooldownMs: CALL_OVER_COOLDOWN_MS,
+    greenStableMs: GREEN_STABLE_MS,
+    notSeenResetMs: NOT_SEEN_RESET_MS,
+    groupAskCooldownMs: GROUP_ASK_COOLDOWN_MS,
+    redZoneNoneResetFrames: RED_ZONE_NONE_RESET_FRAMES,
+    redZoneStableFrames: RED_ZONE_STABLE_FRAMES,
+  });
+  const { buildFaceFrameData } = useFaceCandidates({
+    faceMatcherRef,
+    matchThreshold: MATCH_THRESHOLD,
+    matchMargin: MATCH_MARGIN,
+    stabilizeFrames: STABILIZE_FRAMES,
+    handsCacheMs: HANDS_CACHE_MS,
+    rad: RAD,
+    boxLineWidth: BOX_LINE_WIDTH,
+    labelPadX: LABEL_PAD_X,
+    labelPadY: LABEL_PAD_Y,
+    camFxRef,
+    camFyRef,
+    panOffRef,
+    tiltOffRef,
+    greenMaxMRef,
+    recentMapRef,
+    ageGenderCacheRef,
+    mouthMapRef,
+    gesturesOnRef,
+    gestureTargetsRef,
+    perFaceStableRef,
+    trackedFacesRef,
+    allFacesRef,
+    estimateDistanceMpx,
+    assignGuestIdFor,
+    ageGroupOf,
+    topExpression,
+    anglesFromPixel,
+    posFromPixel,
+    mouthMAR,
+    shrinkBox,
+    gestureLabelOf,
+    faceapi,
+    zoneOf,
+  });
+  const { selectFocus } = useFocusSelection({
+    wNear,
+    wCenter,
+    wMouth,
+  });
 
   /* ====================== UI ====================== */
   return (
@@ -3147,637 +2013,107 @@ export default function App() {
           style={{ margin: "0 auto", width: "100%", maxWidth: 1280 }}
         >
           {/* Camera window pinned to top */}
-          <div className="stage">
-            <video ref={videoRef} autoPlay muted playsInline />
-            <canvas ref={canvasRef} />
-          </div>
+          <CameraStagePanel
+            videoRef={videoRef}
+            canvasRef={canvasRef}
+            captions={captions}
+            lastText={lastText}
+          />
 
           {/* Row 1: CAMERA/STATUS */}
           <div className="left-top2">
-            {/* CAMERA / STATUS (compact, grouped) */}
-            <div className="panel compact">
-              <div className="statgrid">
-                {/* --- Section: Environment --- */}
-                <div className="block">
-                  <div className="block-title">Environment</div>
-                  <div className="kv">
-                    <b>Location:</b> {locationLabel}
-                  </div>
-                  <div className="kv">
-                    <b>Time:</b> {clock.toLocaleTimeString()}
-                  </div>
-                  <div className="kv">
-                    <b>Weather:</b> {weatherLabel}
-                  </div>
-                  <div className="kv">
-                    <b>Backend:</b> {backend}
-                  </div>
-                  <div className="kv">
-                    <b>Models:</b> {ready ? "loaded" : "loading..."}
-                  </div>
-                </div>
-
-                {/* --- Section: Live status --- */}
-                <div className="block">
-                  <div className="block-title">Live status</div>
-
-                  {/* CAM */}
-                  <div className="kv">
-                    {(() => {
-                      const live = isCamLive();
-                      return (
-                        <>
-                          <span className={`dot ${live ? "ok" : "err"}`} />
-                          <b>Cam:</b>&nbsp;{live ? "LIVE" : "IDLE"}
-                        </>
-                      );
-                    })()}
-                  </div>
-
-                  {/* Server */}
-                  <div className="kv">
-                    <span
-                      className={`dot ${serverInfo.connected ? "ok" : "err"}`}
-                    />
-                    <b>Server:</b>&nbsp;
-                    {serverInfo.connected ? "connected" : "disconnected"}
-                  </div>
-                  <div className="kv">
-                    <span className={`dot ${ueConnected ? "ok" : "err"}`} />
-                    <b>UE link:</b>&nbsp;
-                    {ueConnected ? "connected" : "waiting"}
-                  </div>
-                  {serverInfo.model || serverInfo.tts ? (
-                    <div className="kv muted small">
-                      {serverInfo.model ? <>Model: {serverInfo.model}</> : null}
-                      {serverInfo.model && serverInfo.tts ? " | " : null}
-                      {serverInfo.tts ? <>TTS: {serverInfo.tts}</> : null}
-                    </div>
-                  ) : null}
-
-                  {/* Device binding */}
-                  <div className="kv">
-                    <b>Device:</b>&nbsp;{deviceId.slice(0, 8)}...
-                    <span className="muted">
-                      &nbsp;
-                      {serverInfo.boundDeviceId
-                        ? `(bound ${String(serverInfo.boundDeviceId).slice(
-                            0,
-                            8
-                          )}...)`
-                        : `(not bound)`}
-                    </span>
-                  </div>
-                </div>
-
-                {/* --- Section: Traffic --- */}
-                <div className="block">
-                  <div className="block-title">Traffic</div>
-
-                  <div className="kv chiprow">
-                    <b>Last:</b>
-                    <span className="chip">start {lastSent.start}</span>
-                    <span className="chip">snap {lastSent.snapshot}</span>
-                    <span className="chip">stop {lastSent.stop}</span>
-                  </div>
-
-                  <div className="kv chiprow">
-                    <b>HTTP:</b>
-                    <span className="chip">start {lastHttp.start || "-"}</span>
-                    <span className="chip">
-                      snap {lastHttp.snapshot || "-"}
-                    </span>
-                    <span className="chip">stop {lastHttp.stop || "-"}</span>
-                    <span className="muted">
-                      {USE_SOCKET_BRIDGE ? " (socket bridge)" : ""}
-                    </span>
-                  </div>
-
-                  <div className="kv chiprow">
-                    <b>Faces:</b>
-                    <span className="chip">total {totals.all}</span>
-                    <span className="chip">green {totals.green}</span>
-                    <span className="chip">red {totals.red}</span>
-                  </div>
-
-                  <div className="kv">
-                    <button
-                      className="btn small full"
-                      title="Clear in-browser guest memory"
-                      onClick={() => {
-                        guestSeqRef.current = 1;
-                        guestMemRef.current = [];
-                        saveGuestMemSafe({ day: dayKey(), seq: 1, mem: [] });
-                      }}
-                    >
-                      clear guests
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
-            <div
-              className="left-top-side"
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: 12,
-                minWidth: 300,
-                flex: "0 0 auto",
-              }}
-            >
-              {/* Save/Export Settings */}
-              <section className="panel">
-                <h3 className="section-title">settings backup</h3>
-                <div className="row" style={{ gap: 8 }}>
-                  <button className="btn" onClick={exportSettings}>
-                    Export to file
-                  </button>
-                  <button className="btn" onClick={importSettings}>
-                    Import from file
-                  </button>
-                  <button className="btn" onClick={resetSettings}>
-                    Reset all
-                  </button>
-                </div>
-    
-              </section>
-
-              {/* Server connection */}
-              <section className="panel">
-                <h3 className="section-title">server connection</h3>
-                <div className="row" style={{ gap: 8 }}>
-                  <input
-                    className="input bigpad"
-                    placeholder="(same-origin) or http://PC-IP:PORT"
-                    value={serverUrlDraft}
-                    onChange={(e) => setServerUrlDraft(e.target.value)}
-                    autoCorrect="off"
-                    autoCapitalize="off"
-                    spellCheck={false}
-                  />
-                  <button
-                    className="btn"
-                    disabled={serverUrlDraft.trim() === (serverUrl || "")}
-                    onClick={() => setServerUrl(serverUrlDraft.trim())}
-                  >
-                    Apply & reconnect
-                  </button>
-                  <button
-                    className="btn"
-                    onClick={() => {
-                      setServerUrl("");
-                      setServerUrlDraft(window.location.origin);
-                    }}
-                  >
-                    Use same-origin
-                  </button>
-                </div>
-                <div className="help" style={{ marginTop: 6 }}>
-                  Config:{" "}
-                  {serverUrl && serverUrl.trim() ? serverUrl : "(same-origin)"} |
-                  Effective: {effectiveUrl}
-                  <br />
-                  Status: {serverInfo.connected ? "connected" : "disconnected"}
-                </div>
-                <div
-                  className="row"
-                  style={{ gap: 8, marginTop: 12, alignItems: "center" }}
-                >
-                  <input
-                    className="input bigpad"
-                    placeholder="Device / session ID (match UE)"
-                    value={deviceIdDraft}
-                    onChange={(e) => setDeviceIdDraft(e.target.value)}
-                    autoCorrect="off"
-                    autoCapitalize="off"
-                    spellCheck={false}
-                  />
-                  <button
-                    className="btn"
-                    disabled={
-                      !deviceIdDraft.trim() ||
-                      deviceIdDraft.trim() === deviceId
-                    }
-                    onClick={applyDeviceId}
-                  >
-                    Apply device ID
-                  </button>
-                  <button className="btn" onClick={randomizeDeviceId}>
-                    New ID
-                  </button>
-                </div>
-                <div className="help" style={{ marginTop: 6 }}>
-                  Stored as <code>ika:deviceId</code>. Use the same value as the
-                  UE client to share a single session.
-                </div>
-              </section>
-
-              {/* Session control */}
-              <section className="panel">
-                <h3 className="section-title">session control</h3>
-                <div className="row" style={{ gap: 8 }}>
-                  <button
-                    className="btn"
-                    onClick={handleStartSession}
-                    disabled={sessionStatus === "ACTIVE"}
-                  >
-                    Start session
-                  </button>
-                  <button
-                    className="btn"
-                    onClick={handleStopSession}
-                    disabled={sessionStatus !== "ACTIVE"}
-                  >
-                    Stop session
-                  </button>
-                </div>
-                <div
-                  className="row"
-                  style={{ gap: 8, marginTop: 12, alignItems: "center" }}
-                >
-                  <label className="checkbox">
-                    <input
-                      type="checkbox"
-                      checked={autoSession}
-                      onChange={(e) => setAutoSession(e.target.checked)}
-                    />
-                    <span>Auto-manage when server + UE are online</span>
-                  </label>
-                </div>
-                <div className="help" style={{ marginTop: 6 }}>
-                  Status: {sessionStatus}
-                  <br />
-                  {autoSession
-                    ? "Auto-starts when both links are up and stops if either drops."
-                    : "Auto session is off; use the buttons above."}
-                </div>
-              </section>
-
-              {/* Performance */}
-              <section className="panel">
-                <h3 className="section-title">performance</h3>
-                <div className="row" style={{ gap: 12, alignItems: "center" }}>
-                  <label className="checkbox">
-                    <input
-                      type="checkbox"
-                      checked={gesturesOn}
-                      onChange={(e) => setGesturesOn(e.target.checked)}
-                    />
-                    <span>Gestures</span>
-                  </label>
-                  <div
-                    className="row"
-                    style={{ gap: 8, alignItems: "center", marginLeft: 8 }}
-                  >
-                    <label className="label" style={{ margin: 0 }}>
-                      Targets
-                    </label>
-                    <select
-                      className="select"
-                      value={gestureTargets}
-                      onChange={(e) =>
-                        setGestureTargets(
-                          parseInt(e.target.value, 10) === 1 ? 1 : 2
-                        )
-                      }
-                      disabled={!gesturesOn}
-                      title="Limit gesture tracking to 1 or 2 people"
-                    >
-                      <option value={1}>1 person</option>
-                      <option value={2}>2 people</option>
-                    </select>
-                  </div>
-                </div>
-                <div className="help" style={{ marginTop: 6 }}>
-                  Turn off on low-power devices (Android/Edge) to improve FPS.
-                </div>
-                <div
-                  className="row"
-                  style={{ gap: 12, alignItems: "center", marginTop: 8 }}
-                >
-                  <label className="checkbox">
-                    <input
-                      type="checkbox"
-                      checked={keepBgOn}
-                      onChange={(e) => setKeepBgOn(e.target.checked)}
-                    />
-                    <span>Keep running in background</span>
-                  </label>
-                </div>
-              </section>
-            </div>
-          </div>
-
-          {/* Devices */}
-          <div className="panel">
-            <label className="label">Camera</label>
-            <select
-              className="select big"
-              value={videoId}
-              onChange={async (e) => {
-                const next = e.target.value;
-                setVideoId(next);
-                try {
-                  localStorage.setItem("ika:videoId", next);
-                } catch {}
-                await startCamera(next);
-              }}
-            >
-              <option value="">(Default)</option>
-              {videoDevs.map((d) => (
-                <option key={d.deviceId} value={d.deviceId}>
-                  {d.label || "Camera"}
-                </option>
-              ))}
-            </select>
-            <div
-              className="row"
-              style={{ gap: 12, marginTop: 12, flexWrap: "wrap" }}
-            >
-              <button
-                className="btn"
-                onClick={() => {
-                  startCamera().catch((err) =>
-                    console.warn("[Cam] restart failed", err)
-                  );
-                }}
-              >
-                Restart camera
-              </button>
-              <button
-                className="btn"
-                onClick={() => {
-                  stopAll({ reset: true }).catch((err) =>
-                    console.warn("[Cam] stop failed", err)
-                  );
-                }}
-              >
-                Stop camera
-              </button>
-            </div>
-            <div className="help" style={{ marginTop: 6 }}>
-              Use restart after plugging in a new webcam or if autoplay was
-              blocked by the browser.
-            </div>
-          </div>
-
-          {/* Row 2: DISTANCE CONTROLS - two neat panels */}
-          <div className="panel">
-            {/* GREEN ZONE (interaction range) */}
-            <div className="inline-controls">
-              <b>Green zone distance</b>
-              <input
-                className="range"
-                type="range"
-                min="0.3"
-                max="2.0"
-                step="0.05"
-                value={greenMaxM}
-                onChange={(e) => setGreenMaxM(Number(e.target.value))}
-                aria-label="Green zone distance in meters"
-              />
-              <span className="chip">{greenMaxM.toFixed(2)} m</span>
-              <button
-                className="btn"
-                onClick={() => setGreenMaxM(DEFAULT_GREEN_MAX_M)}
-              >
-                reset
-              </button>
-              <button
-                className="btn"
-                onClick={() =>
-                  setGreenMaxM((v) => Math.max(0.3, +(v - 0.1).toFixed(2)))
-                }
-              >
-                -0.1
-              </button>
-              <button
-                className="btn"
-                onClick={() =>
-                  setGreenMaxM((v) => Math.min(2.0, +(v + 0.1).toFixed(2)))
-                }
-              >
-                +0.1
-              </button>
-            </div>
-
-            {/* RED CUTOFF (ignore beyond) */}
-            <div className="inline-controls" style={{ marginTop: 8 }}>
-              <b>Red zone distance</b>
-              <input
-                className="range"
-                type="range"
-                min="1.0"
-                max="4.0"
-                step="0.1"
-                value={redCutoffM}
-                onChange={(e) => setRedCutoffM(Number(e.target.value))}
-                aria-label="Red zone cutoff in meters"
-              />
-              <span className="chip">{redCutoffM.toFixed(1)} m</span>
-              <button
-                className="btn"
-                onClick={() => setRedCutoffM(DEFAULT_RED_CUTOFF_M)}
-              >
-                reset
-              </button>
-              <button
-                className="btn"
-                onClick={() =>
-                  setRedCutoffM((v) => Math.max(1.0, +(v - 0.1).toFixed(1)))
-                }
-              >
-                -0.1
-              </button>
-              <button
-                className="btn"
-                onClick={() =>
-                  setRedCutoffM((v) => Math.min(4.0, +(v + 0.1).toFixed(1)))
-                }
-              >
-                +0.1
-              </button>
-            </div>
-          </div>
-
-          {captions && lastText && (
-            <div
-              aria-live="polite"
-              className="captions"
-              style={{
-                marginTop: 8,
-                background: "rgba(0,0,0,0.55)",
-                padding: "10px 12px",
-                borderRadius: 10,
-                lineHeight: 1.35,
-              }}
-            >
-              {lastText}
-            </div>
-          )}
-
-          <div className="row" style={{ gap: 12, alignItems: "center" }}>
-            <label className="checkbox">
-              <input
-                type="checkbox"
-                checked={showAlign}
-                onChange={(e) => setShowAlign(e.target.checked)}
-              />
-              <span>Show alignment overlay</span>
-            </label>
-
-            <label className="checkbox" style={{ marginLeft: 12 }}>
-              <input
-                type="checkbox"
-                checked={gameModeOn}
-                onChange={(e) => setGameModeOn(e.target.checked)}
-              />
-              <span>Game mode (RPS)</span>
-            </label>
-
-            <div className="kv" style={{ gap: 6 }}>
-              <b>Calib distance:</b>
-              <input
-                className="input"
-                type="number"
-                step="0.05"
-                min="0.3"
-                max="3.0"
-                value={calibDistanceM}
-                onChange={(e) => setCalibDistanceM(Number(e.target.value))}
-                style={{ width: 90 }}
-                aria-label="Calibration distance (meters)"
-              />
-              <span className="muted">m</span>
-            </div>
-
-            <button className="btn" onClick={runCalCountdown}>
-              Calibrate camera (3-2-1)
-            </button>
-          </div>
-
-          {/* Camera settings - now directly under the camera */}
-          <div className="panel" style={{ marginTop: 10 }}>
-            <h3 className="section-title" style={{ marginTop: 0 }}>
-              camera alignment
-            </h3>
-
-            <label className="label">Horizontal FOV ( deg)</label>
-            <input
-              className="range"
-              type="range"
-              min="40"
-              max="110"
-              step="1"
-              value={fovHdeg}
-              onChange={(e) => setFovHdeg(Number(e.target.value))}
+            <StatusOverviewPanel
+              locationLabel={locationLabel}
+              clock={clock}
+              weatherLabel={weatherLabel}
+              backend={backend}
+              ready={ready}
+              camLive={isCamLive()}
+              serverInfo={serverInfo}
+              ueConnected={ueConnected}
+              deviceId={deviceId}
+              lastSent={lastSent}
+              lastHttp={lastHttp}
+              totals={totals}
+              useSocketBridge={USE_SOCKET_BRIDGE}
+              onClearGuests={handleClearGuests}
             />
-            <div className="help">{Math.round(fovHdeg)} deg</div>
-
-            <label className="label">Vertical FOV ( deg)</label>
-            <input
-              className="range"
-              type="range"
-              min="25"
-              max="90"
-              step="1"
-              value={fovVdeg}
-              onChange={(e) => setFovVdeg(Number(e.target.value))}
-            />
-            <div className="help">{Math.round(fovVdeg)} deg</div>
-
-            <div className="row" style={{ gap: 16 }}>
-              <div className="flex1">
-                <label className="label">Pan offset ( deg)</label>
-                <input
-                  className="range"
-                  type="range"
-                  min="-30"
-                  max="30"
-                  step="0.5"
-                  value={panOffsetDeg}
-                  onChange={(e) => setPanOffsetDeg(Number(e.target.value))}
-                />
-                <div className="help">{panOffsetDeg.toFixed(1)} deg</div>
-              </div>
-              <div className="flex1">
-                <label className="label">Tilt offset ( deg)</label>
-                <input
-                  className="range"
-                  type="range"
-                  min="-30"
-                  max="30"
-                  step="0.5"
-                  value={tiltOffsetDeg}
-                  onChange={(e) => setTiltOffsetDeg(Number(e.target.value))}
-                />
-                <div className="help">{tiltOffsetDeg.toFixed(1)} deg</div>
-              </div>
-            </div>
-
-            <div className="row" style={{ gap: 8, marginTop: 8 }}>
-              <button
-                className="btn"
-                onClick={() => {
-                  setPanOffsetDeg(0);
-                  setTiltOffsetDeg(0);
-                }}
-              >
-                reset offsets
-              </button>
-              <span className="help">
-                Tip: click a face on video to auto-zero.
-              </span>
-            </div>
-
-            <div className="divider" />
-
-            <h4 className="section-title">focus weights</h4>
-
-            <label className="label">Closeness</label>
-            <input
-              className="range"
-              type="range"
-              min="0"
-              max="1"
-              step="0.05"
-              value={wNear}
-              onChange={(e) => setWNear(Number(e.target.value))}
-            />
-
-            <label className="label">Centeredness</label>
-            <input
-              className="range"
-              type="range"
-              min="0"
-              max="1"
-              step="0.05"
-              value={wCenter}
-              onChange={(e) => setWCenter(Number(e.target.value))}
-            />
-
-            <label className="label">Mouth activity</label>
-            <input
-              className="range"
-              type="range"
-              min="0"
-              max="1"
-              step="0.05"
-              value={wMouth}
-              onChange={(e) => setWMouth(Number(e.target.value))}
+            <ControlSidebarPanel
+              exportSettings={exportSettings}
+              importSettings={importSettings}
+              resetSettings={resetSettings}
+              serverUrlDraft={serverUrlDraft}
+              setServerUrlDraft={setServerUrlDraft}
+              serverUrl={serverUrl}
+              setServerUrl={setServerUrl}
+              effectiveUrl={effectiveUrl}
+              serverInfo={serverInfo}
+              deviceIdDraft={deviceIdDraft}
+              setDeviceIdDraft={setDeviceIdDraft}
+              deviceId={deviceId}
+              applyDeviceId={applyDeviceId}
+              randomizeDeviceId={randomizeDeviceId}
+              handleStartSession={handleStartSession}
+              handleStopSession={handleStopSession}
+              sessionStatus={sessionStatus}
+              autoSession={autoSession}
+              setAutoSession={setAutoSession}
+              gesturesOn={gesturesOn}
+              setGesturesOn={setGesturesOn}
+              gestureTargets={gestureTargets}
+              setGestureTargets={setGestureTargets}
+              keepBgOn={keepBgOn}
+              setKeepBgOn={setKeepBgOn}
             />
           </div>
 
-          {/* Row 4: GUEST TABLE */}
-          <div className="panel tablewrap" style={{ padding: 12 }}>
-            <PeopleTable table={table} />
-          </div>
+          <CameraControlsPanel
+            videoId={videoId}
+            videoDevs={videoDevs}
+            onVideoChange={handleVideoChange}
+            onRestartCamera={handleRestartCamera}
+            onStopCamera={handleStopCamera}
+            greenMaxM={greenMaxM}
+            setGreenMaxM={setGreenMaxM}
+            defaultGreenMaxM={DEFAULT_GREEN_MAX_M}
+            redCutoffM={redCutoffM}
+            setRedCutoffM={setRedCutoffM}
+            defaultRedCutoffM={DEFAULT_RED_CUTOFF_M}
+            showAlign={showAlign}
+            setShowAlign={setShowAlign}
+            gameModeOn={gameModeOn}
+            setGameModeOn={setGameModeOn}
+            calibDistanceM={calibDistanceM}
+            setCalibDistanceM={setCalibDistanceM}
+            runCalCountdown={runCalCountdown}
+            fovHdeg={fovHdeg}
+            setFovHdeg={setFovHdeg}
+            fovVdeg={fovVdeg}
+            setFovVdeg={setFovVdeg}
+            panOffsetDeg={panOffsetDeg}
+            setPanOffsetDeg={setPanOffsetDeg}
+            tiltOffsetDeg={tiltOffsetDeg}
+            setTiltOffsetDeg={setTiltOffsetDeg}
+            wNear={wNear}
+            setWNear={setWNear}
+            wCenter={wCenter}
+            setWCenter={setWCenter}
+            wMouth={wMouth}
+            setWMouth={setWMouth}
+          />
+
+          <GuestTablePanel table={table} />
         </div>
       </div>
     </main>
   );
 }
+
+
+
+
+
+
 
 
 

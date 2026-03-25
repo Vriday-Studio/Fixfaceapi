@@ -104,3 +104,5 @@ Thumbs.db
 *.ntvs*
 *.njsproj
 *.sln
+/.history
+/.codemap

@@ -125,25 +125,39 @@ export function useTelemetryEmitters({
       if (now - state.t <= minMs) return;
 
       const peopleCandidate = payload.people || [];
-      if (peopleCandidate.length === 0) return;
-
-      for (const p of peopleCandidate) {
-        if (p.gid == null) continue;
-        try {
-          const dataToSend = {
-            deviceId: payload.deviceId,
-            timestamp: payload.timeISO,
-            sessionId: payload.sessionId,
-            gesture: p.gesture || null,
-            context: buildVisitContext(),
-            people: p,
-          };
+      //this to notify backend that no people detected, so that it can reset the crowd status and not keep showing stale data
+      if (peopleCandidate.length === 0){
+         const dataToSend = {
+                    deviceId: payload.deviceId,
+                    timestamp: payload.timeISO,
+                    sessionId: payload.sessionId,
+                    gesture: null,
+                    context: buildVisitContext(),
+                    people: null,
+                  };
 
           sendWsCommand(MSG_TYPE.CrowdStat, dataToSend);
-        } catch {
-          continue;
-        }
-      }
+      } 
+      else
+      {
+        for (const p of peopleCandidate) {
+                if (p.gid == null) continue;
+                try {
+                  const dataToSend = {
+                    deviceId: payload.deviceId,
+                    timestamp: payload.timeISO,
+                    sessionId: payload.sessionId,
+                    gesture: p.gesture || null,
+                    context: buildVisitContext(),
+                    people: p,
+                  };
+
+                  sendWsCommand(MSG_TYPE.CrowdStat, dataToSend);
+                } catch {
+                  continue;
+                }
+              }
+      };
 
       lastCrowdSendRef.current = { t: now };
     },

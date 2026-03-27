@@ -26,6 +26,7 @@ export function useFrameOutput({
     ({ cand, peopleForPost, rows, total, green, red, fresh }) => {
       if (cand.length > 0) {
         sendGreenSnapshot(cand);
+        console.log("cand snapshot sent");
 
         emitCrowdByGid({
           deviceId,
@@ -37,6 +38,20 @@ export function useFrameOutput({
           focusIndex: focusIndexRef.current,
           focusTarget: focusTargetRef.current,
           people: cand,
+        });
+      }
+      else{
+        console.log("No candidates detected, sending empty crowd data");
+        emitCrowdByGid({
+          deviceId,
+          sessionId: sessionId || "web-" + deviceId,
+          timeISO: new Date().toISOString(),
+          backend,
+          totals: 0,
+          gesture: gesturesOnRef.current ? fresh : null,
+          focusIndex: focusIndexRef.current,
+          focusTarget: focusTargetRef.current,
+          people: [],
         });
       }
 

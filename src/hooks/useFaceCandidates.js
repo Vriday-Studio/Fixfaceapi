@@ -55,24 +55,18 @@ export function useFaceCandidates({
         const det = resized[i];
         const box = det.detection.box;
         const dist = estimateDistanceMpx(box.width);
-
+        if (dist != null && dist > cutoff) continue;
         const faceCenterX = box.x + box.width / 2;
         const frameWidth = canvas.width;
-        const leftBoundary = frameWidth * (1 / 3 - 1 / 8);
-        const rightBoundary = frameWidth * (2 / 3 + 1 / 8);
-        const isInCenter =
-          faceCenterX >= leftBoundary && faceCenterX <= rightBoundary;
         const zone = zoneOf(dist, greenMaxMRef.current, faceCenterX, frameWidth);
-        const withinCutoff = !(dist != null && dist > cutoff);
-        candidates.push({ i, det, box, dist, zone, withinCutoff, isInCenter });
+        candidates.push({ i, det, box, dist, zone });
       }
 
-      const visibleCandidates = candidates.filter((c) => c.withinCutoff);
-      const total = visibleCandidates.length;
-      const green = visibleCandidates.filter((c) => c.zone === "green").length;
+      const total = candidates.length;
+      const green = candidates.filter((c) => c.zone === "green").length;
       const red = total - green;
 
-      const greenCandidates = visibleCandidates
+      const greenCandidates = candidates
         .filter((c) => c.zone === "green" && Number.isFinite(c.dist))
         .sort((a, b) => a.dist - b.dist);
       const tracked = greenCandidates.slice(0, 5);
@@ -214,7 +208,7 @@ export function useFaceCandidates({
           ? Math.max(0, Math.round(ageVal))
           : "-";
         const l1 = `${displayName}${gestureLbl ? "  |  " + gestureLbl : ""}  |  ${zone}  |  ${ageTxt} ${gender}  |  ${expr}`;
-        const l2 = `dist ${dist ? dist.toFixed(2) : "-"} m | greenMax ${greenMaxMRef.current.toFixed(2)} m | center ${isInCenter ? "yes" : "no"} | x ${faceCenterX.toFixed(0)}/${frameWidth}`;
+        const l2 = `yaw ${yawDeg.toFixed(1)} deg | pitch ${pitchDeg.toFixed(1)} deg | mouth ${mouthActivity.toFixed(2)} | landmarks :${lmBox.x}`;
         const color =
           zone === "green" ? "rgba(34,197,94,0.85)" : "rgba(239,68,68,0.85)";
         const lineH = 18;
@@ -329,7 +323,7 @@ export function useFaceCandidates({
         ageGroup: p.ageGroup || null,
       }));
 
-      allFacesRef.current = visibleCandidates.map((c) => {
+      allFacesRef.current = candidates.map((c) => {
         const d = shrinkBox(c.box);
         return {
           cx: d.x + d.width * 0.5,
@@ -339,15 +333,15 @@ export function useFaceCandidates({
         };
       });
 
-        return {
-          rows,
-          peopleForPost,
-          gestureAllowedKeys,
-          tracked,
-          candidates: visibleCandidates,
-          total,
-          green,
-          red,
+      return {
+        rows,
+        peopleForPost,
+        gestureAllowedKeys,
+        tracked,
+        candidates,
+        total,
+        green,
+        red,
         guestSnapshots,
       };
     },

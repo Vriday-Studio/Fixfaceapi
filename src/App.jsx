@@ -693,22 +693,9 @@ export default function App() {
   const tinyOptsRef = useRef(
     new faceapi.TinyFaceDetectorOptions({
       inputSize: 416,
-      scoreThreshold: 0.3,
+      scoreThreshold: 0.4,
     })
   );
-  const ssdOptsRef = useRef(
-    new faceapi.SsdMobilenetv1Options({
-      minConfidence: 0.2,
-      maxResults: 5,
-    })
-  );
-  const noFaceStreakRef = useRef(0);
-  const detectorDebugRef = useRef({
-    mode: "tiny",
-    count: 0,
-    fallback: false,
-    ssdLoaded: false,
-  });
 
   const [table, setTable] = useState(
     Array.from({ length: 5 }, (_, i) => ({
@@ -992,7 +979,6 @@ export default function App() {
     let bestIdx = -1,
       bestDist = 1;
     for (let i = 0; i < mem.length; i++) {
-      if (!mem[i].desc || mem[i].desc.length !== descriptor.length) continue;
       const d = faceapi.euclideanDistance(descriptor, mem[i].desc);
       if (d < bestDist) {
         bestDist = d;
@@ -1073,7 +1059,6 @@ export default function App() {
 
         const [_, preloadedMatcher] = await Promise.all([
           faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
-          faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL),
           faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
           faceapi.nets.ageGenderNet.loadFromUri(MODEL_URL),
           faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
@@ -1091,13 +1076,10 @@ export default function App() {
 
         console.log("[models] loaded:", {
           tiny: !!faceapi.nets.tinyFaceDetector?.isLoaded,
-          ssd: !!faceapi.nets.ssdMobilenetv1?.isLoaded,
           lmk68: !!faceapi.nets.faceLandmark68Net?.isLoaded,
           ageg: !!faceapi.nets.ageGenderNet?.isLoaded,
           recog: !!faceapi.nets.faceRecognitionNet?.isLoaded,
         });
-        detectorDebugRef.current.ssdLoaded =
-          !!faceapi.nets.ssdMobilenetv1?.isLoaded;
 
         await startCamera();
 
@@ -1441,90 +1423,17 @@ export default function App() {
         let dets = [];
         const detectStart = performance.now();
         try {
-          const runFullChain = async (opts) => {
-            let chain = faceapi.detectAllFaces(video, opts);
-            if (faceapi.nets.faceLandmark68Net?.isLoaded)
-              chain = chain.withFaceLandmarks();
-            if (heavyAgeNow && faceapi.nets.ageGenderNet?.isLoaded)
-              chain = chain.withAgeAndGender();
-            if (faceapi.nets.faceRecognitionNet?.isLoaded)
-              chain = chain.withFaceDescriptors();
-            return await chain;
-          };
-
-          detectorDebugRef.current.mode = "tiny";
-          detectorDebugRef.current.fallback = false;
-          dets = await runFullChain(tinyOptsRef.current);
-
-          if (!dets.length) {
-            noFaceStreakRef.current += 1;
-          } else {
-            noFaceStreakRef.current = 0;
-          }
-
-          if (!dets.length && noFaceStreakRef.current >= 3) {
-            const fallbackOpts = [
-              new faceapi.TinyFaceDetectorOptions({
-                inputSize: 256,
-                scoreThreshold: 0.3,
-              }),
-              new faceapi.TinyFaceDetectorOptions({
-                inputSize: 192,
-                scoreThreshold: 0.2,
-              }),
-            ];
-
-            for (const opts of fallbackOpts) {
-              const retryDets = await runFullChain(opts);
-              if (retryDets.length) {
-                dets = retryDets;
-                tinyOptsRef.current = opts;
-                noFaceStreakRef.current = 0;
-                detectorDebugRef.current.mode = `tiny:${opts.inputSize}`;
-                detectorDebugRef.current.fallback = true;
-                break;
-              }
-
-              const plainRetry = await faceapi.detectAllFaces(video, opts);
-              if (plainRetry.length) {
-                dets = plainRetry;
-                tinyOptsRef.current = opts;
-                noFaceStreakRef.current = 0;
-                detectorDebugRef.current.mode = `tiny-plain:${opts.inputSize}`;
-                detectorDebugRef.current.fallback = true;
-                break;
-              }
-            }
-
-            if (
-              !dets.length &&
-              faceapi.nets.ssdMobilenetv1?.isLoaded
-            ) {
-              const ssdDets = await runFullChain(ssdOptsRef.current);
-              if (ssdDets.length) {
-                dets = ssdDets;
-                noFaceStreakRef.current = 0;
-                detectorDebugRef.current.mode = "ssd";
-                detectorDebugRef.current.fallback = true;
-              } else {
-                const plainSsd = await faceapi.detectAllFaces(
-                  video,
-                  ssdOptsRef.current
-                );
-                if (plainSsd.length) {
-                  dets = plainSsd;
-                  noFaceStreakRef.current = 0;
-                  detectorDebugRef.current.mode = "ssd-plain";
-                  detectorDebugRef.current.fallback = true;
-                }
-              }
-            }
-          }
-          detectorDebugRef.current.count = dets.length;
+          let chain = faceapi.detectAllFaces(video, tinyOptsRef.current);
+          if (faceapi.nets.faceLandmark68Net?.isLoaded)
+            chain = chain.withFaceLandmarks();
+          if (heavyAgeNow && faceapi.nets.ageGenderNet?.isLoaded)
+            chain = chain.withAgeAndGender();
+          if (faceapi.nets.faceRecognitionNet?.isLoaded)
+            chain = chain.withFaceDescriptors();
+          dets = await chain;
         } catch (e) {
           console.warn("faceapi detect chain failed:", e?.message || e);
           dets = [];
-          detectorDebugRef.current.count = 0;
         }
 
         //#endregion
@@ -1576,21 +1485,6 @@ export default function App() {
             ctx.fillText(msg, x + 9, y + 17);
             ctx.restore();
           }
-
-          const detDbg = detectorDebugRef.current;
-          const dbgMsg = `det ${detDbg.count} | ${detDbg.mode} | fallback ${detDbg.fallback ? "on" : "off"} | ssd ${detDbg.ssdLoaded ? "ok" : "no"}`;
-          ctx.save();
-          ctx.font =
-            "bold 14px system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif";
-          const dbgW = ctx.measureText(dbgMsg).width + 14;
-          const dbgX = 10;
-          const dbgY = 48;
-          ctx.fillStyle = "rgba(0,0,0,0.55)";
-          ctx.fillRect(dbgX, dbgY, dbgW, 24);
-          ctx.fillStyle = "#f8fafc";
-          ctx.textBaseline = "middle";
-          ctx.fillText(dbgMsg, dbgX + 7, dbgY + 12);
-          ctx.restore();
         }
         ctx.font = LABEL_FONT;
         ctx.textBaseline = "top";

@@ -120,7 +120,7 @@ export function useCamera({
           );
           tinyOptsRef.current = new faceapi.TinyFaceDetectorOptions({
             inputSize: pickInputSize(w),
-            scoreThreshold: 0.3,
+            scoreThreshold: 0.4,
           });
         };
       }
@@ -145,7 +145,7 @@ export function useCamera({
           camFyRef.current = focalFromFov(v.videoHeight || 720, fovVdeg);
           tinyOptsRef.current = new faceapi.TinyFaceDetectorOptions({
             inputSize: pickInputSize(w),
-            scoreThreshold: 0.3,
+            scoreThreshold: 0.4,
           });
         };
       }
@@ -221,11 +221,9 @@ export function useCamera({
         pitchDeg: pitch * rad,
       });
     }
-    if (!samples.length) {
-      calibMsgRef.current = "No face detected — check lighting & position";
-      return;
-    }
     calibMsgRef.current = "";
+
+    if (!samples.length) return;
 
     const median = (arr) => {
       const a = [...arr].sort((x, y) => x - y);
@@ -275,11 +273,8 @@ export function useCamera({
     }
     calibMsgRef.current = "Calibrating...";
     await calibrateCameraOneClick();
-    // calibrateCameraOneClick sets an error message on failure; only override with "Done!" on success
-    if (!calibMsgRef.current.includes("No face")) {
-      calibMsgRef.current = "Done!";
-    }
-    await delay(2000);
+    calibMsgRef.current = "Done!";
+    await delay(600);
     calibMsgRef.current = "";
   }, [calibDistanceM, calibMsgRef, calibrateCameraOneClick, delay]);
 

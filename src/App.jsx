@@ -17,6 +17,7 @@ import "./App.css";
 import { normalizeServerUrl, uuid } from "./utils/socketUtils";
 import {
   ageGroupOf,
+  getCenterBand,
   zoneOf,
   topExpression,
   gestureLabelOf,
@@ -673,6 +674,16 @@ export default function App() {
   useEffect(() => {
     greenMaxMRef.current = greenMaxM;
   }, [greenMaxM]);
+  const [zoneMode, setZoneMode] = useState(
+    () => localStorage.getItem("ika:zoneMode") || "screen"
+  );
+  const zoneModeRef = useRef(zoneMode);
+  useEffect(() => {
+    zoneModeRef.current = zoneMode;
+    try {
+      localStorage.setItem("ika:zoneMode", zoneMode);
+    } catch {}
+  }, [zoneMode]);
 
   const DEFAULT_RED_CUTOFF_M = 3.5;
   const [redCutoffM, setRedCutoffM] = useState(() => {
@@ -1573,8 +1584,7 @@ export default function App() {
 
         // Draw center-frame guide lines (middle third for GREEN zone)
         try {
-          const leftBoundary = canvas.width * (1 / 3 - 1 / 8); // match widened green zone (~0.208w)
-          const rightBoundary = canvas.width * (2 / 3 + 1 / 8); // match widened green zone (~0.792w)
+          const { leftBoundary, rightBoundary } = getCenterBand(canvas.width);
 
           ctx.save();
           ctx.strokeStyle = "rgba(34, 197, 94, 0.5)"; // Semi-transparent green
@@ -2092,6 +2102,7 @@ export default function App() {
     panOffRef,
     tiltOffRef,
     greenMaxMRef,
+    zoneModeRef,
     recentMapRef,
     ageGenderCacheRef,
     mouthMapRef,
@@ -2194,6 +2205,8 @@ export default function App() {
             onVideoChange={handleVideoChange}
             onRestartCamera={handleRestartCamera}
             onStopCamera={handleStopCamera}
+            zoneMode={zoneMode}
+            setZoneMode={setZoneMode}
             greenMaxM={greenMaxM}
             setGreenMaxM={setGreenMaxM}
             defaultGreenMaxM={DEFAULT_GREEN_MAX_M}

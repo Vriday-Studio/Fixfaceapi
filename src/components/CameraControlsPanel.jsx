@@ -6,6 +6,8 @@ export default function CameraControlsPanel({
   onVideoChange,
   onRestartCamera,
   onStopCamera,
+  zoneMode,
+  setZoneMode,
   greenMaxM,
   setGreenMaxM,
   defaultGreenMaxM,
@@ -65,6 +67,23 @@ export default function CameraControlsPanel({
       </div>
 
       <div className="panel">
+        <div className="inline-controls" style={{ marginBottom: 8 }}>
+          <b>Zone mode</b>
+          <select
+            className="select"
+            value={zoneMode}
+            onChange={(e) => setZoneMode(e.target.value)}
+            style={{ maxWidth: 220 }}
+          >
+            <option value="screen">Screen space</option>
+            <option value="distance">Calibrated distance</option>
+          </select>
+          <span className="help">
+            {zoneMode === "screen"
+              ? "Green/red follows the visible center zone, independent of camera lens."
+              : "Green/red uses center zone plus calibrated distance."}
+          </span>
+        </div>
         <div className="inline-controls">
           <b>Green zone distance</b>
           <input
@@ -76,20 +95,27 @@ export default function CameraControlsPanel({
             value={greenMaxM}
             onChange={(e) => setGreenMaxM(Number(e.target.value))}
             aria-label="Green zone distance in meters"
+            disabled={zoneMode !== "distance"}
           />
           <span className="chip">{greenMaxM.toFixed(2)} m</span>
-          <button className="btn" onClick={() => setGreenMaxM(defaultGreenMaxM)}>
+          <button
+            className="btn"
+            onClick={() => setGreenMaxM(defaultGreenMaxM)}
+            disabled={zoneMode !== "distance"}
+          >
             reset
           </button>
           <button
             className="btn"
             onClick={() => setGreenMaxM((v) => Math.max(0.3, +(v - 0.1).toFixed(2)))}
+            disabled={zoneMode !== "distance"}
           >
             -0.1
           </button>
           <button
             className="btn"
             onClick={() => setGreenMaxM((v) => Math.min(2.0, +(v + 0.1).toFixed(2)))}
+            disabled={zoneMode !== "distance"}
           >
             +0.1
           </button>

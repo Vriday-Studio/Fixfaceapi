@@ -14,6 +14,7 @@ export function useFaceCandidates({
   camFyRef,
   panOffRef,
   tiltOffRef,
+  zoneModeRef,
   greenMaxMRef,
   recentMapRef,
   ageGenderCacheRef,
@@ -58,7 +59,13 @@ export function useFaceCandidates({
         if (dist != null && dist > cutoff) continue;
         const faceCenterX = box.x + box.width / 2;
         const frameWidth = canvas.width;
-        const zone = zoneOf(dist, greenMaxMRef.current, faceCenterX, frameWidth);
+        const zone = zoneOf(
+          dist,
+          greenMaxMRef.current,
+          faceCenterX,
+          frameWidth,
+          zoneModeRef.current
+        );
         candidates.push({ i, det, box, dist, zone });
       }
 
@@ -361,6 +368,7 @@ export function useFaceCandidates({
       gestureTargetsRef,
       gesturesOnRef,
       greenMaxMRef,
+      zoneModeRef,
       handsCacheMs,
       labelPadX,
       labelPadY,

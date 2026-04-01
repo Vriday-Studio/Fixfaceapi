@@ -11,21 +11,46 @@ export const ageGroupOf = (age) => {
   return "child";
 };
 
-export const zoneOf = (d, greenMaxM, faceCenterX, frameWidth) => {
+export function getCenterBand(frameWidth) {
+  if (
+    Number.isFinite(frameWidth) &&
+    frameWidth > 0
+  ) {
+    return {
+      leftBoundary: frameWidth * (1 / 3 - 1 / 8),
+      rightBoundary: frameWidth * (2 / 3 + 1 / 8),
+    };
+  }
+
+  return { leftBoundary: null, rightBoundary: null };
+}
+
+export const zoneOf = (
+  d,
+  greenMaxM,
+  faceCenterX,
+  frameWidth,
+  mode = "screen"
+) => {
+  const { leftBoundary, rightBoundary } = getCenterBand(frameWidth);
+  const hasCenterBand =
+    Number.isFinite(faceCenterX) &&
+    Number.isFinite(leftBoundary) &&
+    Number.isFinite(rightBoundary);
+  const isInCenter =
+    hasCenterBand &&
+    faceCenterX >= leftBoundary &&
+    faceCenterX <= rightBoundary;
+
+  if (mode === "screen") {
+    return isInCenter ? "green" : "red";
+  }
+
   if (!Number.isFinite(d) || !Number.isFinite(greenMaxM) || d > greenMaxM) {
     return "red";
   }
 
-  if (
-    Number.isFinite(faceCenterX) &&
-    Number.isFinite(frameWidth) &&
-    frameWidth > 0
-  ) {
-    const leftBoundary = frameWidth * (1 / 3 - 1 / 8);
-    const rightBoundary = frameWidth * (2 / 3 + 1 / 8);
-    const isInCenter =
-      faceCenterX >= leftBoundary && faceCenterX <= rightBoundary;
-
+  if (hasCenterBand) {
     return isInCenter ? "green" : "red";
   }
 

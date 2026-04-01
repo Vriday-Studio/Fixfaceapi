@@ -6,6 +6,7 @@ export function handleZoneTransitions({
   prevZoneMapRef,
   greenEntryRef,
   callOverStateRef,
+  lastGlobalCallOverTsRef,
   pendingGreetsRef,
   pushedGreets,
   ageGenderCacheRef,
@@ -170,19 +171,27 @@ export function handleZoneTransitions({
           tries: 0,
           last: 0,
         };
+        const globalReady =
+          now - (lastGlobalCallOverTsRef.current || 0) >= CALL_OVER_COOLDOWN_MS;
         if (
           s.tries < CALL_OVER_MAX_TRIES &&
-          now - (s.last || 0) >= CALL_OVER_COOLDOWN_MS
+          now - (s.last || 0) >= CALL_OVER_COOLDOWN_MS &&
+          globalReady
         ) {
           s.tries += 1;
           s.last = now;
           callOverStateRef.current.set(p.key, s);
+          lastGlobalCallOverTsRef.current = now;
           sendPeopleIntent("call_over", p, {
             group: groupInfo,
             reason: "left_green_zone",
             guests: guestSnapshots,
             context: { attempt: s.tries },
           });
+        } else if (!globalReady) {
+          log(
+            `[DEBUG Zone Transitions] Suppressed call_over for ${p.key}: global cooldown active`
+          );
         }
       } else if (currentZ === "none") {
         sendPeopleIntent("none", { ...p, zone: "none" }, {

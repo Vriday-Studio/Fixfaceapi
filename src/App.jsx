@@ -650,6 +650,7 @@ export default function App() {
 
   const prevZoneMapRef = useRef(new Map());
   const callOverStateRef = useRef(new Map());
+  const lastGlobalCallOverTsRef = useRef(0);
   const greetInviteRef = useRef(new Map());
   const lastGroupSetRef = useRef(new Set());
   const lastGroupAskTsRef = useRef(0);
@@ -2025,6 +2026,7 @@ export default function App() {
     prevZoneMapRef,
     greenEntryRef,
     callOverStateRef,
+    lastGlobalCallOverTsRef,
     pendingGreetsRef,
     redZoneCounterRef,
     noneZoneCounterRef,

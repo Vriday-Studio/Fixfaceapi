@@ -106,6 +106,68 @@ const ATTEND_MIN_FRAMES = 5; // require 3-5 consecutive frames
 const DEBUG_FACE_LOGS = false;
 const DEBUG_ZONE_LOGS = false;
 const DEBUG_PERF_LOGS = false;
+const WEATHER_POLL_MS = 10 * 60 * 1000;
+const GIK_COORDS = { latitude: -6.1944, longitude: 106.8219 };
+
+function describeWeatherCode(code) {
+  switch (code) {
+    case 0:
+      return "Clear";
+    case 1:
+    case 2:
+      return "Partly cloudy";
+    case 3:
+      return "Overcast";
+    case 45:
+    case 48:
+      return "Fog";
+    case 51:
+    case 53:
+    case 55:
+    case 56:
+    case 57:
+      return "Drizzle";
+    case 61:
+    case 63:
+    case 65:
+    case 66:
+    case 67:
+    case 80:
+    case 81:
+    case 82:
+      return "Rain";
+    case 71:
+    case 73:
+    case 75:
+    case 77:
+    case 85:
+    case 86:
+      return "Snow";
+    case 95:
+    case 96:
+    case 99:
+      return "Thunderstorm";
+    default:
+      return "Weather";
+  }
+}
+
+function buildWeatherLabel(current) {
+  const temp = Number(current?.temperature_2m);
+  const precipitation = Number(current?.precipitation ?? 0);
+  const rain = Number(current?.rain ?? 0);
+  const showers = Number(current?.showers ?? 0);
+  const rawCode = Number(current?.weather_code);
+  const hasPrecipitation =
+    Number.isFinite(precipitation) && precipitation > 0.1 ||
+    Number.isFinite(rain) && rain > 0 ||
+    Number.isFinite(showers) && showers > 0;
+  const condition = hasPrecipitation
+    ? "Rain"
+    : describeWeatherCode(Number.isFinite(rawCode) ? rawCode : -1);
+  const roundedTemp = Number.isFinite(temp) ? Math.round(temp) : null;
+  return roundedTemp == null ? condition : `${condition} ${roundedTemp} degC`;
+}
 
 const logFace = (...args) => {
   if (DEBUG_FACE_LOGS) console.log(...args);
@@ -455,6 +517,45 @@ export default function App() {
   useEffect(() => {
     weatherRef.current = weatherLabel;
   }, [weatherLabel]);
+
+  useEffect(() => {
+    let isDisposed = false;
+
+    const updateWeather = async () => {
+      try {
+        const params = new URLSearchParams({
+          latitude: String(GIK_COORDS.latitude),
+          longitude: String(GIK_COORDS.longitude),
+          current: [
+            "temperature_2m",
+            "weather_code",
+            "precipitation",
+            "rain",
+            "showers",
+          ].join(","),
+          timezone: "Asia/Jakarta",
+          forecast_days: "1",
+        });
+        const res = await fetch(
+          `https://api.open-meteo.com/v1/forecast?${params.toString()}`,
+          { cache: "no-store" }
+        );
+        if (!res.ok) throw new Error(`weather http ${res.status}`);
+        const data = await res.json();
+        const nextLabel = buildWeatherLabel(data?.current);
+        if (!isDisposed && nextLabel) setWeatherLabel(nextLabel);
+      } catch (err) {
+        console.warn("weather update failed", err);
+      }
+    };
+
+    updateWeather();
+    const timer = setInterval(updateWeather, WEATHER_POLL_MS);
+    return () => {
+      isDisposed = true;
+      clearInterval(timer);
+    };
+  }, []);
   const totalsRef = useRef({ all: 0, green: 0, red: 0 });
 
   const {

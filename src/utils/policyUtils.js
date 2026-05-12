@@ -1,3 +1,5 @@
+const GREET_COOLDOWN_MS = 20_000;
+
 export function handleZoneTransitions({
   allIdentities,
   now,
@@ -81,9 +83,14 @@ export function handleZoneTransitions({
         continue;
       }
 
+      // reset call_over tries when person enters green
+      if (prevZ !== "green") {
+        callOverStateRef.current.delete(p.key);
+      }
+
       let entry = greenEntryRef.current.get(p.key);
       if (!entry) {
-        entry = { ts: now, greetedOnceInThisGreen: false };
+        entry = { ts: now, lastGreetTs: 0 };
         greenEntryRef.current.set(p.key, entry);
         log(
           `[DEBUG Zone Transitions] Mark green entry for ${p.key} at ${now.toFixed(
@@ -104,16 +111,17 @@ export function handleZoneTransitions({
 
       prevZoneMapRef.current.set(p.key, currentZ);
 
+      const greetCooldownReady = now - (entry.lastGreetTs || 0) >= GREET_COOLDOWN_MS;
       if (
         !isStablyInGreen ||
         !everyoneReady ||
-        entry.greetedOnceInThisGreen ||
+        !greetCooldownReady ||
         isOnPhone
       ) {
         log("[DEBUG Zone Transitions] Skipping greet", {
           isStablyInGreen,
           everyoneReady,
-          greetedOnce: entry.greetedOnceInThisGreen,
+          greetCooldownReady,
           isOnPhone,
         });
         continue;
@@ -144,7 +152,7 @@ export function handleZoneTransitions({
         : "there";
 
       log("[DEBUG Zone Transitions] Sending greet intent for", p.key);
-      sendPeopleIntent(
+      const greetSent = sendPeopleIntent(
         "greet",
         { ...p, gender: effectiveGender, ageGroup: effectiveAgeGroup },
         {
@@ -153,24 +161,35 @@ export function handleZoneTransitions({
         }
       );
 
-      entry.greetedOnceInThisGreen = true;
-      greenEntryRef.current.set(p.key, entry);
-      pendingGreetsRef.current.delete(p.key);
-    } else if (prevZ === "green" && (currentZ === "red" || currentZ === "none")) {
-      log(
-        `[DEBUG Zone Transitions] Person ${p.key}: leaving green -> ${currentZ}`
-      );
-      prevZoneMapRef.current.set(p.key, currentZ);
-      greenEntryRef.current.delete(p.key);
-
-      if (!isOnPhone && currentZ === "red") {
+      if (greetSent) {
+        entry.lastGreetTs = now;
+        greenEntryRef.current.set(p.key, entry);
+        pendingGreetsRef.current.delete(p.key);
+      } else {
         log(
-          `[DEBUG Zone Transitions] TRIGGER: green->red transition for ${p.key}`
+          `[DEBUG Zone Transitions] Suppressed greet for ${p.key}: speech lock active`
         );
-        const s = callOverStateRef.current.get(p.key) || {
-          tries: 0,
-          last: 0,
-        };
+      }
+    } else {
+      prevZoneMapRef.current.set(p.key, currentZ);
+
+      if (prevZ === "green") {
+        log(
+          `[DEBUG Zone Transitions] Person ${p.key}: leaving green -> ${currentZ}`
+        );
+        greenEntryRef.current.delete(p.key);
+
+        if (currentZ === "none") {
+          sendPeopleIntent("none", { ...p, zone: "none" }, {
+            group: groupInfo,
+            reason: "left_green_zone",
+            guests: guestSnapshots,
+          });
+        }
+      }
+
+      if (currentZ === "red" && !isOnPhone) {
+        const s = callOverStateRef.current.get(p.key) || { tries: 0, last: 0 };
         const globalReady =
           now - (lastGlobalCallOverTsRef.current || 0) >= CALL_OVER_COOLDOWN_MS;
         if (
@@ -178,35 +197,35 @@ export function handleZoneTransitions({
           now - (s.last || 0) >= CALL_OVER_COOLDOWN_MS &&
           globalReady
         ) {
-          s.tries += 1;
-          s.last = now;
-          callOverStateRef.current.set(p.key, s);
-          lastGlobalCallOverTsRef.current = now;
-          sendPeopleIntent("call_over", p, {
+          log(
+            `[DEBUG Zone Transitions] TRIGGER: call_over for ${p.key} (zone=red, prevZ=${prevZ})`
+          );
+          const callOverSent = sendPeopleIntent("call_over", p, {
             group: groupInfo,
-            reason: "left_green_zone",
+            reason: prevZ === "green" ? "left_green_zone" : "in_red_zone",
             guests: guestSnapshots,
-            context: { attempt: s.tries },
+            context: { attempt: s.tries + 1 },
           });
+          if (callOverSent) {
+            s.tries += 1;
+            s.last = now;
+            callOverStateRef.current.set(p.key, s);
+            lastGlobalCallOverTsRef.current = now;
+          } else {
+            log(
+              `[DEBUG Zone Transitions] Suppressed call_over for ${p.key}: speech lock active`
+            );
+          }
         } else if (!globalReady) {
           log(
             `[DEBUG Zone Transitions] Suppressed call_over for ${p.key}: global cooldown active`
           );
         }
-      } else if (currentZ === "none") {
-        sendPeopleIntent("none", { ...p, zone: "none" }, {
-          group: groupInfo,
-          reason: "left_green_zone",
-          guests: guestSnapshots,
-        });
+      } else {
+        log(
+          `[DEBUG Zone Transitions] Person ${p.key}: ${prevZ || "none"} -> ${currentZ} (no action)`
+        );
       }
-    } else {
-      prevZoneMapRef.current.set(p.key, currentZ);
-      log(
-        `[DEBUG Zone Transitions] Person ${p.key}: ${
-          prevZ || "none"
-        } -> ${currentZ} (no action)`
-      );
     }
   }
 

@@ -2,6 +2,19 @@ import { useCallback, useMemo } from "react";
 import { uuid } from "../utils/socketUtils";
 import { MSG_TYPE } from "./useDirectWebSocket";
 
+function buildSpeechSafeInstruction(baseInstruction) {
+  const base = (baseInstruction || "").trim();
+  const speechRules = [
+    "You are speaking out loud to visitors.",
+    "Do not say raw URLs, links, email addresses, markdown, headings, or bullet symbols.",
+    "If a source includes a link, summarize what it is for instead of reading it aloud.",
+    "For reservations or web pages, say that the reservation link or page can be shown on screen.",
+    "Use short, natural spoken sentences suitable for TTS.",
+  ].join(" ");
+
+  return base ? `${base}\n\n${speechRules}` : speechRules;
+}
+
 export function useServerBridge({
   socketRef,
   sendWsCommand,
@@ -73,7 +86,7 @@ export function useServerBridge({
       model: modelQuick,
       voice: geminiVoiceQuick,
       language_code: languageCodeQuick,
-      system_instruction: systemInstruction,
+      system_instruction: buildSpeechSafeInstruction(systemInstruction),
       tts_provider: ttsProviderQuick,
       response_modalities:
         ttsProviderQuick === "elevenlabs" ? ["TEXT"] : ["AUDIO", "TEXT"],

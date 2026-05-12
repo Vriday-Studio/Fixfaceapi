@@ -2,6 +2,8 @@ import { useCallback, useRef } from "react";
 import { MSG_TYPE } from "./useDirectWebSocket";
 import { buildVisitContext as buildVisitContextUtil } from "../utils/visitContext";
 
+const PENDING_SPEECH_LOCK_MS = 4000;
+
 export function useTelemetryEmitters({
   clockRef,
   locationRef,
@@ -9,6 +11,11 @@ export function useTelemetryEmitters({
   totalsRef,
   sendWsCommand,
   wsIsConnected,
+  socketRef,
+  deviceId,
+  sessionId,
+  policySpeechLockRef,
+  speakingRef,
 }) {
   const lastCrowdSendRef = useRef({ t: 0, sig: "" });
   const lastPeopleSnapshotSentRef = useRef(0);
@@ -27,8 +34,18 @@ export function useTelemetryEmitters({
 
   const sendPeopleIntent = useCallback(
     (intent, person, extra = {}) => {
-      if (!wsIsConnected.current) {
-        return;
+      const isSpokenIntent = intent === "greet" || intent === "call_over";
+      const now = Date.now();
+      const activeSpeechLock =
+        !!policySpeechLockRef?.current?.active &&
+        now - (policySpeechLockRef?.current?.since || 0) < PENDING_SPEECH_LOCK_MS;
+
+      if (isSpokenIntent && (speakingRef?.current || activeSpeechLock)) {
+        return false;
+      }
+
+      if (isSpokenIntent && policySpeechLockRef?.current) {
+        policySpeechLockRef.current = { active: true, since: now, intent };
       }
 
       const identityKeyForPayload =
@@ -64,9 +81,69 @@ export function useTelemetryEmitters({
         context: buildVisitContext(extra.context || {}),
       };
 
-      sendWsCommand(MSG_TYPE.PeopleData, payload);
+      if (wsIsConnected.current) {
+        sendWsCommand(MSG_TYPE.PeopleData, payload);
+      }
+
+      const socket = socketRef?.current;
+      if (!socket?.emit) return true;
+
+      if (intent === "greet") {
+        socket.emit("policy_event", {
+          deviceId,
+          sessionId: sessionId || "web-" + deviceId,
+          type: "greet",
+          address: extra?.group?.address || null,
+          target: {
+            name: person.name || null,
+            gid: person.gid || null,
+            gender: person.gender || null,
+          },
+          group: extra?.group
+            ? {
+                size: extra.group.size ?? null,
+                hasKid: !!extra.group.hasKid,
+              }
+            : null,
+          at: Date.now(),
+        });
+        return true;
+      }
+
+      if (intent === "call_over") {
+        socket.emit("policy_event", {
+          deviceId,
+          sessionId: sessionId || "web-" + deviceId,
+          type: "call_over",
+          attempt: extra?.context?.attempt ?? null,
+          target: {
+            name: person.name || null,
+            gid: person.gid || null,
+            gender: person.gender || null,
+          },
+          group: extra?.group
+            ? {
+                size: extra.group.size ?? null,
+                hasKid: !!extra.group.hasKid,
+              }
+            : null,
+          reason: extra?.reason || null,
+          at: Date.now(),
+        });
+      }
+
+      return true;
     },
-    [buildVisitContext, sendWsCommand, wsIsConnected]
+    [
+      buildVisitContext,
+      deviceId,
+      policySpeechLockRef,
+      sendWsCommand,
+      sessionId,
+      speakingRef,
+      socketRef,
+      wsIsConnected,
+    ]
   );
 
   const emitCrowdThrottled = useCallback(

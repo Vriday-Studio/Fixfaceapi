@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 import { MSG_TYPE } from "./useDirectWebSocket";
 import { handleZoneTransitions } from "../utils/policyUtils";
 
@@ -38,6 +38,8 @@ export function usePresencePolicy({
   redZoneNoneResetFrames,
   redZoneStableFrames,
 }) {
+  const lastRedPresenceSentRef = useRef(0);
+
   const handleNoFaceDetected = useCallback(() => {
     if (!wsIsConnected.current) return;
 
@@ -109,16 +111,19 @@ export function usePresencePolicy({
               context: buildVisitContext(),
             };
 
-            if (
+            const now = performance.now();
+            const shouldRefreshRedPresence =
               redZoneCounterRef.current === 1 ||
-              redZoneCounterRef.current % 5 === 0
-            ) {
+              now - (lastRedPresenceSentRef.current || 0) >= 3000;
+
+            if (shouldRefreshRedPresence) {
               logZone(
                 `[RED Zone] Sending PeopleData frame ${redZoneCounterRef.current}:`,
                 redPayload
               );
+              lastRedPresenceSentRef.current = now;
+              sendWsCommand(MSG_TYPE.PeopleData, redPayload);
             }
-            sendWsCommand(MSG_TYPE.PeopleData, redPayload);
 
             if (
               redZoneCounterRef.current >= redZoneStableFrames &&
@@ -135,6 +140,7 @@ export function usePresencePolicy({
 
         redZoneCounterRef.current = 0;
         noneZoneCounterRef.current = 0;
+        lastRedPresenceSentRef.current = 0;
       } catch (err) {
         console.error("[RED Zone] Error in detection logic:", err);
       }

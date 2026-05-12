@@ -96,7 +96,7 @@ const LABEL_PAD_Y = 6;
 
 // sockets
 const SOCKET_URL = undefined; // same-origin
-const USE_SOCKET_BRIDGE = false; // legacy Socket.IO bridge (remote controls / telemetry)
+const USE_SOCKET_BRIDGE = true; // Socket.IO bridge for policy events, controls, and audio/text responses
 const USE_DIRECT_WEBSOCKET = true; // policy + session pipeline (always on)
 
 // --- Attention / greeting policy ---
@@ -168,6 +168,74 @@ function buildWeatherLabel(current) {
     : describeWeatherCode(Number.isFinite(rawCode) ? rawCode : -1);
   const roundedTemp = Number.isFinite(temp) ? Math.round(temp) : null;
   return roundedTemp == null ? condition : `${condition} ${roundedTemp} degC`;
+}
+
+function normalizeAssistantText(value) {
+  let text = typeof value === "string" ? value : "";
+  const responseBlock = text.match(
+    /===\s*RESPONSE\s*===\s*([\s\S]*?)(?=\n\s*===\s*[A-Z _]+\s*===|$)/i
+  );
+  if (responseBlock?.[1]) {
+    text = responseBlock[1];
+  }
+
+  text = text
+    .replace(/^\s*(?:response)\s*:\s*/i, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return text;
+}
+
+class ChunkAudioPlayer {
+  constructor({ onStart, onEnd } = {}) {
+    this.queue = [];
+    this.playing = false;
+    this.audio = new Audio();
+    this.audio.autoplay = false;
+    this.onStart = onStart;
+    this.onEnd = onEnd;
+
+    this.audio.addEventListener("ended", () => this._next());
+    this.audio.addEventListener("error", () => this._next());
+  }
+
+  enqueue(uint8, mime = "audio/mpeg") {
+    if (!(uint8 instanceof Uint8Array)) return;
+    this.queue.push({ uint8, mime });
+    if (!this.playing) this._next();
+  }
+
+  _next() {
+    const item = this.queue.shift();
+    if (!item) {
+      this.playing = false;
+      try {
+        this.onEnd?.();
+      } catch {}
+      return;
+    }
+
+    const blob = new Blob([item.uint8], { type: item.mime });
+    const url = URL.createObjectURL(blob);
+    this.playing = true;
+    try {
+      this.onStart?.();
+    } catch {}
+    this.audio.src = url;
+    this.audio
+      .play()
+      .catch(() => {})
+      .finally(() => setTimeout(() => URL.revokeObjectURL(url), 10_000));
+  }
+
+  stop() {
+    try {
+      this.audio.pause();
+    } catch {}
+    this.queue = [];
+    this.playing = false;
+  }
 }
 
 const logFace = (...args) => {
@@ -322,6 +390,10 @@ export default function App() {
     }
   });
   const [deviceIdDraft, setDeviceIdDraft] = useState("");
+  const sessionIdRef = useRef(sessionId);
+  useEffect(() => {
+    sessionIdRef.current = sessionId;
+  }, [sessionId]);
   useEffect(() => {
     setDeviceIdDraft(deviceId);
     try {
@@ -558,6 +630,8 @@ export default function App() {
     };
   }, []);
   const totalsRef = useRef({ all: 0, green: 0, red: 0 });
+  const speakingRef = useRef(false);
+  const policySpeechLockRef = useRef({ active: false, since: 0, intent: null });
 
   const {
     buildVisitContext,
@@ -572,6 +646,11 @@ export default function App() {
     totalsRef,
     sendWsCommand,
     wsIsConnected,
+    socketRef,
+    deviceId,
+    sessionId,
+    policySpeechLockRef,
+    speakingRef,
   });
 
   // Camera + detection state
@@ -647,7 +726,6 @@ export default function App() {
   const mouthMapRef = useRef(new Map());
   const trackedFacesRef = useRef([]);
   const allFacesRef = useRef([]);
-  const speakingRef = useRef(false);
 
   const prevZoneMapRef = useRef(new Map());
   const callOverStateRef = useRef(new Map());
@@ -1870,6 +1948,7 @@ export default function App() {
     camRef.current.stream = null;
 
     speakingRef.current = false;
+    policySpeechLockRef.current = { active: false, since: 0, intent: null };
     S.current = { id: null, seenFrames: 0, lastFaceTs: 0, lastSnapshotTs: 0 };
 
     try {
@@ -1929,6 +2008,107 @@ export default function App() {
   useEffect(() => {
     if (gameModeOn) lastGameActivityRef.current = performance.now();
   }, [gameModeOn]);
+
+  useEffect(() => {
+    const player = new ChunkAudioPlayer({
+      onStart: () => {
+        speakingRef.current = true;
+        policySpeechLockRef.current = {
+          active: true,
+          since: Date.now(),
+          intent: policySpeechLockRef.current?.intent || "tts",
+        };
+        setServerInfo((s) => ({ ...s, ai_speaking: true }));
+      },
+      onEnd: () => {
+        speakingRef.current = false;
+        policySpeechLockRef.current = { active: false, since: 0, intent: null };
+        setServerInfo((s) => ({ ...s, ai_speaking: false }));
+      },
+    });
+    ttsPlayerRef.current = player;
+    return () => player.stop();
+  }, []);
+
+  useEffect(() => {
+    if (!USE_SOCKET_BRIDGE) return undefined;
+
+    const url = normalizeServerUrl(serverUrl || SOCKET_URL);
+    const isHttpsPage = window.location.protocol === "https:";
+    const isLoopback =
+      /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(url || "");
+    const transports =
+      isHttpsPage && isLoopback ? ["websocket"] : ["polling", "websocket"];
+
+    const socket = io(url, {
+      transports,
+      path: "/socket.io",
+      autoConnect: true,
+      reconnection: true,
+      reconnectionDelay: 500,
+      reconnectionAttempts: Infinity,
+      withCredentials: false,
+      timeout: 12000,
+      rememberUpgrade: true,
+      forceNew: true,
+    });
+    socketRef.current = socket;
+
+    socket.on("connect", () => {
+      try {
+        socket.emit("hello", {
+          deviceId,
+          sessionId: sessionIdRef.current,
+          role: "web",
+        });
+      } catch {}
+    });
+    socket.on("server_status", (m) =>
+      setServerInfo((prev) => ({ ...prev, ...m }))
+    );
+    socket.on("set_game_mode", (m) => setGameModeOn(!!m?.on));
+    socket.on("start_rps", () => setGameModeOn(true));
+    socket.on("stop_rps", () => setGameModeOn(false));
+    socket.on("session_created", (m) => {
+      setSessionStatus("ACTIVE");
+      setSessionId((prev) => m?.sessionId || prev || uuid());
+      bump("start");
+    });
+    socket.on("text_response", (t) => {
+      const rawText = typeof t === "string" ? t : t?.text || "";
+      const text = normalizeAssistantText(rawText);
+      if (text) setLastText(text);
+    });
+    socket.on("audio_chunk_received", (pkt) => {
+      try {
+        if (
+          pkt?.sessionId &&
+          sessionIdRef.current &&
+          pkt.sessionId !== sessionIdRef.current
+        ) {
+          return;
+        }
+        const b64 = pkt?.chunk;
+        if (!b64 || !ttsPlayerRef.current) return;
+        const u8 = b64ToU8(b64);
+        const mime = (pkt?.mime || "").toLowerCase();
+        if (mime.includes("mpeg")) {
+          ttsPlayerRef.current.enqueue(u8, mime);
+        }
+      } catch (e) {
+        console.warn("[audio] chunk error:", e);
+      }
+    });
+
+    return () => {
+      try {
+        socket.disconnect();
+      } catch {}
+      if (socketRef.current === socket) {
+        socketRef.current = null;
+      }
+    };
+  }, [serverUrl, deviceId, bump]);
 
   // Focus shared across blocks (used by gesture events and crowd payload)
   const focusIndexRef = useRef(-1);

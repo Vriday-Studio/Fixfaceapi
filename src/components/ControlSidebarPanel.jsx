@@ -10,6 +10,11 @@ export default function ControlSidebarPanel({
   setServerUrl,
   effectiveUrl,
   serverInfo,
+  glchatApiKey,
+  setGlchatApiKey,
+  hasGlchatApiKey,
+  glchatSlug,
+  setGlchatSlug,
   deviceIdDraft,
   setDeviceIdDraft,
   deviceId,
@@ -87,6 +92,43 @@ export default function ControlSidebarPanel({
           Effective: {effectiveUrl}
           <br />
           Status: {serverInfo.connected ? "connected" : "disconnected"}
+        </div>
+        <div
+          className="row"
+          style={{ gap: 8, marginTop: 12, alignItems: "center" }}
+        >
+          <input
+            className="input bigpad"
+            placeholder="GLChat slug"
+            value={glchatSlug}
+            onChange={(e) => setGlchatSlug(e.target.value)}
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            style={{ maxWidth: 140 }}
+          />
+          <input
+            className="input bigpad"
+            type="password"
+            placeholder="GLChat API key (X-API-Key)"
+            value={glchatApiKey}
+            onChange={(e) => setGlchatApiKey(e.target.value)}
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
+          />
+          <button
+            className="btn"
+            disabled={!glchatApiKey}
+            onClick={() => setGlchatApiKey("")}
+          >
+            Clear key
+          </button>
+        </div>
+        <div className="help" style={{ marginTop: 6 }}>
+          GLChat key: {hasGlchatApiKey ? "configured" : "not configured"}.
+          Slug/key storage: <code>ika:glchat:slug</code> and{" "}
+          <code>ika:glchat:key</code>.
         </div>
         <div
           className="row"

@@ -193,13 +193,18 @@ export function processFaceDetections(detections, canvas, redCutoffM, greenMaxM)
   return candidates;
 }
 
-// Filter and sort green zone candidates for tracking
+// Sort all visible candidates for tracking; zone controls eligibility later.
 export function getTrackingCandidates(candidates, maxTrack = 5) {
-  const greenCandidates = candidates
-    .filter((c) => c.zone === "green" && Number.isFinite(c.dist))
-    .sort((a, b) => a.dist - b.dist);
-    
-  return greenCandidates.slice(0, maxTrack);
+  return [...candidates]
+    .sort((a, b) => {
+      const aFinite = Number.isFinite(a.dist);
+      const bFinite = Number.isFinite(b.dist);
+      if (aFinite && bFinite) return a.dist - b.dist;
+      if (aFinite) return -1;
+      if (bFinite) return 1;
+      return a.i - b.i;
+    })
+    .slice(0, maxTrack);
 }
 
 // Calculate zone totals

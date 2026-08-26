@@ -1,4 +1,15 @@
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
+
+const GREEN_ZONE_GRACE_FRAMES = 3;
+
+function sortTrackingCandidates(a, b) {
+  const aFinite = Number.isFinite(a.dist);
+  const bFinite = Number.isFinite(b.dist);
+  if (aFinite && bFinite) return a.dist - b.dist;
+  if (aFinite) return -1;
+  if (bFinite) return 1;
+  return a.i - b.i;
+}
 
 export function useFaceCandidates({
   faceMatcherRef,
@@ -36,6 +47,8 @@ export function useFaceCandidates({
   faceapi,
   zoneOf,
 }) {
+  const zoneGraceRef = useRef(new Map());
+
   const buildFaceFrameData = useCallback(
     ({
       resized,
@@ -69,17 +82,11 @@ export function useFaceCandidates({
         candidates.push({ i, det, box, dist, zone });
       }
 
-      const total = candidates.length;
-      const green = candidates.filter((c) => c.zone === "green").length;
-      const red = total - green;
-
-      const greenCandidates = candidates
-        .filter((c) => c.zone === "green" && Number.isFinite(c.dist))
-        .sort((a, b) => a.dist - b.dist);
-      const tracked = greenCandidates.slice(0, 5);
+      const tracked = [...candidates].sort(sortTrackingCandidates).slice(0, 5);
 
       for (let k = 0; k < tracked.length; k++) {
-        const { i, det, box, dist, zone } = tracked[k];
+        const { i, det, box, dist } = tracked[k];
+        let zone = tracked[k].zone;
 
         // --- recognition (fast path + small margin check) ---
         const faceMatcher = faceMatcherRef.current;
@@ -113,15 +120,46 @@ export function useFaceCandidates({
 
         // --- guest id & display name ---
         let guestId = null;
-        if (!name) guestId = assignGuestIdFor(det.descriptor);
+        if (!name && det.descriptor?.length) {
+          guestId = assignGuestIdFor(det.descriptor);
+        }
         let displayName = name || guestId || "Guest";
 
         // --- stabilization keyed by stable identity (name or gid), not by index ---
         const stableKey = (name || guestId) ?? `tmp-${i}`;
 
+        const prevZone = zoneGraceRef.current.get(stableKey) || {
+          zone,
+          redFrames: 0,
+        };
+        if (zone === "green") {
+          zoneGraceRef.current.set(stableKey, { zone: "green", redFrames: 0 });
+        } else if (
+          prevZone.zone === "green" &&
+          prevZone.redFrames < GREEN_ZONE_GRACE_FRAMES
+        ) {
+          zoneGraceRef.current.set(stableKey, {
+            zone: "green",
+            redFrames: prevZone.redFrames + 1,
+          });
+          zone = "green";
+        } else {
+          zoneGraceRef.current.set(stableKey, {
+            zone: "red",
+            redFrames: prevZone.redFrames + 1,
+          });
+        }
+        tracked[k] = { ...tracked[k], zone };
+        const candidate = candidates.find((c) => c.i === i);
+        if (candidate) candidate.zone = zone;
+
         // Slot key (stable within this frame order; decouples from identity collisions)
         const slotKey = `slot-${k}`;
-        if (gesturesOnRef.current && k < gestureTargetsRef.current) {
+        if (
+          zone === "green" &&
+          gesturesOnRef.current &&
+          gestureAllowedKeys.size < gestureTargetsRef.current
+        ) {
           gestureAllowedKeys.add(stableKey);
         }
 
@@ -195,7 +233,7 @@ export function useFaceCandidates({
           if (rec) mouthActivity = rec.ema;
         }
 
-        ctx.strokeStyle = "#22c55e";
+        ctx.strokeStyle = zone === "green" ? "#22c55e" : "#ef4444";
         ctx.lineWidth = boxLineWidth;
         ctx.strokeRect(dbox.x, dbox.y, dbox.width, dbox.height);
 
@@ -323,6 +361,11 @@ export function useFaceCandidates({
         z: p.posCam?.z ?? null,
       }));
 
+      const keepZoneKeys = new Set(peopleForPost.map((p) => p.stableKey));
+      for (const key of Array.from(zoneGraceRef.current.keys())) {
+        if (!keepZoneKeys.has(key)) zoneGraceRef.current.delete(key);
+      }
+
       const guestSnapshots = peopleForPost.map((p) => ({
         name: p.name || null,
         zone: p.zone,
@@ -339,6 +382,10 @@ export function useFaceCandidates({
           h: d.height,
         };
       });
+
+      const total = candidates.length;
+      const green = candidates.filter((c) => c.zone === "green").length;
+      const red = total - green;
 
       return {
         rows,
@@ -386,6 +433,7 @@ export function useFaceCandidates({
       tiltOffRef,
       topExpression,
       trackedFacesRef,
+      zoneGraceRef,
       zoneOf,
     ]
   );

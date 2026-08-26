@@ -1,5 +1,6 @@
 import { useCallback, useMemo } from "react";
 import { uuid } from "../utils/socketUtils";
+import { buildGlchatAuthPayload } from "../utils/glchatAuth";
 import { MSG_TYPE } from "./useDirectWebSocket";
 
 function buildSpeechSafeInstruction(baseInstruction) {
@@ -35,11 +36,19 @@ export function useServerBridge({
   functionCallingQuick,
   autoFunctionResponseQuick,
   groundingQuick,
+  glchatApiKey,
+  glchatSlug,
 }) {
+  const glchatAuthPayload = useMemo(
+    () => buildGlchatAuthPayload(glchatApiKey, glchatSlug),
+    [glchatApiKey, glchatSlug]
+  );
+
   const createServerSession = useCallback(
     (preset = {}) => {
       sendWsCommand(MSG_TYPE.SessionStart, {
         ...preset,
+        ...glchatAuthPayload,
         deviceId,
         sessionId: sessionId || "web-" + deviceId,
       });
@@ -47,17 +56,31 @@ export function useServerBridge({
       setSessionStatus("ACTIVE");
       setSessionId((id) => id || uuid());
     },
-    [bump, deviceId, sendWsCommand, sessionId, setSessionId, setSessionStatus]
+    [
+      bump,
+      deviceId,
+      glchatAuthPayload,
+      sendWsCommand,
+      sessionId,
+      setSessionId,
+      setSessionStatus,
+    ]
   );
 
   const updateServerSettings = useCallback((fields = {}) => {
-    socketRef.current?.emit?.("update_settings", fields);
-  }, [socketRef]);
+    socketRef.current?.emit?.("update_settings", {
+      ...fields,
+      ...glchatAuthPayload,
+    });
+  }, [glchatAuthPayload, socketRef]);
 
   const sendTextPrompt = useCallback((text) => {
     if (!text) return;
-    socketRef.current?.emit?.("send_text_prompt", { text });
-  }, [socketRef]);
+    socketRef.current?.emit?.("send_text_prompt", {
+      text,
+      ...glchatAuthPayload,
+    });
+  }, [glchatAuthPayload, socketRef]);
 
   const emitCrowdStatus = useCallback(
     (payload) => {

@@ -3,8 +3,7 @@ import { useCallback } from "react";
 export function useFocusSelection({ wNear, wCenter, wMouth }) {
   const selectFocus = useCallback(
     (peopleForPost) => {
-      const pool = peopleForPost.filter((p) => p.zone === "green");
-      const cand = pool.length ? pool : peopleForPost;
+      const cand = peopleForPost.filter((p) => p.zone === "green");
 
       let focusIndex = cand.length ? 0 : -1;
       let focusScore = -1;

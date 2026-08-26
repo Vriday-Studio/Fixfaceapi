@@ -118,7 +118,12 @@ export class FaceTracker {
     // Define gesture eligibility (top N faces by proximity)
     const gestureEligible = new Set();
     if (gesturesOn) {
-      for (let i = 0; i < Math.min(tracked.length, this.config.gestureTargets); i++) {
+      for (
+        let i = 0;
+        i < tracked.length && gestureEligible.size < this.config.gestureTargets;
+        i++
+      ) {
+        if (tracked[i].zone !== "green") continue;
         const stableKey = this.getStableKey(tracked[i], i);
         gestureEligible.add(stableKey);
       }
@@ -168,7 +173,7 @@ export class FaceTracker {
       
       const gestureLbl = zone === "green" && freshGesture ? 
         this.getGestureLabel(freshGesture) : null;
-      const gestureText = freshGesture ? this.getGestureLabel(freshGesture) : null;
+      const gestureText = zone === "green" && freshGesture ? this.getGestureLabel(freshGesture) : null;
       
       // Calculate 3D position
       const pos = analysis.cx && analysis.cy && dist ? 

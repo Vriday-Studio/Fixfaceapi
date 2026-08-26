@@ -27,6 +27,8 @@ export function useCamera({
   rad,
   onCameraGone,
 }) {
+  const tinyFaceScoreThreshold = 0.25;
+
   const isCamLive = useCallback(() => {
     const s = camRef.current?.stream;
     if (!s) return false;
@@ -120,7 +122,7 @@ export function useCamera({
           );
           tinyOptsRef.current = new faceapi.TinyFaceDetectorOptions({
             inputSize: pickInputSize(w),
-            scoreThreshold: 0.4,
+            scoreThreshold: tinyFaceScoreThreshold,
           });
         };
       }
@@ -145,7 +147,7 @@ export function useCamera({
           camFyRef.current = focalFromFov(v.videoHeight || 720, fovVdeg);
           tinyOptsRef.current = new faceapi.TinyFaceDetectorOptions({
             inputSize: pickInputSize(w),
-            scoreThreshold: 0.4,
+            scoreThreshold: tinyFaceScoreThreshold,
           });
         };
       }

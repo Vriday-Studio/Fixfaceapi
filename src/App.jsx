@@ -51,6 +51,14 @@ import {
   groupSignature,
   maybeRotateSession,
 } from "./utils/sessionRotation";
+import {
+  DEFAULT_GLCHAT_SLUG,
+  GLCHAT_API_KEY_STORAGE_KEY,
+  GLCHAT_SLUG_STORAGE_KEY,
+  buildGlchatAuthPayload,
+  normalizeGlchatApiKey,
+  normalizeGlchatSlug,
+} from "./utils/glchatAuth";
 import { MSG_TYPE, useDirectWebSocket } from "./hooks/useDirectWebSocket";
 import { useCamera } from "./hooks/useCamera";
 import { useControlActions } from "./hooks/useControlActions";
@@ -93,6 +101,7 @@ const LABEL_FONT =
   "16px system-ui,-apple-system,Segoe UI,Roboto,'Helvetica Neue',Arial,sans-serif";
 const LABEL_PAD_X = 8;
 const LABEL_PAD_Y = 6;
+const TINY_FACE_SCORE_THRESHOLD = 0.25;
 
 // sockets
 const SOCKET_URL = undefined; // same-origin
@@ -171,12 +180,63 @@ function buildWeatherLabel(current) {
 }
 
 function normalizeAssistantText(value) {
-  let text = typeof value === "string" ? value : "";
-  const responseBlock = text.match(
-    /===\s*RESPONSE\s*===\s*([\s\S]*?)(?=\n\s*===\s*[A-Z _]+\s*===|$)/i
-  );
-  if (responseBlock?.[1]) {
-    text = responseBlock[1];
+  let text = extractAssistantText(value);
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  const markerLabels = new Set([
+    "RESPONSE",
+    "ANSWER",
+    "THINKING",
+    "ANALYSIS",
+    "SOURCES",
+    "METADATA",
+  ]);
+  const output = [];
+  let sawResponseMarker = false;
+  let capturing = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    const compact = line.replace(/[^a-z0-9]+/gi, "").toUpperCase();
+    const markerOnly =
+      compact &&
+      markerLabels.has(compact) &&
+      (line.length - compact.length >= 2 ||
+        line.startsWith("==") ||
+        line.startsWith("++"));
+
+    if (markerOnly) {
+      if (compact === "RESPONSE" || compact === "ANSWER") {
+        sawResponseMarker = true;
+        capturing = true;
+        continue;
+      }
+      if (capturing) break;
+      continue;
+    }
+
+    const withoutPrefix = rawLine.replace(
+      /^\s*[=+\-#*_~`|:\s]*(?:RESPONSE|ANSWER)\s*[=+\-#*_~`|:\s]*/i,
+      ""
+    );
+
+    if (capturing || withoutPrefix !== rawLine) {
+      sawResponseMarker = true;
+      capturing = true;
+      output.push(withoutPrefix);
+    } else {
+      output.push(rawLine);
+    }
+  }
+
+  if (sawResponseMarker) {
+    text = output.join("\n");
+  } else {
+    text = output
+      .filter((line) => {
+        const compact = line.trim().replace(/[^a-z0-9]+/gi, "").toUpperCase();
+        return !markerLabels.has(compact);
+      })
+      .join("\n");
   }
 
   text = text
@@ -185,6 +245,65 @@ function normalizeAssistantText(value) {
     .trim();
 
   return text;
+}
+
+function extractAssistantText(value) {
+  if (value == null) return "";
+  if (typeof value === "object") {
+    const direct =
+      value.response ??
+      value.message ??
+      value.answer ??
+      value.text ??
+      value.output ??
+      value.content;
+    if (typeof direct === "string") return extractAssistantText(direct);
+    for (const key of ["data", "result", "payload"]) {
+      if (value[key] != null) {
+        const nested = extractAssistantText(value[key]);
+        if (nested) return nested;
+      }
+    }
+    return "";
+  }
+
+  let text = String(value || "").trim();
+  text = text
+    .replace(/^\s*```(?:json)?\s*/i, "")
+    .replace(/\s*```\s*$/i, "")
+    .replace(
+      /^\s*[=+\-#*_~`|:\s]*(?:RESPONSE|ANSWER)\s*[=+\-#*_~`|:\s]*/i,
+      ""
+    )
+    .trim();
+
+  const parsed = parseAssistantJson(text);
+  if (parsed) return parsed;
+
+  const jsonStart = text.indexOf("{");
+  if (jsonStart >= 0) {
+    const parsedTail = parseAssistantJson(text.slice(jsonStart));
+    if (parsedTail) return parsedTail;
+  }
+
+  return text;
+}
+
+function parseAssistantJson(text) {
+  if (!text || !/^\s*[\[{]/.test(text)) return "";
+  try {
+    return extractAssistantText(JSON.parse(text));
+  } catch {
+    const end = text.lastIndexOf("}");
+    if (end > 0 && end < text.length - 1) {
+      try {
+        return extractAssistantText(JSON.parse(text.slice(0, end + 1)));
+      } catch {
+        return "";
+      }
+    }
+    return "";
+  }
 }
 
 class ChunkAudioPlayer {
@@ -315,6 +434,26 @@ export default function App() {
       localStorage.setItem("ika:serverUrl", serverUrl);
     } catch { }
   }, [serverUrl]);
+
+  const [glchatApiKey, setGlchatApiKey] = useState(
+    () => localStorage.getItem(GLCHAT_API_KEY_STORAGE_KEY) || ""
+  );
+  const [glchatSlug, setGlchatSlug] = useState(
+    () =>
+      localStorage.getItem(GLCHAT_SLUG_STORAGE_KEY) || DEFAULT_GLCHAT_SLUG
+  );
+  const glchatAuthPayload = useMemo(
+    () => buildGlchatAuthPayload(glchatApiKey, glchatSlug),
+    [glchatApiKey, glchatSlug]
+  );
+  const hasGlchatApiKey = !!normalizeGlchatApiKey(glchatApiKey);
+  const normalizedGlchatSlug = normalizeGlchatSlug(glchatSlug);
+  useEffect(() => {
+    try {
+      localStorage.setItem(GLCHAT_API_KEY_STORAGE_KEY, glchatApiKey);
+      localStorage.setItem(GLCHAT_SLUG_STORAGE_KEY, normalizedGlchatSlug);
+    } catch {}
+  }, [glchatApiKey, normalizedGlchatSlug]);
 
   // Pick up ?server=... from query string once
   useEffect(() => {
@@ -537,6 +676,8 @@ export default function App() {
     functionCallingQuick,
     autoFunctionResponseQuick,
     groundingQuick,
+    glchatApiKey,
+    glchatSlug: normalizedGlchatSlug,
   });
 
   // Per-identity attention counting & cooldown
@@ -782,7 +923,7 @@ export default function App() {
   const tinyOptsRef = useRef(
     new faceapi.TinyFaceDetectorOptions({
       inputSize: 416,
-      scoreThreshold: 0.4,
+      scoreThreshold: TINY_FACE_SCORE_THRESHOLD,
     })
   );
 
@@ -1098,7 +1239,7 @@ export default function App() {
       // TinyFaceDetector tuning based on current video width
       tinyOptsRef.current = new faceapi.TinyFaceDetectorOptions({
         inputSize: pickInputSize(w),
-        scoreThreshold: 0.4,
+        scoreThreshold: TINY_FACE_SCORE_THRESHOLD,
       });
 
       // Update camera intrinsics from current FOVs
@@ -1181,7 +1322,7 @@ export default function App() {
             off,
             new faceapi.TinyFaceDetectorOptions({
               inputSize: 128,
-              scoreThreshold: 0.4,
+              scoreThreshold: TINY_FACE_SCORE_THRESHOLD,
             })
           );
         } catch { }
@@ -1807,24 +1948,15 @@ export default function App() {
         // ---- Policy: zone transitions -> call-over / greet (candidates include red) ----
         try {
           const policyStart = performance.now();
-          const matcher = faceMatcherRef.current;
-          const allIdentities = frameCandidates.map((c) => {
-            const det = c.det;
-            let name = null;
-            if (matcher && det.descriptor) {
-              const best = matcher.findBestMatch(det.descriptor);
-              if (best && best.label !== "unknown" && best.distance <= MATCH_THRESHOLD) {
-                name = best.label;
-              }
-            }
-            let gid = null;
-            if (!name) gid = assignGuestIdFor(det.descriptor);
-            const key = (name || gid) ?? `tmp-${c.i}`;
-            const gender = (det.gender || "").toLowerCase();
-            const age = Number(det.age);
-            const ageGroup = ageGroupOf(age);
-            return { key, name, gid, gender, age, ageGroup, zone: c.zone };
-          });
+          const allIdentities = peopleForPost.map((p) => ({
+            key: p.stableKey,
+            name: p.name || null,
+            gid: p.gid || null,
+            gender: p.gender || null,
+            age: null,
+            ageGroup: p.ageGroup,
+            zone: p.zone,
+          }));
           dispatchZoneTransitions({
             allIdentities,
             now,
@@ -2051,6 +2183,7 @@ export default function App() {
       timeout: 12000,
       rememberUpgrade: true,
       forceNew: true,
+      auth: glchatAuthPayload,
     });
     socketRef.current = socket;
 
@@ -2060,6 +2193,7 @@ export default function App() {
           deviceId,
           sessionId: sessionIdRef.current,
           role: "web",
+          ...glchatAuthPayload,
         });
       } catch {}
     });
@@ -2075,8 +2209,7 @@ export default function App() {
       bump("start");
     });
     socket.on("text_response", (t) => {
-      const rawText = typeof t === "string" ? t : t?.text || "";
-      const text = normalizeAssistantText(rawText);
+      const text = normalizeAssistantText(t);
       if (text) setLastText(text);
     });
     socket.on("audio_chunk_received", (pkt) => {
@@ -2108,7 +2241,7 @@ export default function App() {
         socketRef.current = null;
       }
     };
-  }, [serverUrl, deviceId, bump]);
+  }, [serverUrl, deviceId, bump, glchatAuthPayload]);
 
   // Focus shared across blocks (used by gesture events and crowd payload)
   const focusIndexRef = useRef(-1);
@@ -2360,6 +2493,11 @@ export default function App() {
               setServerUrl={setServerUrl}
               effectiveUrl={effectiveUrl}
               serverInfo={serverInfo}
+              glchatApiKey={glchatApiKey}
+              setGlchatApiKey={setGlchatApiKey}
+              hasGlchatApiKey={hasGlchatApiKey}
+              glchatSlug={glchatSlug}
+              setGlchatSlug={setGlchatSlug}
               deviceIdDraft={deviceIdDraft}
               setDeviceIdDraft={setDeviceIdDraft}
               deviceId={deviceId}

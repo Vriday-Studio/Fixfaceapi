@@ -24,8 +24,10 @@ export function useFrameOutput({
 
   const commitFrameOutput = useCallback(
     ({ cand, peopleForPost, rows, total, green, red, fresh }) => {
-      if (cand.length > 0) {
-        sendGreenSnapshot(cand);
+      const greenPeople = peopleForPost.filter((p) => p.zone === "green");
+
+      if (greenPeople.length > 0) {
+        sendGreenSnapshot(greenPeople);
         console.log("cand snapshot sent");
 
         emitCrowdByGid({
@@ -37,7 +39,7 @@ export function useFrameOutput({
           gesture: gesturesOnRef.current ? fresh : null,
           focusIndex: focusIndexRef.current,
           focusTarget: focusTargetRef.current,
-          people: cand,
+          people: greenPeople,
         });
       }
       else{
